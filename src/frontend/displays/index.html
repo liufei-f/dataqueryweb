@@ -1,0 +1,118 @@
+{% extends "layout.html" %}
+{% block title %}Find QTL data — DataQuery{% endblock %}
+{% block content %}
+<div class="dq">
+  <h1>Find QTL data</h1>
+  <p class="muted lede">Search Europe PMC for QTL studies, or paste a paper's DOI or URL. Each paper is read for its
+    data availability statement, repository links and accessions, and the places its QTL data can be downloaded are listed.</p>
+
+  <div class="dq-toggle" role="tablist" aria-label="Search mode">
+    <button type="button" class="dq-toggle-btn active" data-mode="search" role="tab" aria-selected="true">Search literature</button>
+    <button type="button" class="dq-toggle-btn" data-mode="ref" role="tab" aria-selected="false">DOI or URL</button>
+  </div>
+
+  <form class="dq-form" id="dq-form" role="search" autocomplete="off">
+    <div class="dq-form-row">
+      <input type="search" id="dq-input" class="dq-input" aria-label="Query" autofocus
+             placeholder="Keywords — e.g. single-cell eQTL immune cells">
+      <button type="submit" class="dq-submit" id="dq-submit">Search</button>
+      <button type="button" class="dq-stop" id="dq-stop" hidden title="Stop reading papers; results so far are kept">Stop</button>
+    </div>
+    <div class="dq-filters" id="dq-search-options">
+      <label class="dq-limit" title="How many Europe PMC results to read (each takes time and, with the AI check, tokens)">
+        <span>Papers</span>
+        <input type="number" id="dq-limit" value="10" min="1" max="1000" step="1" inputmode="numeric" aria-label="Number of papers">
+      </label>
+      <label class="dq-limit" title="Publication year range; leave either end empty for no limit">
+        <span>Years</span>
+        <input type="number" id="dq-year-from" min="1800" max="3000" step="1" placeholder="from" inputmode="numeric" aria-label="From year">
+        <span class="dq-dash">–</span>
+        <input type="number" id="dq-year-to" min="1800" max="3000" step="1" placeholder="to" inputmode="numeric" aria-label="To year">
+      </label>
+      <span class="dq-year-chips" aria-label="Year presets">
+        <button type="button" class="dq-year-chip" data-years="1">This year</button>
+        <button type="button" class="dq-year-chip" data-years="2" title="This year and last year">2 yrs</button>
+        <button type="button" class="dq-year-chip" data-years="5" title="The last five years, including this one">5 yrs</button>
+        <button type="button" class="dq-year-chip" data-years="0">Any</button>
+      </span>
+      <label class="dq-limit" title="Order in which Europe PMC returns papers">
+        <span>Sort</span>
+        <select id="dq-sort">
+          <option value="relevance" selected>Relevance</option>
+          <option value="newest">Newest first</option>
+        </select>
+      </label>
+      <label class="dq-limit" title="Where to search">
+        <span>Sources</span>
+        <select id="dq-source">
+          <option value="all" selected>All</option>
+          <option value="journal">Journals</option>
+          <option value="preprint">bioRxiv + medRxiv</option>
+        </select>
+      </label>
+    </div>
+    <p class="dq-limit-warn" id="dq-limit-warn" hidden></p>
+  </form>
+  <div class="dq-key-notice" id="dq-key-notice" hidden role="status">
+    <strong>🔑 LLM API key</strong>
+    <span><span class="dq-key-change">changed: <code id="dq-key-old"></code> → <code id="dq-key-new"></code></span></span>
+    <span class="dq-key-status" id="dq-key-status"></span>
+    <button type="button" class="dq-key-dismiss" id="dq-key-dismiss" aria-label="Dismiss">×</button>
+  </div>
+  <div class="dq-examples" id="dq-examples">
+    <span class="muted">Examples:</span>
+    <span class="dq-ex-search">
+      <button type="button" class="dq-chip">single-cell eQTL</button>
+      <button type="button" class="dq-chip">sQTL brain</button>
+      <button type="button" class="dq-chip">pQTL plasma proteome</button>
+      <button type="button" class="dq-chip">caQTL chromatin accessibility</button>
+    </span>
+    <span class="dq-ex-ref" hidden>
+      <button type="button" class="dq-chip">10.1038/s41588-021-00913-z</button>
+      <button type="button" class="dq-chip">https://www.science.org/doi/10.1126/science.aaz1776</button>
+      <button type="button" class="dq-chip">PMC8432599</button>
+      <button type="button" class="dq-chip">https://www.medrxiv.org/content/10.1101/2021.10.09.21264604v1</button>
+    </span>
+  </div>
+  <div class="dq-options">
+    <label class="dq-check" id="dq-qtl-wrap">
+      <input type="checkbox" id="dq-qtl-only" checked> Only papers mentioning QTL
+    </label>
+    <label class="dq-check" title="A free LLM reads each paper's abstract, data availability statement and the links found, and decides whether the paper releases new QTL data and which link downloads it">
+      <input type="checkbox" id="dq-ai" checked> AI check for new QTL data
+      <span class="dq-ai-model" id="dq-ai-model"></span>
+      <span class="dq-ai-model dq-ai-key" id="dq-ai-key" title="The API key in use (masked). Change it in .env — no restart needed."></span>
+      <button type="button" class="dq-key-check" id="dq-key-check" title="Check that the endpoint accepts this key (uses no tokens)">check key</button>
+    </label>
+    <label class="dq-check" id="dq-autosave-wrap" title="Papers the AI is very sure about — new QTL data, a download location with QTL results, high confidence, judged by the main model — are added to Saved records automatically and marked Auto-saved. Everything else is left for you to check.">
+      <input type="checkbox" id="dq-autosave" checked> Auto-save when the AI is sure
+      <span class="dq-ai-model" id="dq-autosave-note"></span>
+    </label>
+  </div>
+
+  <div id="dq-status" class="dq-status" hidden>
+    <span class="dq-spinner" aria-hidden="true"></span><span id="dq-status-text"></span>
+    <div class="dq-progress"><div class="dq-progress-bar" id="dq-progress-bar"></div></div>
+  </div>
+
+  <div id="dq-results-head" class="dq-results-head" hidden>
+    <h2 id="dq-results-title">Results</h2>
+    <span class="muted" id="dq-results-sub"></span>
+    <label class="dq-check dq-check-inline">
+      <input type="checkbox" id="dq-hide-empty"> Hide papers with no data source
+    </label>
+    <label class="dq-check dq-check-inline">
+      <input type="checkbox" id="dq-hide-low" checked> Hide low-relevance links
+    </label>
+  </div>
+  <div class="dq-review" id="dq-review" role="tablist" aria-label="Filter by review status" hidden>
+    <button type="button" class="dq-review-btn active" data-f="all">All <span></span></button>
+    <button type="button" class="dq-review-btn" data-f="check" title="New or possibly new QTL data that the AI was not sure enough to save, or that it could not judge">Needs human check <span></span></button>
+    <button type="button" class="dq-review-btn" data-f="auto" title="Saved automatically by the AI — spot-check and Confirm">Auto-saved <span></span></button>
+    <button type="button" class="dq-review-btn" data-f="human" title="Saved or confirmed by you">Saved by you <span></span></button>
+    <button type="button" class="dq-review-btn" data-f="no" title="The AI judged that the paper only reuses existing QTL data">No new QTL data <span></span></button>
+  </div>
+  <div id="dq-results"></div>
+</div>
+<script src="/static/js/app.js?v={{ version }}"></script>
+{% endblock %}

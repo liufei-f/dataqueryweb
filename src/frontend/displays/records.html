@@ -1,0 +1,41 @@
+{% extends "layout.html" %}
+{% block title %}Saved records — DataQuery{% endblock %}
+{% block content %}
+<div class="dq">
+  <h1>Saved records</h1>
+  <p class="muted lede">Data locations you saved on the Find QTL data page, plus those the AI saved automatically
+    because it was very sure (marked <strong>🤖 auto-saved</strong> — spot-check them and <strong>Confirm</strong>, or delete).
+    One row per publication and download location; saving the same pair again updates it and keeps your note.
+    The download uses the column names of LocusView's qtl-data-agent review table.</p>
+
+  <div class="rec-toolbar">
+    <input type="search" id="rec-filter" class="dq-input" placeholder="Filter by title, DOI, QTL type, repository, note…" aria-label="Filter saved records">
+    <select id="rec-by" class="rec-btn" aria-label="Saved by">
+      <option value="">Everyone</option>
+      <option value="auto">Auto-saved (to check)</option>
+      <option value="human">Saved by you</option>
+    </select>
+    <span class="muted rec-count" id="rec-count"></span>
+    <a class="rec-btn primary" href="/api/records/export?fmt=tsv">Download TSV</a>
+    <a class="rec-btn" href="/api/records/export?fmt=csv">Download CSV</a>
+  </div>
+
+  <div class="dq-paper">
+    <div class="table-wrap">
+      <table class="rec-table">
+        <colgroup>
+          <col style="width:4%"><col style="width:25%"><col style="width:10%"><col style="width:12%">
+          <col style="width:22%"><col style="width:9%"><col style="width:15%"><col style="width:3%">
+        </colgroup>
+        <thead>
+          <tr><th>#</th><th>Publication</th><th>QTL type</th><th>Context / species</th>
+              <th>Download location</th><th>Access</th><th>Curator note</th><th></th></tr>
+        </thead>
+        <tbody id="rec-body"><tr><td colspan="8" class="rec-empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  <p class="muted rec-path">Stored in <code>{{ db_path }}</code></p>
+</div>
+<script src="/static/js/records.js?v={{ version }}"></script>
+{% endblock %}

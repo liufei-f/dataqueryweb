@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}DataQuery{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/base.css?v={{ version }}" />
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header class="site-header">
+    <div class="brand">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+        <circle cx="10.5" cy="10.5" r="7" stroke="currentColor" stroke-width="1.5"></circle>
+        <circle cx="10.5" cy="10.5" r="2.2" fill="currentColor"></circle>
+        <line x1="15.6" y1="15.6" x2="21" y2="21" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></line>
+      </svg>
+      <span>Data<span class="accent">Query</span></span>
+    </div>
+    <nav class="site-nav">
+      <a href="/" class="{{ 'active' if active == 'search' else '' }}">Find QTL data</a>
+      <a href="/records" class="{{ 'active' if active == 'records' else '' }}">Saved records</a>
+      <a href="/about" class="{{ 'active' if active == 'about' else '' }}">How it works</a>
+    </nav>
+    <span class="version">v{{ version }}</span>
+  </header>
+
+  <div class="page">
+    {% block content %}{% endblock %}
+  </div>
+
+  <footer class="site-footer">
+    DataQuery v{{ version }} &middot; literature via Europe PMC &middot; companion to LocusView
+  </footer>
+</body>
+</html>

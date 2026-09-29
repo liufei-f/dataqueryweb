@@ -1,0 +1,175 @@
+{% extends "layout.html" %}
+{% block title %}How it works — DataQuery{% endblock %}
+{% block content %}
+<div class="dq dq-prose">
+  <h1>How it works</h1>
+  <p class="muted lede">DataQuery reads papers the way a curator would: it works out whether a paper produced new QTL data,
+    and where the authors say those results can be downloaded. Rules find every candidate link cheaply; an LLM decides
+    what they are; you review what it was not sure about.</p>
+
+  <ol class="ab-flow" aria-label="Pipeline">
+    <li><strong>Find</strong><span>Europe PMC search, or one DOI / URL</span></li>
+    <li><strong>Read</strong><span>full text, preprint API, publisher page</span></li>
+    <li><strong>Extract</strong><span>links, accessions, sentences — no AI</span></li>
+    <li><strong>Judge</strong><span>LLM: new data? which link?</span></li>
+    <li><strong>Save</strong><span>auto-save if sure, else you review</span></li>
+  </ol>
+
+  <h2>1. Find papers</h2>
+  <p><strong>Search literature</strong> queries the <a href="https://europepmc.org/RestfulWebService">Europe PMC REST API</a>,
+    which also indexes bioRxiv and medRxiv. Plain keywords are matched against titles and abstracts; Europe PMC syntax
+    (e.g. <code>AUTH:"Smith J" AND eQTL</code>) is passed through unchanged.</p>
+  <table class="data-table">
+    <thead><tr><th>Option</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td>Papers</td><td>How many results to read, 1–{{ max_limit }}; fetched from Europe PMC in pages of up to 1,000. Above 50 the page warns about time and tokens.</td></tr>
+      <tr><td>Years</td><td>Publication-year range (<code>PUB_YEAR</code>); either end may be empty. <em>This year / 2 yrs / 5 yrs / Any</em> fill it in.</td></tr>
+      <tr><td>Sort</td><td><em>Relevance</em>, or <em>Newest first</em> — with a year range, the quickest way to reach newly published data.</td></tr>
+      <tr><td>Sources</td><td>All, journals only, or bioRxiv + medRxiv preprints only.</td></tr>
+      <tr><td>Only papers mentioning QTL</td><td>Adds eQTL / sQTL / pQTL / caQTL / mQTL / "quantitative trait loci" to the query.</td></tr>
+    </tbody>
+  </table>
+  <p><strong>DOI or URL</strong> inspects a single paper: a DOI, a doi.org / publisher / PMC / PubMed / bioRxiv / medRxiv link,
+    a PMID or a PMCID. A link straight to a data repository (Zenodo, figshare…) is listed with its files.</p>
+  <p>Results appear as each paper finishes. <strong>Stop</strong> ends a search at any time: papers already read stay on the
+    page, and the server cancels the rest, so they stop using LLM tokens and nothing more is auto-saved. The options are
+    kept in the page URL, so a refresh or a shared link repeats the same search.</p>
+
+  <h2>2. Read each paper</h2>
+  <p>Every route that is reachable is used; the <em>Read:</em> line under each paper lists which ones were.</p>
+  <table class="data-table">
+    <thead><tr><th>Route</th><th>What is read</th></tr></thead>
+    <tbody>
+      <tr><td>PMC full text</td><td>Europe PMC <code>fullTextXML</code>, or NCBI PMC when Europe PMC has none; for preprints, Europe PMC's preprint full text when it exists.</td></tr>
+      <tr><td>bioRxiv / medRxiv API</td><td>Preprint metadata from <a href="https://api.biorxiv.org">api.biorxiv.org</a> and, once published, the journal DOI. The journal version is then read too, and its data sources are merged in, prefixed with the journal name.</td></tr>
+      <tr><td>Accession annotations</td><td>Europe PMC's text-mined accession numbers (GEO, EGA, dbGaP, ArrayExpress…), available even for some closed papers.</td></tr>
+      <tr><td>Publisher page</td><td>The article page via doi.org when there is no open full text. Many publishers — and bioRxiv/medRxiv — refuse automated requests; the paper then says so.</td></tr>
+      <tr><td>Repository APIs</td><td>Zenodo and figshare records are expanded into direct file links with sizes.</td></tr>
+    </tbody>
+  </table>
+  <p>If Europe PMC itself is down, a single-paper lookup carries on with the other routes; a keyword search says so and asks you to retry.</p>
+
+  <h2>3. Extract and rank links (rules, no AI)</h2>
+  <p>From the text, every data link, dataset DOI and accession is collected with the sentence it came from —
+    including links in <em>Data availability</em> statements and supplementary files whose caption mentions QTL results.
+    Each is ranked:</p>
+  <ul>
+    <li><span class="dq-rel dq-rel-high">high</span> the sentence is about QTL results / summary statistics, and it is in a data availability statement or says the authors share it;</li>
+    <li><span class="dq-rel dq-rel-medium">medium</span> part of that evidence — e.g. an availability statement about raw data, or an accession found by Europe PMC's text mining;</li>
+    <li><span class="dq-rel dq-rel-low">low</span> incidental: software, reference files, resources the paper merely downloaded (hidden by default).</li>
+  </ul>
+  <p>Access is marked <span class="badge badge-open">open</span>, <span class="badge badge-controlled">controlled</span>
+    (EGA, dbGaP — needs an application), <span class="badge badge-request">request</span> or <span class="badge badge-unknown">unknown</span>.</p>
+
+  <h2>4. AI check</h2>
+  <p>Rules cannot tell a paper that <em>mapped</em> QTLs from one that only <em>used</em> published QTLs (Mendelian randomization,
+    SMR, colocalization, TWAS…). With <strong>AI check</strong> on, an LLM reads the title, abstract, data availability statements,
+    the numbered list of found links and — when it was read — the full text, and answers:</p>
+  <ul>
+    <li>three factual questions — did the authors map QTLs, do they only reuse published QTLs, do they say where their results are —
+      each answered yes / no / unclear with a verbatim quote, plus QTL types, species, tissues or cells and a one-sentence reason;</li>
+    <li>which found links hold the paper's own results — marked <span class="dq-ai-pick">AI: QTL summary statistics</span>, results browser, supplementary table or raw data —
+      and whether download is open, controlled, on request or not found.</li>
+  </ul>
+  <p>The model does <em>not</em> choose the verdict or the confidence: the program derives both from its answers with the fixed
+    <a href="#rubric">scoring rubric</a> below, so the same answers always give the same result.</p>
+  <p><strong>Full text first.</strong> The full text is sent with data, QTL and accession paragraphs first, up to the configured length,
+    so the verdict rests on the methods and the data statement rather than the abstract.
+    The model answers with link <em>numbers</em>, never URLs of its own, so it cannot invent a download address.</p>
+  <p><strong>Web search when the text is not enough.</strong> If the full text could not be read, or the model says "new data" but no found
+    link holds it, a model with web access searches for the article itself, opens it and the repository pages, and reports the data URLs
+    with the sentence and page they came from. Each such URL is then requested once: URLs that do not exist are dropped, and ones that
+    exist but refuse automated access are marked <em>link blocked</em>. Expand <em>AI web search</em> under a verdict to see what it searched and opened.</p>
+  <p><strong>Fallback.</strong> If the main model is out of quota or fails, a keyless model takes over for the rest of the search; its verdicts
+    are marked <em>(fallback)</em>. The AI can be wrong — the reason and the quoted sentences are always shown so you can check.</p>
+
+  <h2 id="rubric">Scoring rubric <span class="muted" style="font-size:13px;font-weight:400">version {{ rubric.RUBRIC_VERSION }}</span></h2>
+  <p>The questions the LLM answers, word for word as it receives them. A “yes” must come with a verbatim quote from the paper,
+    otherwise it counts as “unclear”; when the text does not say, the answer must be “unclear”.</p>
+  <table class="data-table">
+    <thead><tr><th>#</th><th>Question</th><th>Definition</th></tr></thead>
+    <tbody>
+      {% for key, question, definition in rubric.QUESTIONS %}
+      <tr><td>{{ loop.index }}</td><td><strong>{{ question }}</strong><br><code>{{ key }}</code></td><td>{{ definition }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p><strong>Verdict</strong> (decided by the program from the answers):</p>
+  <ul>{% for r in rubric.VERDICT_RULES %}<li>{{ r }}</li>{% endfor %}</ul>
+  <p><strong>Confidence</strong> — five criteria with fixed weights (sum 100):</p>
+  <table class="data-table">
+    <thead><tr><th>Criterion</th><th>Weight</th><th>Met when</th></tr></thead>
+    <tbody>
+      {% for key, label, weight, how in rubric.CRITERIA %}
+      <tr><td>{{ label }}</td><td>{{ (weight * 100) | round | int }}</td><td>{{ how }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <ul>{% for r in rubric.CONFIDENCE_RULES %}<li>{{ r }}</li>{% endfor %}</ul>
+  <p><strong>What a picked location holds.</strong> The model labels each picked link with one of
+    {% for c in rubric.CONTENT_TYPES %}<code>{{ c }}</code>{{ ", " if not loop.last }}{% endfor %}.
+    If it describes the link in words instead, these rules — checked in order — decide the label
+    (only the first three count as a download location for QTL results):</p>
+  <table class="data-table">
+    <thead><tr><th>Label</th><th>Description matches (regular expression, case-insensitive)</th></tr></thead>
+    <tbody>
+      {% for content, pattern in rubric.CONTENT_RULES %}<tr><td><code>{{ content }}</code></td><td><code>{{ pattern }}</code></td></tr>{% endfor %}
+      <tr><td><code>other</code></td><td>anything else</td></tr>
+    </tbody>
+  </table>
+  <p>With the auto-save threshold of {{ (autosave.min_confidence * 100) | round | int }}%, a paper is auto-saved only when
+    <strong>all five criteria are met</strong> (missing any one gives at most 85). Under each verdict, the checklist shows which
+    criteria were met; hover a criterion or open <em>Why this score</em> to see the answer and quote behind it.</p>
+
+  <h2>5. Auto-save and review</h2>
+  <p>With <strong>Auto-save when the AI is sure</strong> on, a paper goes into Saved records by itself —
+    marked <span class="dq-saved-tag dq-auto-tag">🤖 Auto-saved</span> — only when <em>all</em> of these hold:</p>
+  <ul>
+    <li>the verdict is “New QTL data” with confidence ≥ {{ (autosave.min_confidence * 100) | round | int }}% by the <a href="#rubric">rubric</a>;</li>
+    <li>the verdict came from the main model{% if autosave.allow_fallback %} or the fallback{% else %}, not the fallback{% endif %};</li>
+    <li>the AI named a location holding QTL results: summary statistics, a results browser or a supplementary table.</li>
+  </ul>
+  <p>Only those locations are saved; raw data and code links are not. An automatic save never overwrites a record you saved, nor your note.
+    Every other paper stays on the page with the reason, e.g. <em>Needs human check: confidence 85% &lt; 90%</em>.</p>
+  <p>The filter above the results sorts papers into <em>Needs human check</em>, <em>Auto-saved</em>, <em>Saved by you</em> and
+    <em>No new QTL data</em>, with counts. Spot-check auto-saved rows and press <strong>Confirm</strong> (the record becomes yours)
+    or <strong>Remove</strong>. Any other row can be saved with <strong>Save</strong>.</p>
+  <p><strong>Saved papers are not re-read.</strong> A paper already in Saved records — matched by DOI (or a preprint's published DOI), PMID,
+    title or article URL — is not sent to the AI again, to save tokens. It shows <em>AI check skipped</em>, with a
+    <strong>Re-check with AI</strong> button for when you want a fresh verdict.</p>
+
+  <h2>6. Saved records</h2>
+  <p><a href="/records">Saved records</a> is one row per publication and download location. Saving the same pair again updates it
+    (http/https, <code>www.</code> and a trailing slash don't make it a different location). You can filter, add a curator note,
+    confirm auto-saved rows, delete, and download the table as TSV or CSV — with the column names of LocusView's qtl-data-agent review
+    table, plus <code>saved_by</code>, <code>ai_confidence</code> and a few more. Records are kept in <code>{{ db_path }}</code>, so
+    they survive restarts. On the search page, papers and rows already saved are marked, with the date.</p>
+
+  <h2>Current setup</h2>
+  <table class="data-table ab-setup">
+    <tbody>
+      <tr><th>LLM endpoint</th><td>{{ llm.provider }}</td></tr>
+      <tr><th>Models (in order)</th><td><code>{{ llm.model }}</code></td></tr>
+      <tr><th>API key</th><td><code>{{ llm.key }}</code> — change it in <code>.env</code>; no restart needed, and the search page shows the change</td></tr>
+      <tr><th>Full text sent per paper</th><td>up to {{ "{:,}".format(llm.max_text) }} characters</td></tr>
+      <tr><th>Web search</th><td>{{ "on" if llm.web_search else "off" }}</td></tr>
+      {% if llm.fallback %}<tr><th>Fallback</th><td>{{ llm.fallback.provider }} · <code>{{ llm.fallback.model }}</code> (up to {{ "{:,}".format(llm.fallback.max_text) }} characters, no web search)</td></tr>{% endif %}
+      <tr><th>Auto-save</th><td>confidence ≥ {{ (autosave.min_confidence * 100) | round | int }}%{{ ", main model only" if not autosave.allow_fallback else "" }}</td></tr>
+      <tr><th>Papers per search</th><td>up to {{ max_limit }}</td></tr>
+    </tbody>
+  </table>
+
+  <h2>API</h2>
+  <table class="data-table">
+    <thead><tr><th>Request</th><th>Returns</th></tr></thead>
+    <tbody>
+      <tr><td><code>GET /api/search?q=…</code></td><td>One NDJSON line per paper as it finishes. Options: <code>limit</code>, <code>year_from</code>, <code>year_to</code>, <code>sort=relevance|newest</code>, <code>source=all|journal|preprint</code>, <code>qtl_only</code>, <code>ai</code>, <code>autosave</code>, <code>recheck</code>.</td></tr>
+      <tr><td><code>GET /api/inspect?ref=…</code></td><td>One paper as JSON; takes <code>ai</code>, <code>autosave</code>, <code>recheck</code>.</td></tr>
+      <tr><td><code>GET /api/records</code></td><td>Saved records; <code>POST</code> saves one, <code>PATCH /api/records/{id}</code> edits the note or confirms, <code>DELETE</code> removes it.</td></tr>
+      <tr><td><code>GET /api/records/export?fmt=tsv|csv</code></td><td>The whole table as a file.</td></tr>
+      <tr><td><code>GET /api/llm</code>, <code>/api/llm/check</code></td><td>The LLM in use (key masked); whether the endpoint accepts the key (uses no tokens).</td></tr>
+    </tbody>
+  </table>
+  <p class="muted">Step-by-step commands (start, restart, configure, back up) are in <code>USAGE.md</code> in the project folder.</p>
+</div>
+{% endblock %}
