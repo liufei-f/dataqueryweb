@@ -84,3 +84,17 @@ src/frontend/displays/      Jinja templates (layout, index, about)
 src/frontend/static/        css/base.css, js/app.js
 tests/                      test_extract.py
 ```
+
+### Automatic checking and Resume
+
+The search page processes all matching papers in order, automatically fetching the next
+batch until the search is complete. The page has no total paper limit. Keep it open while
+checking; Stop, a closed tab, exhausted AI quota or an AI error pauses the run. Resume
+continues at the unfinished paper, using the query and filters saved in this browser's
+local storage (also retained after refresh). Recover tokens or fix the endpoint before
+resuming an AI error. A fresh search replaces this browser's current checkpoint.
+
+AI verdicts are stored separately in SQLite, including papers without new QTL data,
+not just automatically saved download records. Later searches reuse successful verdicts
+without another AI call. Use a paper's **Re-check with AI** button to explicitly spend
+tokens on another check. Past checks remain in the database and usage ledger.

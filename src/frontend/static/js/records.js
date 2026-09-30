@@ -27,10 +27,12 @@
         <td>${esc(r.qtl_type)}</td>
         <td>${esc(r.qtl_context)}${r.species ? `<div class="rec-sub">${esc(r.species)}</div>` : ""}</td>
         <td>
-          <a class="rec-url" href="${esc(safeUrl(r.download_url))}" target="_blank" rel="noopener">${esc(r.download_url)}</a>
+          ${String(r.download_url || "").split("; ").filter(Boolean).map((u) =>
+            `<a class="rec-url" href="${esc(safeUrl(u))}" target="_blank" rel="noopener">${esc(u)}</a>`).join("<br>")}
           <div class="rec-sub">${esc([r.repository, r.content, files && `${files} file${files > 1 ? "s" : ""}`].filter(Boolean).join(" · "))}</div>
         </td>
-        <td><span class="badge badge-${BADGE[r.access_route] || "unknown"}">${esc(r.access_route || "unknown")}</span>
+        <td>${(r.access_route ? r.access_route.split("; ") : ["unknown"]).map((a) =>
+            `<span class="badge badge-${BADGE[a] || "unknown"}">${esc(a)}</span>`).join(" ")}
             <div class="rec-sub">saved ${esc(r.saved_at.slice(0, 10))}</div>
             ${r.saved_by === "auto" ? `<span class="rec-auto" title="${esc(r.ai_reason)}">🤖 auto-saved${r.ai_confidence ? ` · ${Math.round(r.ai_confidence * 100)}%` : ""}</span>
             <button type="button" class="rec-confirm" title="The AI got this right: mark it as checked by you">Confirm</button>` : ""}</td>

@@ -18,16 +18,54 @@ ROW = {
 }
 
 
-def test_save_upserts_on_publication_and_url(tmp_path: Path) -> None:
+def test_one_record_per_publication_with_every_location(tmp_path: Path) -> None:
     store = records.RecordStore(tmp_path / "r.sqlite3")
     first = store.save(ROW)
     again = store.save(ROW | {"qtl_context": "microglia"})
-    other = store.save(ROW | {"download_url": "https://malhotralab.shinyapps.io/x"})
-    assert first["record_id"] == again["record_id"] != other["record_id"]
-    assert again["qtl_context"] == "microglia"
-    assert again["first_author"] == "Bryois J"
-    assert again["qtl_type"] == "eQTL"
-    assert len(store.all()) == 2
+    other = store.save(ROW | {"download_url": "https://malhotralab.shinyapps.io/x",
+                              "access_route": "request"})
+    assert first["record_id"] == again["record_id"] == other["record_id"]
+    assert len(store.all()) == 1
+    assert other["download_url"] == ("https://doi.org/10.5281/zenodo.5543734; "
+                                     "https://malhotralab.shinyapps.io/x")
+    assert other["access_route"] == "open; request"
+    assert other["qtl_context"] == "microglia"
+    assert other["first_author"] == "Bryois J"
+    assert other["qtl_type"] == "eQTL"
+
+
+def test_one_location_can_be_removed_and_the_last_takes_the_record(tmp_path: Path) -> None:
+    store = records.RecordStore(tmp_path / "r.sqlite3")
+    store.save(ROW)
+    rid = store.save(ROW | {"download_url": "https://malhotralab.shinyapps.io/x"})["record_id"]
+    left = store.remove_location(rid, "http://www.malhotralab.shinyapps.io/x/")
+    assert left["download_url"] == "https://doi.org/10.5281/zenodo.5543734"
+    assert store.remove_location(rid, "https://nowhere.example") is None
+    assert store.remove_location(rid, ROW["download_url"]) == {"deleted": True}
+    assert store.all() == []
+
+
+def test_duplicate_rows_of_one_paper_are_merged_on_open(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "r.sqlite3"
+    store = records.RecordStore(path)
+    a = store.save(ROW | {"curator_note": "check files"})
+    with sqlite3.connect(path) as db:  # rows written under the old one-per-location rule
+        db.execute("UPDATE records SET record_key = 'old-a', locations = '' WHERE record_id = ?",
+                   [a["record_id"]])
+        db.execute(
+            "INSERT INTO records (record_key, publication_title, doi, download_url, "
+            "access_route, saved_by, curator_note, saved_at) VALUES "
+            "('old-b', ?, ?, 'https://eqtlgen.org', 'open', 'auto', 'second note', 'now')",
+            [ROW["publication_title"], ROW["doi"]])
+    rows = records.RecordStore(path).all()
+    assert len(rows) == 1
+    assert rows[0]["record_id"] == a["record_id"]
+    assert rows[0]["download_url"] == ROW["download_url"] + "; https://eqtlgen.org"
+    assert rows[0]["saved_by"] == "human"
+    assert rows[0]["curator_note"] == "check files | second note"
+    assert list(tmp_path.glob("r.sqlite3.bak-*"))
 
 
 def test_export_uses_review_table_columns(tmp_path: Path) -> None:
@@ -62,7 +100,8 @@ def test_url_variants_match_the_same_record(tmp_path: Path) -> None:
     a = store.save(ROW | {"download_url": "http://www.eqtlgen.org/"})
     b = store.save(ROW | {"download_url": "https://eqtlgen.org"})
     assert a["record_id"] == b["record_id"]
-    assert a["record_key"] == "10.1038/s41593-022-01128-z|eqtlgen.org"
+    assert a["record_key"] == "10.1038/s41593-022-01128-z"
+    assert b["download_url"] == "https://eqtlgen.org"  # updated in place, not added
 
 
 def test_old_keys_are_migrated(tmp_path: Path) -> None:
@@ -119,7 +158,19 @@ def test_autosave_saves_only_confident_qtl_result_locations(tmp_path: Path) -> N
         "https://zenodo.org/records/1"
     ]  # not the code link
     assert rows[0]["saved_by"] == "auto" and rows[0]["ai_confidence"] == "0.95"
-    assert out == {"saved": [rows[0]["record_id"]], "reason": "new QTL data, confidence 95%"}
+    assert out == {"saved": [rows[0]["record_id"]], "locations": 1,
+                   "reason": "new QTL data, confidence 95%"}
+
+
+def test_autosave_puts_every_picked_location_of_a_paper_in_one_record(tmp_path: Path) -> None:
+    store = records.RecordStore(tmp_path / "r.sqlite3")
+    paper = _paper()
+    paper.sources[1].ai_pick = "qtl_summary_statistics"
+    out = records.autosave(store, paper)
+    rows = store.all()
+    assert len(rows) == 1
+    assert rows[0]["download_url"] == "https://zenodo.org/records/1; https://github.com/a/b"
+    assert out["saved"] == [rows[0]["record_id"]] and out["locations"] == 2
 
 
 def test_autosave_leaves_uncertain_papers_for_a_human(tmp_path: Path) -> None:
@@ -208,20 +259,42 @@ def test_saved_papers_skip_the_llm(tmp_path: Path, monkeypatch) -> None:  # type
 
     async def fake_judge(self, paper):  # type: ignore[no-untyped-def]
         calls.append(paper.doi)
-        return {"new_qtl_data": "yes", "confidence": 0.5, "data_sources": []}
+        return {"new_qtl_data": "yes", "confidence": 0.5, "data_sources": [],
+                "usage": {"total_tokens": 100, "calls": 1}}
 
     monkeypatch.setattr(finder, "inspect_ref", fake_inspect_ref)
     monkeypatch.setattr(llm.Judge, "judge", fake_judge)
     store = records.RecordStore(tmp_path / "r.sqlite3")
     client = TestClient(web.create_app(store))
 
-    assert (
-        "skipped" not in client.get("/api/inspect", params={"ref": "xyz", "ai": True}).json()["ai"]
-    )
+    first = client.get("/api/inspect", params={"ref": "xyz", "ai": True}).json()["ai"]
+    assert "skipped" not in first and "cached" not in first
+    assert calls == [ROW["doi"]]
+    # Checked once: the same paper is not sent to the LLM again, saved or not.
+    again = client.get("/api/inspect", params={"ref": "xyz", "ai": True}).json()["ai"]
+    assert again["cached"]["check_id"] and again["new_qtl_data"] == "yes"
     assert calls == [ROW["doi"]]
     store.save(ROW)
-    ai = client.get("/api/inspect", params={"ref": "xyz", "ai": True}).json()["ai"]
-    assert ai["skipped"] and ai["saved_by"] == ["human"]
-    assert calls == [ROW["doi"]]  # not called again
+    saved = client.get("/api/inspect", params={"ref": "xyz", "ai": True}).json()["ai"]
+    assert saved["cached"] and saved["saved_records"]
+    assert calls == [ROW["doi"]]
     client.get("/api/inspect", params={"ref": "xyz", "ai": True, "recheck": True})
     assert calls == [ROW["doi"], ROW["doi"]]  # recheck forces it
+
+
+def test_papers_saved_before_checks_were_kept_still_skip_the_llm(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from dataqueryweb import finder, llm
+
+    async def fake_inspect_ref(http, ref):  # type: ignore[no-untyped-def]
+        return finder.Paper(title="Brain eQTL", doi=ROW["doi"])
+
+    async def fake_judge(self, paper):  # type: ignore[no-untyped-def]
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(finder, "inspect_ref", fake_inspect_ref)
+    monkeypatch.setattr(llm.Judge, "judge", fake_judge)
+    store = records.RecordStore(tmp_path / "r.sqlite3")
+    store.save(ROW)
+    ai = TestClient(web.create_app(store)).get(
+        "/api/inspect", params={"ref": "xyz", "ai": True}).json()["ai"]
+    assert ai["skipped"] and ai["saved_by"] == ["human"]

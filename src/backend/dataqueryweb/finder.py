@@ -227,25 +227,31 @@ async def epmc_search(
     year_from: int | None = None,
     year_to: int | None = None,
     sort: str = "relevance",
-) -> tuple[int, list[Paper]]:
-    """Up to ``limit`` papers, fetched in pages of up to 1000 with Europe PMC's cursorMark."""
+    cursor: str = "*",
+) -> tuple[int, list[Paper], str]:
+    """Up to ``limit`` papers from ``cursor`` on, fetched in pages of up to 1000 with Europe
+    PMC's cursorMark. Returns (hits, papers, the cursor where the next batch starts — "" when
+    nothing is left), so a search can be continued past its first ``limit`` papers."""
     q = build_query(query, qtl_only=qtl_only, source=source, year_from=year_from, year_to=year_to)
-    params: dict[str, Any] = {"query": q, "format": "json", "resultType": "core", "cursorMark": "*"}
+    params: dict[str, Any] = {"query": q, "format": "json", "resultType": "core",
+                              "cursorMark": cursor or "*"}
     if SORTS.get(sort):
         params["sort"] = SORTS[sort]
     papers: list[Paper] = []
     hits = 0
+    following = ""
     while len(papers) < limit:
         params["pageSize"] = min(EPMC_PAGE, limit - len(papers))
         data = await epmc_get(http, params)
         hits = int(data.get("hitCount") or 0)
         results = (data.get("resultList") or {}).get("result") or []
         papers += [paper_from_epmc(x) for x in results]
-        cursor = data.get("nextCursorMark")
-        if not results or not cursor or cursor == params["cursorMark"]:
+        following = str(data.get("nextCursorMark") or "")
+        if not results or not following or following == params["cursorMark"]:
+            following = ""
             break
-        params["cursorMark"] = cursor
-    return hits, papers[:limit]
+        params["cursorMark"] = following
+    return hits, papers[:limit], following
 
 
 async def epmc_lookup(http: httpx.AsyncClient, ref: Ref) -> Paper | None:

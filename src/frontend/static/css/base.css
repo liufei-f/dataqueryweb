@@ -306,6 +306,9 @@ table.data-table th { border-bottom: 2px solid #cbd5e1; }
 .dq-options { display: flex; flex-wrap: wrap; gap: 0 22px; }
 .dq-ai-model { font-family: var(--mono); font-size: 11px; color: var(--faint); }
 .dq-hidden-note { font-size: 13px; }
+.dq-usage { margin: 6px 0 2px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.dq-usage summary { cursor: pointer; }
+.dq-usage div { color: var(--faint); margin-top: 3px; }
 .dq-ai-key { color: var(--muted); }
 .dq-key-check {
   border: none; background: none; padding: 0; color: var(--link); font-size: 11px; cursor: pointer;
@@ -508,3 +511,11 @@ select.rec-btn { padding: 7px 8px; }
 .dq-prose h2 { font-size: 19px; font-weight: 600; margin: 30px 0 8px; }
 .dq-prose p, .dq-prose li { font-size: 14.5px; }
 .dq-prose li { margin: 6px 0; }
+
+.dq-next {
+  margin-left: auto; padding: 5px 12px; border: 1px solid var(--accent, #0b5cab); border-radius: 4px;
+  background: var(--accent, #0b5cab); color: #fff; font-size: 13px; cursor: pointer;
+}
+.dq-next:hover { filter: brightness(1.1); }
+
+#dq-journal, #chk-journal { max-width: min(320px, 70vw); }

@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from dataqueryweb import __version__, finder, llm, records, rubric
+from dataqueryweb import __version__, checks, finder, llm, records, rubric
 
 _FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
 CONCURRENCY = 5
@@ -67,8 +67,15 @@ def _line(obj: dict[str, Any]) -> bytes:
 def create_app(store: records.RecordStore | None = None) -> FastAPI:
     app = FastAPI(title="dataqueryweb", version=__version__)
     saved = store or records.RecordStore()
+    checked = checks.CheckStore(saved)
     app.mount("/static", StaticFiles(directory=_FRONTEND / "static"), name="static")
     templates = Jinja2Templates(directory=_FRONTEND / "displays")
+    # `?v=` on every script and stylesheet. The package version never changes between
+    # edits, so browsers kept serving a stale app.js; the newest static file's mtime,
+    # read at render, changes with every edit and needs no restart.
+    templates.env.globals["asset_version"] = lambda: str(max(
+        (f.stat().st_mtime_ns for f in (_FRONTEND / "static").rglob("*") if f.is_file()),
+        default=0))
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
@@ -91,6 +98,17 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
                 "rubric": rubric,
             },
         )
+
+    @app.get("/checked", response_class=HTMLResponse)
+    async def checked_page(request: Request) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request, "checked.html", {"version": __version__, "active": "checked"}
+        )
+
+    @app.get("/api/checks")
+    async def list_checks() -> list[dict[str, Any]]:
+        """Every paper the AI has read — its latest check — for curators to review and save."""
+        return checked.latest()
 
     @app.get("/records", response_class=HTMLResponse)
     async def records_page(request: Request) -> HTMLResponse:
@@ -124,7 +142,13 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         return row
 
     @app.delete("/api/records/{record_id}")
-    async def delete_record(record_id: int) -> dict[str, bool]:
+    async def delete_record(record_id: int, url: str = "") -> dict[str, Any]:
+        """Delete the record, or with ``url`` only that one download location of it."""
+        if url:
+            row = saved.remove_location(record_id, url)
+            if row is None:
+                raise HTTPException(404, "No such record or location")
+            return row
         if not saved.delete(record_id):
             raise HTTPException(404, "No such record")
         return {"deleted": True}
@@ -152,9 +176,20 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         search_terms: str = "",
         recheck: bool = False,
     ) -> None:
-        # Already curated: don't spend LLM tokens reading it again (unless asked to).
+        """The paper's AI verdict, spending tokens only on a paper never checked before.
+
+        1. Checked before (``llm_checks``): reuse that verdict and its picks; no LLM call.
+        2. Already in Saved records (from before checks were kept): skip, as curated.
+        3. Otherwise ask the LLM, and record the check — verdict, picks and tokens — whether
+           or not it is auto-saved. ``recheck`` skips 1 and 2 and records a new check.
+        """
         known = [] if recheck else saved.find_paper(p)
-        if known:
+        previous = None if recheck else checked.find(p)
+        if previous is not None:
+            checks.reuse(p, previous)
+            if known:
+                p.ai["saved_records"] = [r["record_id"] for r in known]
+        elif known:
             p.ai = {
                 "skipped": True,
                 "reason": "Already in Saved records — AI check skipped to save tokens",
@@ -162,12 +197,18 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
                 "saved_by": sorted({r["saved_by"] for r in known}),
             }
             return
-        try:
-            verdict = await asyncio.wait_for(j.judge(p), timeout=300)
-        except TimeoutError:
-            verdict = {"error": "LLM timed out"}
-        llm.apply(p, verdict)
-        if autosave and p.ai is not None:
+        else:
+            try:
+                verdict = await asyncio.wait_for(j.judge(p), timeout=300)
+            except TimeoutError:
+                verdict = {"error": "LLM timed out"}
+            llm.apply(p, verdict)
+            # A paper refused before any model answered (every model out of quota) is not
+            # a check: it spent nothing, would drag the per-paper average down, and must be
+            # asked again once quota is back.
+            if p.ai is not None and ("error" not in p.ai or (p.ai.get("usage") or {}).get("calls")):
+                checked.record(p, p.ai, search_terms=search_terms)
+        if autosave and p.ai is not None and "error" not in p.ai:
             settings = autosave_settings()
             p.ai["autosave"] = records.autosave(
                 saved,
@@ -176,6 +217,11 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
                 min_confidence=settings["min_confidence"],
                 allow_fallback=settings["allow_fallback"],
             )
+
+    @app.get("/api/usage")
+    async def usage(recent: int = Query(50, ge=0, le=500)) -> dict[str, Any]:
+        """Tokens spent on LLM checks: totals, average per checked paper, latest checks."""
+        return checked.summary(recent)
 
     @app.get("/api/llm")
     async def llm_info() -> dict[str, Any]:
@@ -223,6 +269,8 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         ai: bool = False,
         autosave: bool = False,
         recheck: bool = False,
+        cursor: str = Query("*", max_length=500),
+        offset: int = Query(0, ge=0, le=MAX_SEARCH_LIMIT),
     ) -> StreamingResponse:
         async def stream() -> AsyncIterator[bytes]:
             j = llm.Judge() if ai else None
@@ -250,7 +298,7 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         ) -> AsyncIterator[bytes]:
             async with finder.client() as http:
                 try:
-                    hits, papers = await finder.epmc_search(
+                    hits, papers, next_cursor = await finder.epmc_search(
                         http,
                         q,
                         limit=limit,
@@ -259,6 +307,7 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
                         year_from=year_from,
                         year_to=year_to,
                         sort=sort,
+                        cursor=cursor,
                     )
                 except httpx.HTTPError as exc:
                     code = getattr(getattr(exc, "response", None), "status_code", "")
@@ -275,24 +324,28 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
                         "type": "meta",
                         "hits": hits,
                         "count": len(papers),
+                        # Where the next batch starts; "" when this was the last one.
+                        "next_cursor": next_cursor,
                         "llm": j.public() if j else None,
                     }
                 )
-                gate = asyncio.Semaphore(CONCURRENCY)
-
-                async def one(i: int, p: finder.Paper) -> tuple[int, finder.Paper]:
-                    async with gate:
+                # Ordered checks make the checkpoint exact: no later paper spends tokens
+                # after an earlier paper has exhausted the provider's quota.
+                for i, p in enumerate(papers):
+                    if i < offset:
+                        continue
+                    previous = None if recheck else checked.find(p)
+                    if previous is None:
                         try:
                             await asyncio.wait_for(finder.inspect(http, p), timeout=90)
-                        except Exception as exc:  # one bad paper must not end the stream
+                        except Exception as exc:
                             p.note = f"Inspection failed: {type(exc).__name__}"
-                    if j:  # outside the inspection gate: the LLM has its own rate limit
+                    if j:
                         await judge(j, p, autosave=autosave, search_terms=q, recheck=recheck)
-                    return i, p
-
-                tasks.extend(asyncio.create_task(one(i, p)) for i, p in enumerate(papers))
-                for task in asyncio.as_completed(tasks):
-                    i, p = await task
+                    if j and p.ai and "error" in p.ai:
+                        yield _line({"type": "paused", "offset": i,
+                                     "message": p.ai["error"]})
+                        return
                     yield _line({"type": "paper", "rank": i, "paper": p.to_dict()})
                 yield _line({"type": "done"})
 

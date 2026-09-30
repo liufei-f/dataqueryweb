@@ -5,7 +5,7 @@
   <h1>Saved records</h1>
   <p class="muted lede">Data locations you saved on the Find QTL data page, plus those the AI saved automatically
     because it was very sure (marked <strong>🤖 auto-saved</strong> — spot-check them and <strong>Confirm</strong>, or delete).
-    One row per publication and download location; saving the same pair again updates it and keeps your note.
+    One row per publication, listing every download location saved for it; saving a location again updates it and keeps your note.
     The download uses the column names of LocusView's qtl-data-agent review table.</p>
 
   <div class="rec-toolbar">
@@ -37,5 +37,5 @@
   </div>
   <p class="muted rec-path">Stored in <code>{{ db_path }}</code></p>
 </div>
-<script src="/static/js/records.js?v={{ version }}"></script>
+<script src="/static/js/records.js?v={{ asset_version() }}"></script>
 {% endblock %}

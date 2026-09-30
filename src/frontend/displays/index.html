@@ -16,13 +16,12 @@
       <input type="search" id="dq-input" class="dq-input" aria-label="Query" autofocus
              placeholder="Keywords — e.g. single-cell eQTL immune cells">
       <button type="submit" class="dq-submit" id="dq-submit">Search</button>
+      <button type="button" class="dq-next" id="dq-resume" hidden>Resume</button>
       <button type="button" class="dq-stop" id="dq-stop" hidden title="Stop reading papers; results so far are kept">Stop</button>
     </div>
     <div class="dq-filters" id="dq-search-options">
-      <label class="dq-limit" title="How many Europe PMC results to read (each takes time and, with the AI check, tokens)">
-        <span>Papers</span>
-        <input type="number" id="dq-limit" value="10" min="1" max="1000" step="1" inputmode="numeric" aria-label="Number of papers">
-      </label>
+      <span class="muted">All matching papers · automatically checked one by one</span>
+      <input type="hidden" id="dq-limit" value="50">
       <label class="dq-limit" title="Publication year range; leave either end empty for no limit">
         <span>Years</span>
         <input type="number" id="dq-year-from" min="1800" max="3000" step="1" placeholder="from" inputmode="numeric" aria-label="From year">
@@ -89,6 +88,10 @@
       <span class="dq-ai-model" id="dq-autosave-note"></span>
     </label>
   </div>
+  <details class="dq-usage" id="dq-usage" hidden>
+    <summary id="dq-usage-line" title="Tokens every AI check has spent, from the provider's own usage reports. A paper checked before is never sent to the AI again, so it costs nothing the second time."></summary>
+    <div id="dq-usage-detail"></div>
+  </details>
 
   <div id="dq-status" class="dq-status" hidden>
     <span class="dq-spinner" aria-hidden="true"></span><span id="dq-status-text"></span>
@@ -98,6 +101,12 @@
   <div id="dq-results-head" class="dq-results-head" hidden>
     <h2 id="dq-results-title">Results</h2>
     <span class="muted" id="dq-results-sub"></span>
+    <button type="button" class="dq-next" id="dq-next" hidden
+            title="Read the next batch of this search's papers. Papers the AI has already checked are not sent to it again."></button>
+    <label class="dq-limit">Journal
+      <select id="dq-journal" aria-label="Filter by journal"><option value="">All journals</option></select>
+    </label>
+    <span class="muted" id="dq-filter-count" aria-live="polite"></span>
     <label class="dq-check dq-check-inline">
       <input type="checkbox" id="dq-hide-empty"> Hide papers with no data source
     </label>
@@ -114,5 +123,6 @@
   </div>
   <div id="dq-results"></div>
 </div>
-<script src="/static/js/app.js?v={{ version }}"></script>
+<script src="/static/js/journals.js?v={{ asset_version() }}"></script>
+<script src="/static/js/app.js?v={{ asset_version() }}"></script>
 {% endblock %}

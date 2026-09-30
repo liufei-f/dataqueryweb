@@ -1,7 +1,9 @@
 """Saved records: data locations a curator confirmed as correct, kept in a local SQLite file.
 
-One record is one (publication, download location) pair — the unit a curator checks on the
-Find QTL data page. Saving the same pair again updates it instead of duplicating it.
+One record is one publication. Every download location saved for it — by a curator on the
+Find QTL data page, or by :func:`autosave` — is merged into that record's location list
+(``locations``, flattened into ``download_url`` etc. joined by "; "), so a paper never shows
+up as several rows. Saving a location already in the list updates it.
 The TSV/CSV export uses the column names of locusview's qtl-data-agent review table
 (qtl-data-agent/skills/qtl-data-finder/SKILL.md) plus a few DataQuery-specific ones, so a
 saved table can be handed to that pipeline.
@@ -20,6 +22,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -91,8 +94,61 @@ def title_key(title: str) -> str:
 
 
 def record_key(record: dict[str, Any]) -> str:
-    """Identity of a record: the publication plus the download location."""
-    return f"{paper_key(record)}|{url_key(str(record.get('download_url', '')))}"
+    """Identity of a record: the publication. Its locations live inside it."""
+    return paper_key(record)
+
+
+# The per-location fields. A record keeps its locations whole in ``locations`` (JSON) and
+# flattens them into these columns, "; "-joined in saved order, for display and export.
+LOCATION_FIELDS = ("download_url", "repository", "access_route", "content", "file_urls",
+                   "extraction_note")
+
+
+def _split(value: str) -> list[str]:
+    return [v.strip() for v in str(value or "").split("; ") if v.strip()]
+
+
+def _location(values: dict[str, Any]) -> dict[str, str]:
+    return {f: str(values.get(f) or "") for f in LOCATION_FIELDS}
+
+
+def _locations_of(row: dict[str, Any]) -> list[dict[str, str]]:
+    """A stored row's locations; a row from before the list existed is one location."""
+    try:
+        locs = json.loads(row.get("locations") or "[]")
+    except ValueError:
+        locs = []
+    if isinstance(locs, list) and locs:
+        return [_location(loc) for loc in locs if isinstance(loc, dict)]
+    return [_location(row)] if row.get("download_url") else []
+
+
+def _merge_locations(old: list[dict[str, str]], new: list[dict[str, str]]) -> list[dict[str, str]]:
+    """``old`` then ``new``; a location already present (same URL) is updated in place."""
+    out = list(old)
+    for loc in new:
+        at = next((i for i, o in enumerate(out)
+                   if url_key(o["download_url"]) == url_key(loc["download_url"])), None)
+        if at is None:
+            out.append(loc)
+        else:
+            out[at] = {f: loc[f] or out[at][f] for f in LOCATION_FIELDS}
+    return out
+
+
+def _flatten(locs: list[dict[str, str]]) -> dict[str, str]:
+    def joined(field: str, sep: str = "; ") -> str:
+        seen: list[str] = []
+        for loc in locs:
+            for v in (_split(loc[field]) if sep == "; " else [loc[field].strip()]):
+                if v and v.lower() not in (s.lower() for s in seen):
+                    seen.append(v)
+        return sep.join(seen)
+
+    flat = {f: joined(f) for f in LOCATION_FIELDS if f != "extraction_note"}
+    flat["download_url"] = "; ".join(loc["download_url"] for loc in locs)
+    flat["extraction_note"] = joined("extraction_note", " | ")
+    return flat
 
 
 class RecordStore:
@@ -111,21 +167,48 @@ class RecordStore:
             for col in TEXT_FIELDS:
                 if col not in have:
                     db.execute(f"ALTER TABLE records ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+            if "locations" not in have:
+                db.execute("ALTER TABLE records ADD COLUMN locations TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE records SET saved_by = 'human' WHERE saved_by = ''")
-            # Re-derive keys so rows saved under an older key rule still match (and dedupe).
-            for row in db.execute("SELECT * FROM records ORDER BY record_id").fetchall():
-                key = record_key(dict(row))
-                if key != row["record_key"]:
-                    clash = db.execute(
-                        "SELECT record_id FROM records WHERE record_key = ?", [key]
-                    ).fetchone()
-                    if clash:
-                        db.execute("DELETE FROM records WHERE record_id = ?", [row["record_id"]])
-                    else:
-                        db.execute(
-                            "UPDATE records SET record_key = ? WHERE record_id = ?",
-                            [key, row["record_id"]],
-                        )
+        self._migrate_keys()
+
+    def _migrate_keys(self) -> None:
+        """Re-derive keys, merging rows of one publication into its oldest record.
+
+        Records used to be one per (publication, location), so a paper could fill several
+        rows. Their locations join the oldest row; the merged record is human-saved if any
+        part was, and keeps every curator note. The database is copied aside first.
+        """
+        with self._connect() as db:
+            rows = [dict(r) for r in db.execute("SELECT * FROM records ORDER BY record_id")]
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            groups.setdefault(record_key(row), []).append(row)
+        stale = {k: g for k, g in groups.items()
+                 if len(g) > 1 or g[0]["record_key"] != k or not g[0].get("locations")}
+        if not stale:
+            return
+        if any(len(g) > 1 for g in stale.values()):
+            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+            shutil.copy2(self.path, self.path.with_name(f"{self.path.name}.bak-{stamp}"))
+        with self._connect() as db:
+            for key, group in stale.items():
+                keep, rest = group[0], group[1:]
+                locs: list[dict[str, str]] = []
+                for row in group:
+                    locs = _merge_locations(locs, _locations_of(row))
+                notes = [r["curator_note"] for r in group if r["curator_note"]]
+                values = {f: next((r[f] for r in group if r[f]), "") for f in TEXT_FIELDS}
+                values |= _flatten(locs)
+                values["curator_note"] = " | ".join(dict.fromkeys(notes))
+                values["saved_by"] = "human" if any(r["saved_by"] == "human" for r in group) else "auto"
+                for row in rest:
+                    db.execute("DELETE FROM records WHERE record_id = ?", [row["record_id"]])
+                db.execute(
+                    f"UPDATE records SET record_key = ?, locations = ?, "
+                    f"{', '.join(f'{f} = ?' for f in TEXT_FIELDS)} WHERE record_id = ?",
+                    [key, json.dumps(locs, ensure_ascii=False), *values.values(), keep["record_id"]],
+                )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -139,10 +222,12 @@ class RecordStore:
             db.close()
 
     def save(self, data: dict[str, Any], *, auto: bool = False) -> dict[str, Any]:
-        """Insert, or update the record with the same publication + download URL.
+        """Add this location to the publication's record, creating the record if needed.
 
         ``auto=True`` marks the record as saved by the LLM and leaves an existing human-saved
-        record untouched. A human save of an auto record turns it into a human one.
+        record untouched. A human save of an auto record turns it into a human one. Fields
+        about the publication take the newer non-empty value; the curator note is kept
+        unless the save brings one.
         """
         values = {f: _text(data.get(f)) for f in TEXT_FIELDS}
         values["saved_by"] = "auto" if auto else "human"
@@ -154,24 +239,52 @@ class RecordStore:
         now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         with self._connect() as db:
             existing = db.execute("SELECT * FROM records WHERE record_key = ?", [key]).fetchone()
-            if auto and existing is not None and existing["saved_by"] == "human":
-                return dict(existing)
-            assignments = ", ".join(
-                f"{f} = excluded.{f}" for f in TEXT_FIELDS if f != "curator_note"
-            )
-            # Keep the curator's note unless the new save brings one.
-            assignments += (
-                ", curator_note = CASE WHEN excluded.curator_note != '' "
-                "THEN excluded.curator_note ELSE records.curator_note END"
-            )
-            db.execute(
-                f"INSERT INTO records (record_key, {', '.join(TEXT_FIELDS)}, saved_at) "
-                f"VALUES (?, {', '.join('?' for _ in TEXT_FIELDS)}, ?) "
-                f"ON CONFLICT(record_key) DO UPDATE SET {assignments}, saved_at = excluded.saved_at",
-                [key, *values.values(), now],
-            )
+            if existing is None:
+                locs = [_location(values)]
+                values |= _flatten(locs)
+                db.execute(
+                    f"INSERT INTO records (record_key, {', '.join(TEXT_FIELDS)}, saved_at, locations) "
+                    f"VALUES (?, {', '.join('?' for _ in TEXT_FIELDS)}, ?, ?)",
+                    [key, *values.values(), now, json.dumps(locs, ensure_ascii=False)],
+                )
+            else:
+                old = dict(existing)
+                if auto and old["saved_by"] == "human":
+                    return old
+                locs = _merge_locations(_locations_of(old), [_location(values)])
+                merged = {f: values[f] or old[f] for f in TEXT_FIELDS}
+                merged |= _flatten(locs)
+                merged["curator_note"] = values["curator_note"] or old["curator_note"]
+                merged["saved_by"] = values["saved_by"]
+                db.execute(
+                    f"UPDATE records SET {', '.join(f'{f} = ?' for f in TEXT_FIELDS)}, "
+                    "saved_at = ?, locations = ? WHERE record_key = ?",
+                    [*merged.values(), now, json.dumps(locs, ensure_ascii=False), key],
+                )
             row = db.execute("SELECT * FROM records WHERE record_key = ?", [key]).fetchone()
         return dict(row)
+
+    def remove_location(self, record_id: int, url: str) -> dict[str, Any] | None:
+        """Drop one location; the record goes with its last one. None if nothing matched."""
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM records WHERE record_id = ?", [record_id]).fetchone()
+            if row is None:
+                return None
+            locs = _locations_of(dict(row))
+            left = [loc for loc in locs if url_key(loc["download_url"]) != url_key(url)]
+            if len(left) == len(locs):
+                return None
+            if not left:
+                db.execute("DELETE FROM records WHERE record_id = ?", [record_id])
+                return {"deleted": True}
+            flat = _flatten(left)
+            db.execute(
+                f"UPDATE records SET {', '.join(f'{f} = ?' for f in flat)}, locations = ? "
+                "WHERE record_id = ?",
+                [*flat.values(), json.dumps(left, ensure_ascii=False), record_id],
+            )
+            updated = db.execute("SELECT * FROM records WHERE record_id = ?", [record_id]).fetchone()
+        return dict(updated)
 
     def update_note(self, record_id: int, note: str) -> dict[str, Any] | None:
         return self.update(record_id, curator_note=note)
@@ -297,8 +410,11 @@ def autosave(
     """Save a paper's QTL-result locations when the LLM is sure enough; report what happened."""
     picks, reason = autosave_decision(paper, min_confidence, allow_fallback)
     saved = [store.save(from_paper(paper, s, search_terms), auto=True) for s in picks]
+    auto = [r for r in saved if r["saved_by"] == "auto"]
     return {
-        "saved": [r["record_id"] for r in saved if r["saved_by"] == "auto"],
+        # Every location of one paper lands in the same record, so this is one id at most.
+        "saved": list(dict.fromkeys(r["record_id"] for r in auto)),
+        "locations": len(auto),
         "reason": reason,
     }
 

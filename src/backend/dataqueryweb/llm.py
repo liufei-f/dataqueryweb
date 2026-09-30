@@ -375,6 +375,23 @@ class QuotaExhausted(Exception):
     """The provider refused because an account quota is used up."""
 
 
+def new_usage() -> dict[str, int]:
+    """Tokens one paper's check spent, summed over every model call it made."""
+    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+
+
+def add_usage(usage: dict[str, int] | None, reported: Any) -> None:
+    """Add a provider's ``usage`` block: chat (prompt/completion) or Responses (input/output)."""
+    if usage is None or not isinstance(reported, dict):
+        return
+    prompt = int(reported.get("prompt_tokens") or reported.get("input_tokens") or 0)
+    completion = int(reported.get("completion_tokens") or reported.get("output_tokens") or 0)
+    usage["prompt_tokens"] += prompt
+    usage["completion_tokens"] += completion
+    usage["total_tokens"] += int(reported.get("total_tokens") or prompt + completion)
+    usage["calls"] += 1
+
+
 class Judge:
     """Rate-limited LLM caller shared by all papers of one request."""
 
@@ -395,8 +412,10 @@ class Judge:
     async def aclose(self) -> None:
         await self.http.aclose()
 
-    async def _chat(self, config: LLMConfig, model: str, user: str) -> tuple[str, str]:
-        """(reply text, model name the provider reports actually answering)."""
+    async def _chat(
+        self, config: LLMConfig, model: str, user: str, usage: dict[str, int] | None = None
+    ) -> tuple[str, str]:
+        """(reply text, model name the provider reports actually answering); adds to ``usage``."""
         headers = {"Content-Type": "application/json"}
         if config.api_key:
             headers["Authorization"] = f"Bearer {config.api_key}"
@@ -411,7 +430,7 @@ class Judge:
         url = url if url.endswith("/openai") else f"{url}/chat/completions"
         for attempt in range(4):
             r = await self.http.post(url, headers=headers, json=body)
-            if r.status_code == 429 and QUOTA_RE.search(r.text):
+            if r.status_code in (402, 403, 429) and QUOTA_RE.search(r.text):
                 raise QuotaExhausted(r.text[:200])  # won't recover by waiting a few seconds
             if r.status_code in (429, 502, 503) and attempt < 3:  # rate limit / busy
                 wait = float(r.headers.get("retry-after") or 4 * (attempt + 1))
@@ -421,19 +440,25 @@ class Judge:
                 continue
             r.raise_for_status()
             data = r.json()
+            add_usage(usage, data.get("usage"))
             message = data["choices"][0]["message"]
             return str(message.get("content") or ""), str(data.get("model") or model)
         raise httpx.HTTPError("rate limited")
 
     async def judge(self, paper: Paper) -> dict[str, Any]:
-        """Text verdict, then — when needed and supported — a web-research pass."""
-        verdict = await self._judge_text(paper)
+        """Text verdict, then — when needed and supported — a web-research pass.
+
+        ``verdict["usage"]`` is every token both passes spent on this paper.
+        """
+        usage = new_usage()
+        verdict = await self._judge_text(paper, usage)
         if self.needs_research(paper, verdict):
             # Mark the text pass's picks now: research inserts sources, shifting indices.
             mark_picks(paper, verdict)
-            web = await self.research(paper)
+            web = await self.research(paper, usage)
             if web is not None:
-                return web
+                verdict = web
+        verdict["usage"] = usage
         return verdict
 
     def needs_research(self, paper: Paper, verdict: dict[str, Any]) -> bool:
@@ -445,7 +470,9 @@ class Judge:
             verdict.get("new_qtl_data") == "yes" and not verdict.get("data_sources")
         )
 
-    async def _judge_text(self, paper: Paper) -> dict[str, Any]:
+    async def _judge_text(
+        self, paper: Paper, usage: dict[str, int] | None = None
+    ) -> dict[str, Any]:
         errors = []
         for config in self.configs:
             user, ids = build_prompt(paper, config.max_text)
@@ -454,7 +481,7 @@ class Judge:
                     if (config.name, model) in self.exhausted:
                         continue
                     try:
-                        reply, used = await self._chat(config, model, user)
+                        reply, used = await self._chat(config, model, user, usage)
                         result = normalize(parse_json(reply), ids)
                         finish(
                             result,
@@ -477,7 +504,9 @@ class Judge:
 
     # ── web research (OpenAI Responses API + web_search tool) ──────────────────
 
-    async def _responses(self, config: LLMConfig, model: str, user: str) -> dict[str, Any]:
+    async def _responses(
+        self, config: LLMConfig, model: str, user: str, usage: dict[str, int] | None = None
+    ) -> dict[str, Any]:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {config.api_key}"}
         body = {
             "model": model,
@@ -488,10 +517,12 @@ class Judge:
         r = await self.http.post(
             f"{config.base_url.rstrip('/')}/responses", headers=headers, json=body, timeout=300
         )
-        if r.status_code == 429 and QUOTA_RE.search(r.text):
+        if r.status_code in (402, 403, 429) and QUOTA_RE.search(r.text):
             raise QuotaExhausted(r.text[:200])
         r.raise_for_status()
-        return dict(r.json())
+        data = dict(r.json())
+        add_usage(usage, data.get("usage"))
+        return data
 
     async def verify_url(self, url: str) -> str:
         """ "ok", "blocked" (exists but refuses robots), or "missing"."""
@@ -507,7 +538,9 @@ class Judge:
             return "ok"
         return "blocked" if r.status_code in (401, 403, 405, 429, 503) else "missing"
 
-    async def research(self, paper: Paper) -> dict[str, Any] | None:
+    async def research(
+        self, paper: Paper, usage: dict[str, int] | None = None
+    ) -> dict[str, Any] | None:
         config = self.config
         user = build_web_prompt(paper)
         async with self.gates[config.name]:
@@ -515,7 +548,7 @@ class Judge:
                 if (config.name, model) in self.exhausted:
                     continue
                 try:
-                    data = await self._responses(config, model, user)
+                    data = await self._responses(config, model, user, usage)
                     return await self._apply_research(paper, data, config, model)
                 except QuotaExhausted:
                     self.exhausted.add((config.name, model))

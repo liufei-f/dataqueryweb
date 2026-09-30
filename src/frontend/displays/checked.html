@@ -1,0 +1,33 @@
+{% extends "layout.html" %}
+{% block title %}AI-checked papers — DataQuery{% endblock %}
+{% block content %}
+<div class="dq">
+  <h1>AI-checked papers</h1>
+  <p class="muted lede">Every paper the AI has read, with its latest verdict and the download locations it found —
+    whether or not it was auto-saved. Check them here and <strong>Save</strong> the locations that are correct; they go to
+    <a href="/records">Saved records</a>. A paper listed here is never sent to the AI again when a search finds it
+    (use <em>Re-check with AI</em> on the search page to ask again).</p>
+
+  <div class="rec-toolbar">
+    <input type="search" id="chk-filter" class="dq-input" placeholder="Filter by title, DOI, species, tissue, repository…" aria-label="Filter checked papers">
+    <select id="chk-journal" class="rec-btn" aria-label="Filter by journal"><option value="">All journals</option></select>
+    <select id="chk-verdict" class="rec-btn" aria-label="AI verdict">
+      <option value="">Any verdict</option>
+      <option value="yes">New QTL data</option>
+      <option value="unsure">Unclear</option>
+      <option value="no">No new QTL data</option>
+      <option value="error">Check failed</option>
+    </select>
+    <select id="chk-saved" class="rec-btn" aria-label="Saved state">
+      <option value="">Saved or not</option>
+      <option value="unsaved">Not saved yet</option>
+      <option value="saved">Has saved locations</option>
+    </select>
+    <span class="muted rec-count" id="chk-count"></span>
+  </div>
+
+  <div id="chk-list"><p class="muted">Loading…</p></div>
+</div>
+<script src="/static/js/journals.js?v={{ asset_version() }}"></script>
+<script src="/static/js/checked.js?v={{ asset_version() }}"></script>
+{% endblock %}

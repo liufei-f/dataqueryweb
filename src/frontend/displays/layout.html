@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}DataQuery{% endblock %}</title>
-  <link rel="stylesheet" href="/static/css/base.css?v={{ version }}" />
+  <link rel="stylesheet" href="/static/css/base.css?v={{ asset_version() }}" />
   {% block head %}{% endblock %}
 </head>
 <body>
@@ -20,6 +20,7 @@
     <nav class="site-nav">
       <a href="/" class="{{ 'active' if active == 'search' else '' }}">Find QTL data</a>
       <a href="/records" class="{{ 'active' if active == 'records' else '' }}">Saved records</a>
+      <a href="/checked" class="{{ 'active' if active == 'checked' else '' }}">AI-checked papers</a>
       <a href="/about" class="{{ 'active' if active == 'about' else '' }}">How it works</a>
     </nav>
     <span class="version">v{{ version }}</span>

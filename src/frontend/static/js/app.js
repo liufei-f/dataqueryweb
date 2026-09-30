@@ -8,6 +8,7 @@
   const results = $("dq-results"), head = $("dq-results-head");
   const title = $("dq-results-title"), sub = $("dq-results-sub");
   const hideEmpty = $("dq-hide-empty"), hideLow = $("dq-hide-low");
+  const journalSel = $("dq-journal");
   const aiBox = $("dq-ai"), autoBox = $("dq-autosave");
   let reviewFilter = "all";
   const CONTENT = {
@@ -70,7 +71,9 @@
   // Same identity rules as records.paper_key / url_key / record_key on the server.
   const paperKey = (p) => String(p.doi || p.pmid || p.title || p.publication_title || "").trim().toLowerCase();
   const urlKey = (u) => String(u || "").trim().toLowerCase().replace(/^[a-z]+:\/\//, "").replace(/^www\./, "").replace(/\/+$/, "");
+  // A record is one paper; each of its saved locations is indexed as paper|url.
   const recordKey = (p, url) => `${paperKey(p)}|${urlKey(url)}`;
+  const recordUrls = (r) => String(r.download_url || "").split("; ").filter(Boolean);
 
   // Same as records.title_key on the server.
   const titleKey = (t) => String(t || "").toLowerCase().replace(/<[^>]+>/g, "").replace(/[^a-z0-9]+/g, "");
@@ -79,7 +82,7 @@
   function indexSaved(rows) {
     savedByKey = new Map(); savedByPaper = new Map(); savedById = new Map();
     for (const r of rows) {
-      savedByKey.set(r.record_key, r);
+      recordUrls(r).forEach((u) => savedByKey.set(`${r.record_key}|${urlKey(u)}`, r));
       push(savedByPaper, r.record_key.split("|")[0], r);
       push(savedById, r.doi && `doi:${r.doi.toLowerCase()}`, r);
       push(savedById, r.pmid && `pmid:${r.pmid}`, r);
@@ -102,7 +105,7 @@
   }
   // The saved record for one row: same paper, same download location.
   const savedRow = (p, s) => savedByKey.get(recordKey(p, s.url))
-    || savedFor(p).find((r) => urlKey(r.download_url) === urlKey(s.url));
+    || savedFor(p).find((r) => recordUrls(r).some((u) => urlKey(u) === urlKey(s.url)));
   async function loadSaved() {
     try {
       indexSaved(await (await fetch("/api/records")).json());
@@ -110,6 +113,29 @@
     } catch { /* the page still works without saved state */ }
   }
   loadSaved();
+
+  // ── token usage ────────────────────────────────────────────────────────
+  const fmtTok = (n) => (n = Number(n) || 0) >= 1e6 ? `${(n / 1e6).toFixed(2)}M`
+    : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
+  async function loadUsage() {
+    let u;
+    try { u = await (await fetch("/api/usage?recent=0")).json(); } catch { return; }
+    const box = $("dq-usage");
+    if (!u) return;
+    box.hidden = false;
+    if (!u.checks) {
+      $("dq-usage-line").textContent = "AI tokens used: 0 so far — counted from the next AI check";
+      $("dq-usage-detail").innerHTML = "<div>Every paper the AI reads is recorded with the tokens it used; a paper read before is not sent again.</div>";
+      return;
+    }
+    $("dq-usage-line").textContent = `AI tokens used: ${fmtTok(u.total_tokens)} in total · `
+      + `${u.checks} paper check${u.checks > 1 ? "s" : ""} (${u.papers} distinct papers) · `
+      + `average ${fmtTok(u.avg_tokens_per_check)} per paper`;
+    $("dq-usage-detail").innerHTML = `
+      <div>Prompt ${esc(fmtTok(u.prompt_tokens))} · completion ${esc(fmtTok(u.completion_tokens))} · ${u.calls} model calls${u.failed ? ` · ${u.failed} failed check${u.failed > 1 ? "s" : ""} (tokens counted, verdict not reused)` : ""}</div>
+      ${(u.by_model || []).map((m) => `<div>${esc(m.model || "unknown model")}: ${esc(fmtTok(m.total))} over ${m.checks} check${m.checks > 1 ? "s" : ""}</div>`).join("")}`;
+  }
+  loadUsage();
   // Records may be saved or deleted in another tab (e.g. on Saved records).
   document.addEventListener("visibilitychange", () => { if (!document.hidden) loadSaved(); });
 
@@ -141,7 +167,7 @@
     b.addEventListener("click", () => { setMode(b.dataset.mode); input.focus(); }));
   document.querySelectorAll(".dq-chip").forEach((c) =>
     c.addEventListener("click", () => { input.value = c.textContent.trim(); form.requestSubmit(); }));
-  [hideEmpty, hideLow].forEach((el) => el.addEventListener("change", renderAll));
+  [hideEmpty, hideLow, journalSel].forEach((el) => el.addEventListener("change", renderAll));
   aiBox.addEventListener("change", () => { autoBox.disabled = !aiBox.checked; });
   document.querySelectorAll(".dq-review-btn").forEach((b) => b.addEventListener("click", () => {
     reviewFilter = b.dataset.f;
@@ -294,9 +320,12 @@
         <span class="dq-verdict-reason">${esc(ai.reason)}</span>
         ${criteriaHtml(ai)}
         ${ai.autosave ? `<span class="dq-autosave-line ${ai.autosave.saved.length ? "done" : ""}">${ai.autosave.saved.length
-          ? `🤖 Auto-saved ${ai.autosave.saved.length} record${ai.autosave.saved.length > 1 ? "s" : ""} (${esc(ai.autosave.reason)})`
+          ? `🤖 Auto-saved ${(n => `${n} location${n > 1 ? "s" : ""}`)(ai.autosave.locations || ai.autosave.saved.length)} to Saved records (${esc(ai.autosave.reason)})`
           : ai.new_qtl_data === "no" ? "" : `Needs human check: ${esc(ai.autosave.reason)}`}</span>` : ""}
         <span class="dq-verdict-model">${esc(ai.model)} · confidence ${Math.round((ai.confidence || 0) * 100)}%${ai.rubric ? ` (rubric ${esc(ai.rubric)})` : ""}
+          · ${ai.cached ? `reused the check of ${esc(String(ai.cached.checked_at || "").slice(0, 10))} — no tokens now (it used ${esc(fmtTok(ai.cached.tokens_then))})`
+            : `${esc(fmtTok((ai.usage || {}).total_tokens))} tokens`}
+          ${recheckRef ? `<button type="button" class="dq-recheck" data-p="${pi}" title="Ask the AI again instead of reusing the earlier check (uses tokens)">Re-check with AI</button>` : ""}
           · ${p.full_text ? `read full text (${Math.round((p.text_chars || 0) / 1000)}k chars)` : "no full text"}</span>
         ${ai.web ? `
         <details class="dq-web">
@@ -308,7 +337,8 @@
       </div>`;
     const recs = savedFor(p);
     const shownUrls = new Set(all.map((s) => urlKey(s.url)));
-    const elsewhere = recs.filter((r) => !shownUrls.has(urlKey(r.download_url)));
+    const elsewhere = recs.flatMap((r) => recordUrls(r)).filter((u) => !shownUrls.has(urlKey(u)))
+      .map((u) => ({ download_url: u }));
     const last = recs.map((r) => r.saved_at).sort().pop();
     const allAuto = recs.length && recs.every((r) => r.saved_by === "auto");
     const banner = recs.length ? `
@@ -333,13 +363,35 @@
       </article>`;
   }
 
+  // While a search streams, papers arrive one by one. Rebuilding every card for each
+  // arrival is quadratic — a 1000-paper search rebuilt ~500,000 cards and froze the page —
+  // so arrivals only schedule a redraw, at most one per RENDER_EVERY_MS.
+  const RENDER_EVERY_MS = 1000;
+  let renderTimer = null;
+  function scheduleRender() {
+    if (renderTimer) return;
+    // A redraw of hundreds of cards is itself heavy: give big batches more room.
+    const wait = papers.length > 300 ? 3 * RENDER_EVERY_MS : RENDER_EVERY_MS;
+    renderTimer = setTimeout(() => { renderTimer = null; renderAll(); }, wait);
+  }
+  // Same for re-reading Saved records after auto-saves: one fetch per interval, not per paper.
+  let savedTimer = null;
+  function scheduleSavedReload() {
+    if (savedTimer) return;
+    savedTimer = setTimeout(() => { savedTimer = null; loadSaved(); }, RENDER_EVERY_MS);
+  }
+
   function renderAll() {
+    if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+    DQJournals.update(journalSel, papers.filter(Boolean));
     const list = papers.map((p, pi) => p && Object.assign(p, { _pi: pi })).filter(Boolean)
+      .filter((p) => !journalSel.value || DQJournals.key(p) === journalSel.value)
       .filter((p) => !hideEmpty.checked || (p.sources || []).length || savedFor(p).length)
       .filter((p) => reviewFilter === "all" || category(p) === reviewFilter);
     const hidden = papers.filter(Boolean).length - list.length;
+    $("dq-filter-count").textContent = `${list.length} of ${papers.filter(Boolean).length} loaded papers`;
     const counts = { all: 0, check: 0, auto: 0, human: 0, no: 0 };
-    papers.filter(Boolean).forEach((p) => { counts.all++; counts[category(p)]++; });
+    papers.filter((p) => p && (!journalSel.value || DQJournals.key(p) === journalSel.value)).forEach((p) => { counts.all++; counts[category(p)]++; });
     document.querySelectorAll(".dq-review-btn").forEach((b) => {
       b.classList.toggle("active", b.dataset.f === reviewFilter);
       b.querySelector("span").textContent = counts[b.dataset.f];
@@ -382,6 +434,7 @@
       if (!resp.ok) throw new Error(body.detail || `HTTP ${resp.status}`);
       papers[pi] = body;
       await loadSaved();
+      loadUsage();
       renderAll();
     } catch (err) {
       btn.disabled = false;
@@ -404,8 +457,8 @@
         });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
       } else if (saved) {
-        if (!confirm(`Remove this record from Saved records?\n${s.url}`)) { btn.disabled = false; return; }
-        const r = await fetch(`/api/records/${saved.record_id}`, { method: "DELETE" });
+        if (!confirm(`Remove this location from Saved records?\n${s.url}`)) { btn.disabled = false; return; }
+        const r = await fetch(`/api/records/${saved.record_id}?url=${encodeURIComponent(s.url)}`, { method: "DELETE" });
         if (!r.ok && r.status !== 404) throw new Error(`HTTP ${r.status}`);
       } else {
         const r = await fetch("/api/records", {
@@ -421,64 +474,94 @@
   });
 
   // ── requests ───────────────────────────────────────────────────────────
-  async function runSearch(q) {
-    const params = new URLSearchParams({
-      q, limit: limitValue(), qtl_only: $("dq-qtl-only").checked, source: $("dq-source").value,
-      sort: $("dq-sort").value, ...yearRange(),
+  const CHECKPOINT = "dq-search-checkpoint-v1";
+  const resumeBtn = $("dq-resume"), nextBtn = $("dq-next");
+  let continuing = null, checkpoint = null;
+  try { checkpoint = JSON.parse(localStorage.getItem(CHECKPOINT) || "null"); } catch { /* unavailable */ }
+  function saveCheckpoint() {
+    try {
+      if (checkpoint) localStorage.setItem(CHECKPOINT, JSON.stringify(checkpoint));
+      else localStorage.removeItem(CHECKPOINT);
+    } catch { /* private mode: in-memory resume still works */ }
+    resumeBtn.hidden = !checkpoint;
+    resumeBtn.disabled = !!controller && submit.disabled;
+  }
+  saveCheckpoint();
+  resumeBtn.addEventListener("click", () => {
+    if (!checkpoint || submit.disabled) return;
+    continuing = structuredClone(checkpoint);
+    input.value = checkpoint.q;
+    setMode("search");
+    form.requestSubmit();
+  });
+
+  async function runSearch(q, cont = null) {
+    const options = cont ? cont.options : {
+      q, limit: Math.min(50, maxLimit), qtl_only: $("dq-qtl-only").checked,
+      source: $("dq-source").value, sort: $("dq-sort").value, ...yearRange(),
       ai: aiBox.checked, autosave: aiBox.checked && autoBox.checked,
-    });
-    const resp = await fetch(`/api/search?${params}`, { signal: controller.signal });
-    if (!resp.ok) throw new Error(`Search failed (HTTP ${resp.status})`);
-    const reader = resp.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "", total = 0, done = 0;
-    progress.done = 0; progress.total = 0;
-    const verb = aiBox.checked ? "Reading and AI-checking" : "Reading";
+    };
+    checkpoint = cont || { q, options, cursor: "*", offset: 0, completed: 0, hits: 0 };
+    saveCheckpoint();
+    nextBtn.hidden = true;
     setStatus("Searching Europe PMC…", { progress: 0 });
     for (;;) {
-      const { value, done: end } = await reader.read();
-      if (end) break;
-      buf += dec.decode(value, { stream: true });
-      let nl;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
-        if (!line) continue;
-        const msg = JSON.parse(line);
-        if (msg.type === "error") throw new Error(msg.message);
-        if (msg.type === "meta") {
-          total = msg.count; progress.total = total;
-          papers = new Array(total);
-          head.hidden = false;
-          title.textContent = `Results for “${q}”`;
-          const yr = yearRange();
-          const range = yr.year_from || yr.year_to ? ` · ${yr.year_from || "…"}–${yr.year_to || "…"}` : "";
-          const order = $("dq-sort").value === "newest" ? "newest" : "top";
-          sub.textContent = `${msg.hits.toLocaleString()} matching papers in Europe PMC${range} · reading the ${order} ${total}`;
-          if (!total) { setStatus("No papers matched.", { busy: false }); return; }
-          setStatus(`${verb} 0 of ${total} papers…`, { progress: 0 });
-        } else if (msg.type === "paper") {
-          papers[msg.rank] = msg.paper; done++; progress.done = done;
-          if (msg.paper.ai && msg.paper.ai.autosave && msg.paper.ai.autosave.saved.length) await loadSaved();
-          renderAll();
-          setStatus(`${verb} ${done} of ${total} papers…`, { progress: done / total });
-        } else if (msg.type === "done") {
-          const already = papers.filter((p) => p && savedFor(p).length).length;
-          const skipped = papers.filter((p) => p && p.ai && p.ai.skipped).length;
-          const autoNow = papers.filter((p) => p && p.ai && p.ai.autosave && p.ai.autosave.saved.length).length;
-          const alreadyText = (autoNow ? ` · ${autoNow} auto-saved` : "")
-            + (already - autoNow > 0 ? ` · ${already - autoNow} already in Saved records` : "")
-            + (skipped ? ` (${skipped} not sent to the AI again)` : "");
-          if (aiBox.checked) {
-            const judged = papers.filter((p) => p && p.ai && !p.ai.error && !p.ai.skipped);
-            const isNew = judged.filter((p) => p.ai.new_qtl_data === "yes");
-            const open = isNew.filter((p) => p.ai.download_status === "open").length;
-            setStatus(`Read ${total} papers · AI: ${isNew.length} with new QTL data (${open} openly downloadable), ${judged.filter((p) => p.ai.new_qtl_data === "no").length} without${judged.length + skipped < total ? ` · ${total - judged.length - skipped} not judged` : ""}${alreadyText}.`, { busy: false, progress: 1 });
-          } else {
-            const found = papers.filter((p) => p && p.sources.some((s) => s.relevance === "high")).length;
-            setStatus(`Read ${total} papers · ${found} with a high-relevance QTL data source${alreadyText}.`, { busy: false, progress: 1 });
+      const current = checkpoint;
+      const params = new URLSearchParams({ ...options, cursor: current.cursor, offset: current.offset });
+      const resp = await fetch(`/api/search?${params}`, { signal: controller.signal });
+      if (!resp.ok) throw new Error(`Search failed (HTTP ${resp.status})`);
+      const reader = resp.body.getReader(), dec = new TextDecoder();
+      let buf = "", nextCursor = "", finished = false;
+      for (;;) {
+        const { value, done: end } = await reader.read();
+        if (end) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const msg = JSON.parse(line);
+          if (msg.type === "error") throw new Error(msg.message);
+          if (msg.type === "meta") {
+            current.hits = msg.hits;
+            nextCursor = msg.next_cursor || "";
+            progress.total = msg.hits; progress.done = current.completed;
+            head.hidden = false;
+            title.textContent = `Results for “${q}”`;
+            sub.textContent = `${msg.hits.toLocaleString()} matching papers · checking all results`;
+            saveCheckpoint();
+          } else if (msg.type === "paper") {
+            papers.push(msg.paper);
+            current.offset = msg.rank + 1;
+            current.completed++;
+            progress.done = current.completed;
+            saveCheckpoint();
+            if (msg.paper.ai?.autosave?.saved.length) scheduleSavedReload();
+            scheduleRender();
+            setStatus(`Processed ${current.completed.toLocaleString()} of ${current.hits.toLocaleString()} papers · previously checked papers reuse their verdict.`,
+              { progress: current.hits ? current.completed / current.hits : 0 });
+          } else if (msg.type === "paused") {
+            current.offset = msg.offset;
+            saveCheckpoint();
+            renderAll(); loadUsage();
+            setStatus(`Paused after ${current.completed.toLocaleString()} papers: ${msg.message}. Resume when tokens are available or the problem is resolved.`,
+              { busy: false, progress: current.hits ? current.completed / current.hits : 0 });
+            return;
+          } else if (msg.type === "done") {
+            finished = true;
           }
         }
       }
+      if (!finished) throw new Error("Connection interrupted. Press Resume to continue.");
+      await loadSaved(); loadUsage();
+      if (!nextCursor) {
+        const completed = current.completed;
+        checkpoint = null; saveCheckpoint();
+        setStatus(`Completed all ${completed.toLocaleString()} papers. AI checks are saved in AI-checked papers.`, { busy: false, progress: 1 });
+        return;
+      }
+      current.cursor = nextCursor; current.offset = 0;
+      saveCheckpoint();
     }
   }
 
@@ -488,6 +571,7 @@
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(body.detail || `Lookup failed (HTTP ${resp.status})`);
     papers = [body];
+    loadUsage();
     if (body.ai && body.ai.autosave && body.ai.autosave.saved.length) await loadSaved();
     head.hidden = false;
     title.textContent = "Data sources";
@@ -520,17 +604,7 @@
     if (to) out.year_to = to;
     return out;
   }
-  // A large count is slow and, with the AI on, expensive: say so before the search starts.
-  function warnLimit() {
-    const n = Number(limitBox.value) || 0;
-    const warn = $("dq-limit-warn");
-    warn.hidden = n <= 50;
-    if (n > maxLimit) warn.textContent = `At most ${maxLimit} papers per search.`;
-    else if (n > 50) warn.textContent = `${n} papers will take a while${aiBox.checked
-      ? ` and, with the AI check on, may use a lot of tokens (≈20k per paper not already saved)` : ""}. You can Stop at any time; results so far are kept.`;
-  }
-  limitBox.addEventListener("input", warnLimit);
-  aiBox.addEventListener("change", warnLimit);
+  function warnLimit() { $("dq-limit-warn").hidden = true; }
   document.querySelectorAll(".dq-year-chip").forEach((b) => b.addEventListener("click", () => {
     const span = +b.dataset.years;
     yearFrom.value = span ? thisYear - span + 1 : "";
@@ -552,16 +626,20 @@
       ? `Stopped · ${progress.done} of ${progress.total} papers read — results so far are kept below.`
       : "Stopped.", { busy: false, progress: progress.total ? progress.done / progress.total : 0 });
     if (shown) renderAll();
+    saveCheckpoint();
   });
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    const q = input.value.trim();
+    const cont = continuing;
+    continuing = null;
+    const q = cont ? cont.q : input.value.trim();
     if (!q) { input.focus(); return; }
+    const previousQuery = lastQuery;
     lastQuery = q;
     if (controller) controller.abort();
     controller = new AbortController();
-    papers = []; results.innerHTML = ""; head.hidden = true;
+    if (!cont || previousQuery !== q) { journalSel.value = ""; papers = []; results.innerHTML = ""; head.hidden = true; }
     submit.disabled = true;
     stopBtn.hidden = false;
     const url = new URL(location.href);
@@ -574,12 +652,13 @@
     }
     history.replaceState(null, "", url);
     try {
-      await (mode === "search" ? runSearch(q) : runRef(q));
+      await (mode === "search" ? runSearch(q, cont) : runRef(q));
     } catch (err) {
       if (err.name !== "AbortError") setStatus(err.message, { busy: false, error: true });
     } finally {
       submit.disabled = false;
       stopBtn.hidden = true;
+      saveCheckpoint();
     }
   });
 
@@ -592,5 +671,11 @@
   if (["relevance", "newest"].includes(params.get("sort"))) $("dq-sort").value = params.get("sort");
   if (["all", "journal", "preprint"].includes(params.get("source"))) $("dq-source").value = params.get("source");
   warnLimit();
-  if (params.get("q")) { input.value = params.get("q"); form.requestSubmit(); }
+  // Restore the search but do not start it: a refresh used to re-run the whole search —
+  // up to 1000 papers — every time the page was opened.
+  if (params.get("q")) {
+    input.value = params.get("q");
+    setStatus("Press Search to run this search again (papers checked before reuse their AI verdict).",
+      { busy: false });
+  }
 })();
