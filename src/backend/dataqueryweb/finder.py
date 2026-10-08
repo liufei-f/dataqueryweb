@@ -21,6 +21,7 @@ import asyncio
 import html
 import re
 import xml.etree.ElementTree as ET
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -182,14 +183,24 @@ def client() -> httpx.AsyncClient:
 
 
 async def epmc_get(http: httpx.AsyncClient, params: dict[str, Any]) -> dict[str, Any]:
-    """Europe PMC search, retried on its occasional 429/5xx (it recovers within seconds)."""
-    for attempt in range(4):
-        r = await http.get(f"{EPMC}/search", params=params)
-        if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
-            await asyncio.sleep(2 * (attempt + 1))
-            continue
-        r.raise_for_status()
-        return dict(r.json())
+    """Retry temporary HTTP and transport failures without changing the search cursor."""
+    attempts = 6
+    for attempt in range(attempts):
+        try:
+            r = await http.get(f"{EPMC}/search", params=params)
+            r.raise_for_status()
+            return dict(r.json())
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in (429, 500, 502, 503, 504) or attempt == attempts - 1:
+                raise
+            delay = min(2 ** (attempt + 1), 30)
+            with suppress(ValueError):
+                delay = min(max(delay, float(exc.response.headers.get("retry-after", 0))), 30)
+        except httpx.TransportError:
+            if attempt == attempts - 1:
+                raise
+            delay = min(2 ** (attempt + 1), 30)
+        await asyncio.sleep(delay)
     raise httpx.HTTPError("unreachable")
 
 

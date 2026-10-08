@@ -82,3 +82,55 @@ def test_search_pauses_and_resumes_without_rechecking(tmp_path, monkeypatch):
     repeated = run()
     assert all(m["paper"]["ai"]["cached"] for m in repeated if m["type"] == "paper")
     assert calls == ["0", "1", "1", "2"]
+
+
+def test_epmc_retries_service_and_transport_failures(monkeypatch):
+    import httpx
+
+    attempts = []
+    waits = []
+
+    def respond(request):
+        attempts.append(dict(request.url.params))
+        if len(attempts) == 1:
+            return httpx.Response(503, headers={"Retry-After": "5"})
+        if len(attempts) == 2:
+            raise httpx.ConnectError("temporary connection failure", request=request)
+        return httpx.Response(200, json={"hitCount": 1})
+
+    async def sleep(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(finder.asyncio, "sleep", sleep)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            return await finder.epmc_get(client, {"query": "eqtl", "cursorMark": "saved"})
+
+    assert asyncio.run(run()) == {"hitCount": 1}
+    assert waits == [5, 4]
+    assert all(p["cursorMark"] == "saved" for p in attempts)
+
+
+def test_epmc_stops_retrying_after_six_attempts(monkeypatch):
+    import httpx
+    import pytest
+
+    attempts = []
+
+    def respond(request):
+        attempts.append(request)
+        return httpx.Response(503)
+
+    async def sleep(delay):
+        pass
+
+    monkeypatch.setattr(finder.asyncio, "sleep", sleep)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            return await finder.epmc_get(client, {"query": "eqtl"})
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(run())
+    assert len(attempts) == 6

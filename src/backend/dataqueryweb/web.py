@@ -199,7 +199,9 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
             return
         else:
             try:
-                verdict = await asyncio.wait_for(j.judge(p), timeout=300)
+                # A paper may need both a text check and a web-research pass. The
+                # latter alone may use the full 300-second provider timeout.
+                verdict = await asyncio.wait_for(j.judge(p), timeout=600)
             except TimeoutError:
                 verdict = {"error": "LLM timed out"}
             llm.apply(p, verdict)
@@ -315,7 +317,7 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
                         {
                             "type": "error",
                             "message": f"Europe PMC is temporarily unavailable ({code or type(exc).__name__}). "
-                            "Please try again in a minute.",
+                            "Search progress is kept. Please press Resume in a minute.",
                         }
                     )
                     return

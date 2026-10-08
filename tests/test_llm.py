@@ -115,6 +115,71 @@ def test_quota_limited_primary_falls_back() -> None:
     assert second["model"] == "Pollinations · gpt-oss-20b (fallback)"
 
 
+def test_chat_retries_one_transient_timeout(monkeypatch) -> None:
+    import asyncio
+
+    import httpx
+
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("slow proxy", request=request)
+        return httpx.Response(
+            200,
+            json={"model": "m", "choices": [{"message": {"content": "ok"}}]},
+        )
+
+    async def no_wait(_seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(llm.asyncio, "sleep", no_wait)
+    judge = llm.Judge([llm.LLMConfig("proxy", "http://proxy.example/v1", "k", ["m"], 1)])
+    judge.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def run() -> tuple[str, str]:
+        try:
+            return await judge._chat(judge.config, "m", "paper")
+        finally:
+            await judge.aclose()
+
+    assert asyncio.run(run()) == ("ok", "m")
+    assert calls == 2
+
+
+def test_gpt_6_1_chat_omits_unsupported_temperature() -> None:
+    import asyncio
+    import json
+
+    import httpx
+
+    sent: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"model": "gpt-6.1-sol", "choices": [{"message": {"content": "ok"}}]},
+        )
+
+    judge = llm.Judge(
+        [llm.LLMConfig("proxy", "http://proxy.example/v1", "k", ["gpt-6.1-sol"], 1)]
+    )
+    judge.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def run() -> None:
+        try:
+            await judge._chat(judge.config, "gpt-6.1-sol", "paper")
+        finally:
+            await judge.aclose()
+
+    asyncio.run(run())
+    assert sent["model"] == "gpt-6.1-sol"
+    assert "temperature" not in sent
+
+
 def test_text_excerpt_puts_data_paragraphs_first_within_budget() -> None:
     paras = [
         "[Intro] " + "x" * 50,

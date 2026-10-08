@@ -423,13 +423,23 @@ class Judge:
             headers["X-Title"] = "dataqueryweb"
         body = {
             "model": model,
-            "temperature": 0,
             "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
         }
+        # GPT-6.1 Sol uses reasoning by default, where temperature is unsupported.
+        if not model.startswith("gpt-6.1-"):
+            body["temperature"] = 0
         url = config.base_url.rstrip("/")
         url = url if url.endswith("/openai") else f"{url}/chat/completions"
         for attempt in range(4):
-            r = await self.http.post(url, headers=headers, json=body)
+            try:
+                r = await self.http.post(url, headers=headers, json=body)
+            except httpx.TimeoutException:
+                # A slow proxy response is transient. Retry once before pausing the
+                # search; the per-paper deadline still bounds the total wait.
+                if attempt == 0:
+                    await asyncio.sleep(2)
+                    continue
+                raise
             if r.status_code in (402, 403, 429) and QUOTA_RE.search(r.text):
                 raise QuotaExhausted(r.text[:200])  # won't recover by waiting a few seconds
             if r.status_code in (429, 502, 503) and attempt < 3:  # rate limit / busy

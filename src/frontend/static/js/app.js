@@ -478,6 +478,15 @@
   const resumeBtn = $("dq-resume"), nextBtn = $("dq-next");
   let continuing = null, checkpoint = null;
   try { checkpoint = JSON.parse(localStorage.getItem(CHECKPOINT) || "null"); } catch { /* unavailable */ }
+  function paperKeys(p) {
+    const keys = [];
+    for (const [field, value] of [["doi", p.doi], ["doi", p.published_doi], ["pmid", p.pmid],
+      ["pmcid", p.pmcid], ["epmc", p.epmc_id], ["title", p.title]]) {
+      const clean = String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+      if (clean) keys.push(`${field}:${clean}`);
+    }
+    return [...new Set(keys)];
+  }
   function saveCheckpoint() {
     try {
       if (checkpoint) localStorage.setItem(CHECKPOINT, JSON.stringify(checkpoint));
@@ -501,10 +510,18 @@
       source: $("dq-source").value, sort: $("dq-sort").value, ...yearRange(),
       ai: aiBox.checked, autosave: aiBox.checked && autoBox.checked,
     };
-    checkpoint = cont || { q, options, cursor: "*", offset: 0, completed: 0, hits: 0 };
+    if (cont && !Array.isArray(cont.processedIds)) {
+      // Older checkpoints counted cursor rows, including duplicates. Reconcile from
+      // the first page; successful checks are reused by the backend without tokens.
+      cont.cursor = "*"; cont.offset = 0; cont.completed = 0; cont.hits = 0;
+      cont.processedIds = [];
+      papers = [];
+    }
+    checkpoint = cont || { q, options, cursor: "*", offset: 0, completed: 0, hits: 0, processedIds: [] };
+    checkpoint.processedIds ||= [];
     saveCheckpoint();
     nextBtn.hidden = true;
-    setStatus("Searching Europe PMC…", { progress: 0 });
+    setStatus("Searching Europe PMC… Temporary service failures are retried automatically; you can Stop at any time.", { progress: 0 });
     for (;;) {
       const current = checkpoint;
       const params = new URLSearchParams({ ...options, cursor: current.cursor, offset: current.offset });
@@ -523,17 +540,24 @@
           const msg = JSON.parse(line);
           if (msg.type === "error") throw new Error(msg.message);
           if (msg.type === "meta") {
-            current.hits = msg.hits;
+            current.hits = Math.max(current.hits || 0, msg.hits || 0, current.completed || 0);
             nextCursor = msg.next_cursor || "";
-            progress.total = msg.hits; progress.done = current.completed;
+            progress.total = current.hits; progress.done = current.completed;
             head.hidden = false;
             title.textContent = `Results for “${q}”`;
-            sub.textContent = `${msg.hits.toLocaleString()} matching papers · checking all results`;
+            sub.textContent = `${current.hits.toLocaleString()} matching papers · checking all results`;
             saveCheckpoint();
           } else if (msg.type === "paper") {
-            papers.push(msg.paper);
+            const keys = paperKeys(msg.paper);
+            const seen = new Set(current.processedIds);
+            const duplicate = keys.some((key) => seen.has(key));
+            for (const key of keys) seen.add(key);
+            current.processedIds = [...seen];
+            if (!duplicate) {
+              papers.push(msg.paper);
+              current.completed++;
+            }
             current.offset = msg.rank + 1;
-            current.completed++;
             progress.done = current.completed;
             saveCheckpoint();
             if (msg.paper.ai?.autosave?.saved.length) scheduleSavedReload();
