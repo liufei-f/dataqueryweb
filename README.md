@@ -59,6 +59,37 @@ Everything else is left for a person. The page filters papers by review status: 
 check / auto-saved / saved by you / no new data. Auto-saved rows can be confirmed or removed.
 See `records.autosave`.
 
+## Manifest rows
+
+`dataqueryweb-manifest run` turns saved records into candidate rows of LocusCompare's
+`scripts/qtl_manifest.tsv`. For each record it lists the files behind every download location
+(Zenodo, figshare, GitHub, Hugging Face, OSF, direct links), reads each table's header and
+first rows without downloading the file, maps headers to manifest columns with fixed rules,
+re-reads the paper, and asks the LLM once for context, sample size, ancestry and genome build —
+each with a verbatim quote. A quote counts only when it is found in the text the model was
+given; everything else is flagged. Rows get a status (`ready`, `needs_review`,
+`needs_processing`, `not_loadable`) and are reviewed at `/manifest`, where a curator checks
+the evidence, corrects fields and approves. The rules are written out in
+[MANIFEST_RULES.md](MANIFEST_RULES.md).
+
+```bash
+uv run dataqueryweb-manifest run --limit 20          # next 20 unprocessed human records
+uv run dataqueryweb-manifest run --record 20 28      # these records again
+uv run dataqueryweb-manifest export --out rows.tsv --scope approved --format manifest
+```
+
+The result is kept in this repository: `manifest/qtl_manifest.tsv` (approved rows, the 27 manifest
+columns) and `manifest/qtl_manifest_candidates.tsv` (every row with status and evidence), both rewritten
+from the database on every change. LocusCompare's own manifest is only read, as a reference for
+dataset names and the context vocabulary.
+
+On the page, **Build rows → Start** does the same as `run` in the background of the server (progress,
+Stop, per-paper Rebuild), so nothing has to be typed in a terminal.
+
+API: `GET /api/manifest`, `PATCH /api/manifest/{row_id}`, `GET|POST /api/manifest/run`,
+`POST /api/manifest/run/stop`,
+`GET /api/manifest/export?scope=approved|ready|all&fmt=manifest|review`.
+
 ## Run
 
 中文使用说明（启动、重启、配置 LLM、API）见 [USAGE.md](USAGE.md).
@@ -79,10 +110,12 @@ uv run pytest                        # offline parsing tests
 
 ```
 src/backend/dataqueryweb/   web.py (FastAPI), finder.py (network), extract.py (pure parsing),
-                            llm.py (free-LLM verdict), records.py (saved records)
-src/frontend/displays/      Jinja templates (layout, index, about)
-src/frontend/static/        css/base.css, js/app.js
-tests/                      test_extract.py
+                            llm.py (free-LLM verdict), records.py (saved records),
+                            probe.py (list and read remote files), manifest_rules.py (manifest
+                            rules), manifest.py (candidate manifest rows, CLI)
+src/frontend/displays/      Jinja templates (layout, index, records, manifest, checked, about)
+src/frontend/static/        css/base.css, js/app.js, js/manifest.js, …
+tests/                      test_extract.py, test_manifest.py, …
 ```
 
 ### Automatic checking and Resume

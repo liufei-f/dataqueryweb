@@ -375,6 +375,10 @@ class QuotaExhausted(Exception):
     """The provider refused because an account quota is used up."""
 
 
+class LLMFailed(Exception):
+    """No configured model returned a usable answer."""
+
+
 def new_usage() -> dict[str, int]:
     """Tokens one paper's check spent, summed over every model call it made."""
     return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
@@ -413,7 +417,8 @@ class Judge:
         await self.http.aclose()
 
     async def _chat(
-        self, config: LLMConfig, model: str, user: str, usage: dict[str, int] | None = None
+        self, config: LLMConfig, model: str, user: str, usage: dict[str, int] | None = None,
+        system: str = SYSTEM, timeout: float | None = None,
     ) -> tuple[str, str]:
         """(reply text, model name the provider reports actually answering); adds to ``usage``."""
         headers = {"Content-Type": "application/json"}
@@ -423,7 +428,7 @@ class Judge:
             headers["X-Title"] = "dataqueryweb"
         body = {
             "model": model,
-            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         }
         # GPT-6.1 Sol uses reasoning by default, where temperature is unsupported.
         if not model.startswith("gpt-6.1-"):
@@ -432,7 +437,8 @@ class Judge:
         url = url if url.endswith("/openai") else f"{url}/chat/completions"
         for attempt in range(4):
             try:
-                r = await self.http.post(url, headers=headers, json=body)
+                r = await self.http.post(url, headers=headers, json=body,
+                                         **({"timeout": timeout} if timeout else {}))
             except httpx.TimeoutException:
                 # A slow proxy response is transient. Retry once before pausing the
                 # search; the per-paper deadline still bounds the total wait.
@@ -454,6 +460,33 @@ class Judge:
             message = data["choices"][0]["message"]
             return str(message.get("content") or ""), str(data.get("model") or model)
         raise httpx.HTTPError("rate limited")
+
+    async def ask(
+        self, system: str, user: str, usage: dict[str, int] | None = None,
+        timeout: float | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        """One JSON answer to ``system`` + ``user`` from the first model that gives one.
+
+        Returns (answer, "provider · model"); raises :class:`LLMFailed` naming what each
+        model did when none answers.
+        """
+        errors = []
+        for config in self.configs:
+            async with self.gates[config.name]:
+                for model in config.models:
+                    if (config.name, model) in self.exhausted:
+                        continue
+                    try:
+                        reply, used = await self._chat(config, model, user, usage, system, timeout)
+                        return parse_json(reply), f"{config.name} · {used}"
+                    except QuotaExhausted:
+                        self.exhausted.add((config.name, model))
+                        errors.append(f"{model}: usage limit")
+                    except httpx.HTTPStatusError as exc:
+                        errors.append(f"{model}: HTTP {exc.response.status_code} {exc.response.text[:160]}")
+                    except (httpx.HTTPError, ValueError, KeyError) as exc:
+                        errors.append(f"{model}: {type(exc).__name__}")
+        raise LLMFailed("; ".join(errors) or "no model configured")
 
     async def judge(self, paper: Paper) -> dict[str, Any]:
         """Text verdict, then — when needed and supported — a web-research pass.

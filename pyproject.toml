@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 dataqueryweb = "dataqueryweb.web:main"
+dataqueryweb-manifest = "dataqueryweb.manifest:main"
 
 [dependency-groups]
 dev = [

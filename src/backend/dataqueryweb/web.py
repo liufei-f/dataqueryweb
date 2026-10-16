@@ -6,6 +6,8 @@ soon as it is done, so the page fills in while slow publishers are still being r
 With ``ai=true`` each paper is also judged by a free LLM (llm.py): does it release new QTL
 data, and which of the found links downloads it. ``GET /api/llm`` reports the model in use.
 ``/api/records`` stores the rows a curator confirmed (records.py); ``/records`` lists them.
+``/api/manifest`` holds candidate qtl_manifest rows built from saved records (manifest.py),
+with the evidence for each field; ``/manifest`` is where a curator reviews and exports them.
 With ``autosave=true`` (and ``ai=true``), papers the LLM is very sure about are saved
 automatically (``records.autosave``); ``paper.ai.autosave`` says what was saved, or why not.
 Papers already in Saved records are not sent to the LLM (``paper.ai.skipped``) unless
@@ -15,6 +17,7 @@ Papers already in Saved records are not sent to the LLM (``paper.ai.skipped``) u
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from collections.abc import AsyncIterator, Coroutine
@@ -29,7 +32,8 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from dataqueryweb import __version__, checks, finder, llm, records, rubric
+from dataqueryweb import __version__, checks, finder, llm, manifest, records, rubric
+from dataqueryweb import manifest_rules as rules
 
 _FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
 CONCURRENCY = 5
@@ -68,6 +72,7 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
     app = FastAPI(title="dataqueryweb", version=__version__)
     saved = store or records.RecordStore()
     checked = checks.CheckStore(saved)
+    manifests = manifest.ManifestStore(saved.path)
     app.mount("/static", StaticFiles(directory=_FRONTEND / "static"), name="static")
     templates = Jinja2Templates(directory=_FRONTEND / "displays")
     # `?v=` on every script and stylesheet. The package version never changes between
@@ -163,6 +168,95 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
                 "Content-Disposition": f'attachment; filename="qtl-saved-records-{stamp}.{fmt}"'
             },
         )
+
+    @app.get("/manifest", response_class=HTMLResponse)
+    async def manifest_page(request: Request) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request, "manifest.html",
+            {"version": __version__, "active": "manifest", "db_path": str(saved.path),
+             "reference": rules.load_target().path, "rules_version": rules.RULES_VERSION,
+             "manifest_file": str(manifests.out_dir / manifest.MANIFEST_FILE),
+             "candidates_file": str(manifests.out_dir / manifest.CANDIDATES_FILE)},
+        )
+
+    @app.get("/api/manifest")
+    async def list_manifest() -> dict[str, Any]:
+        """Candidate manifest rows and per-location reports, with what explains them."""
+        papers = {r["record_id"]: {k: r[k] for k in ("publication_title", "doi", "first_author",
+                                                     "year", "journal", "qtl_type", "publication_url")}
+                  for r in saved.all()}
+        return {"rows": manifests.rows(), "locations": manifests.locations(), "records": papers,
+                "files": manifests.write_files(),
+                "issues": rules.ISSUES, "columns": rules.MANIFEST_COLUMNS,
+                "role_columns": list(rules.ROLE_COLUMN.values())}
+
+    @app.patch("/api/manifest/{row_id}")
+    async def edit_manifest_row(row_id: int, data: JsonBody) -> dict[str, Any]:
+        try:
+            row = manifests.update(
+                row_id, review=data.get("review"), reviewer_note=data.get("reviewer_note"),
+                fields=data.get("fields"))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if row is None:
+            raise HTTPException(404, "No such manifest row")
+        return row
+
+    @app.get("/api/manifest/export")
+    async def export_manifest(
+        scope: str = Query("approved", pattern="^(approved|ready|all)$"),
+        fmt: str = Query("manifest", pattern="^(manifest|review)$"),
+    ) -> PlainTextResponse:
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        return PlainTextResponse(
+            manifests.export(scope, fmt), media_type="text/tab-separated-values",
+            headers={"Content-Disposition": f'attachment; filename="qtl-manifest-{fmt}-{scope}-{stamp}.tsv"'},
+        )
+
+    def run_status() -> dict[str, Any]:
+        job: manifest.Batch | None = getattr(app.state, "manifest_job", None)
+        everything, done = saved.all(), manifests.processed()
+        human = [r for r in everything if not manifest.eligible(r)]
+        return {"job": job.snapshot() if job else None, "records": len(everything), "human": len(human),
+                "processed": len(done), "waiting": sum(r["record_id"] not in done for r in human),
+                "waiting_all_species": sum(r["record_id"] not in done for r in everything)}
+
+    @app.get("/api/manifest/run")
+    async def manifest_run_status() -> dict[str, Any]:
+        """Progress of the background run, and how many saved records still wait."""
+        return run_status()
+
+    @app.post("/api/manifest/run")
+    async def start_manifest_run(data: JsonBody) -> dict[str, Any]:
+        """Start building candidate rows in the background. One run at a time; it keeps
+        going when the page is closed, and each finished record is stored at once."""
+        job: manifest.Batch | None = getattr(app.state, "manifest_job", None)
+        if job is not None and job.running:
+            raise HTTPException(409, "A run is already in progress")
+        try:
+            ids = [int(x) for x in data.get("record_ids") or []]
+            limit = max(0, int(data.get("limit") or 0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "record_ids and limit must be numbers") from exc
+        todo = manifest.select(
+            saved.all(), manifests.processed(), record_ids=ids, limit=limit,
+            redo=bool(data.get("redo")), all_species=bool(data.get("all_species")))
+        if not todo:
+            raise HTTPException(400, "No such saved record" if ids else "No saved record is waiting")
+        job = manifest.Batch(todo, manifests, no_llm=bool(data.get("no_llm")),
+                             include_supplements=bool(data.get("include_supplements")))
+        job.task = asyncio.create_task(job.run())
+        app.state.manifest_job = job
+        return run_status()
+
+    @app.post("/api/manifest/run/stop")
+    async def stop_manifest_run() -> dict[str, Any]:
+        job: manifest.Batch | None = getattr(app.state, "manifest_job", None)
+        if job is not None and job.running:
+            job.stop()
+            with contextlib.suppress(asyncio.CancelledError):
+                await job.task  # type: ignore[misc]
+        return run_status()
 
     @app.get("/health")
     async def health() -> dict[str, str]:
