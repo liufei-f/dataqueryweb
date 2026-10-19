@@ -296,7 +296,7 @@ def test_dotenv_is_reread_and_shell_values_win(tmp_path, monkeypatch) -> None:  
 
 
 def test_mask_key_never_shows_the_secret() -> None:
-    key = "sk-Z0EZVWsgbdP1WWLsBYliexiRcLL45nXm92CTyZT6gZVYwMZq"
-    assert llm.mask_key(key) == "sk-Z0E…wMZq"
+    key = "sk-TEST0000000000000000000000000000000000000000FAKE"
+    assert llm.mask_key(key) == "sk-TES…FAKE"
     assert llm.mask_key("") == ""
     assert llm.key_id(key) != llm.key_id(key + "x") and len(llm.key_id(key)) == 10

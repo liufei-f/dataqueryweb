@@ -183,7 +183,8 @@ def test_a_row_keeps_the_evidence_for_every_fact() -> None:
     # The ancestry quote is not in any text: the value is kept, and flagged.
     assert row["population"] == "EUR" and evidence["population"]["verified"] is False
     assert "population_unverified" in r["issues"] and "paper_full_text_not_read" in r["issues"]
-    assert r["status"] == "needs_review"
+    # caQTL phenotype ids without peak coordinates stop the importer: processing is needed.
+    assert "peak_id_not_chr_start_end" in r["issues"] and r["status"] == "needs_processing"
 
 
 def test_rules_decide_the_status() -> None:
@@ -266,4 +267,51 @@ def test_a_run_is_started_watched_and_stopped_from_the_page(tmp_path: Path, monk
         assert status["job"]["state"] == "done" and status["job"]["tokens"] == 14
         assert len(built) == 2 and status["waiting"] == 0
         assert client.post("/api/manifest/run", json={}).status_code == 400  # nothing waits
+        papers = client.get("/api/manifest").json()["records"]
+        assert {p["n_locations"] for p in papers.values()} == {1} and papers[str(built[0])]["not_eligible"] == ""
+        assert sorted(client.get("/api/manifest").json()["built"]) == sorted(built)
         assert client.post("/api/manifest/run/stop").json()["job"]["state"] == "done"
+
+
+def test_build_clicks_join_the_queue_of_a_running_batch(tmp_path: Path) -> None:
+    store = manifest.ManifestStore(tmp_path / "r.sqlite3")
+    one, two = {"record_id": 1, "publication_title": "A"}, {"record_id": 2, "publication_title": "B"}
+    batch = manifest.Batch([one], store)
+    batch.current = {"record_id": 1}  # record 1 is being built
+    assert batch.queued() == []
+    assert batch.add([one, two]) == 1 and batch.queued() == [2]  # the one in progress is not queued twice
+    assert batch.add([two]) == 0 and batch.snapshot()["queue"] == [2]
+
+
+def test_a_dropped_connection_is_tried_again_and_explained(monkeypatch) -> None:
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ReadError("[Errno 54] Connection reset by peer")
+        return httpx.Response(200, content=b"gene\tsnp\tpval\nA\trs1\t0.1\n")
+
+    monkeypatch.setattr(probe.time, "sleep", lambda s: None)
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        got = probe.probe_file(http, probe.RemoteFile("x.tsv", "https://example.org/x.tsv"))
+    assert got.kind == "table" and len(calls) == 2
+
+    with httpx.Client(transport=httpx.MockTransport(lambda r: (_ for _ in ()).throw(httpx.ReadError("reset by peer")))) as http:
+        got = probe.probe_file(http, probe.RemoteFile("x.tsv", "https://example.org/x.tsv"))
+    assert got.kind == "error" and got.note.startswith("the server cut the connection")
+
+
+def test_what_needs_a_person_is_collected_per_paper() -> None:
+    loc = {"url": "https://data.bris.ac.uk/x", "status": "listed", "note": "", "inventory": [
+        {"path": "all.zip", "holds": "unknown_scope", "why": "the server cut the connection", "needs_hand": True},
+        {"path": "lead_snps.txt", "holds": "subset", "why": "lead SNPs only"},
+        {"path": "README.txt", "holds": "doc", "why": ""}]}
+    ftp = {"url": "ftp://ftp.example.org/qtl", "status": "manual", "note": "FTP server: open it with an FTP client", "inventory": []}
+    too_big = {"review": "pending", "issues": ["data_too_large"], "source_path": "chr*.parquet",
+               "evidence": {"data": {"status": "too_large", "note": "1244 GB would pass the 50 GB limit"}}}
+    hand = manifest.needs_you([too_big], [loc, ftp])
+    assert [h["what"] for h in hand] == ["all.zip", "ftp://ftp.example.org/qtl", "chr*.parquet"]
+    assert "50 GB" in hand[2]["why"]
+    # Subsets and documentation are not a person's job; a rejected row is not either.
+    assert manifest.needs_you([too_big | {"review": "rejected"}], [loc | {"inventory": loc["inventory"][1:]}]) == []

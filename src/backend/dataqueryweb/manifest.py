@@ -36,6 +36,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -45,7 +46,7 @@ from typing import Any
 
 import httpx
 
-from dataqueryweb import finder, llm, probe, records
+from dataqueryweb import fetch, finder, llm, probe, records
 from dataqueryweb import manifest_rules as rules
 
 MAX_PROBES = int(os.environ.get("MANIFEST_MAX_PROBES") or 14)  # files opened per location
@@ -82,6 +83,7 @@ class Candidate:
     note: str = ""
     access: str = ""
     cid: str = ""
+    needs_hand: bool = False  # the file could not be read here: a person has to fetch or open it
 
     @property
     def path(self) -> str:
@@ -180,7 +182,8 @@ def _retrieve_location(
                 out.append(Candidate(**base, issues=["header_not_read"], note="not opened (probe budget)"))
         elif not p.tables:
             note = p.note or (f"archive with {len(p.members)} members, none a readable table" if p.members else "")
-            out.append(Candidate(**base, issues=["header_not_read"], note=note))
+            out.append(Candidate(**base, issues=["header_not_read"], note=note,
+                                 needs_hand=p.kind in ("error", "unreadable")))
         else:
             for t in p.tables:
                 c = Candidate(**base, table=t, member=t.name, note=p.note)
@@ -189,7 +192,8 @@ def _retrieve_location(
                 out.append(c)
     _apply_file_rules(out)
     report["inventory"] = [
-        {"path": c.path, "n_files": len(c.files), "size": c.size, "holds": c.holds, "why": c.why or c.note}
+        {"path": c.path, "n_files": len(c.files), "size": c.size, "holds": c.holds, "why": c.why or c.note,
+         "needs_hand": c.needs_hand}
         for c in out][:200]
     report["inventory"] += [
         {"path": u.glob, "n_files": len(u.files), "size": u.size, "holds": "subset",
@@ -474,10 +478,9 @@ def assemble(
                                  "header_from": c.header_from, "note": c.note}
         else:
             evidence["table"] = {"columns": [], "rows": [], "note": c.note}
-        folder = re.sub(r"[^a-z0-9_\-]+", "_", name.lower())
-        row["file_path"] = f"/data/qtl_data/{folder}/{c.member.rsplit('/', 1)[-1] if c.member else c.glob}"
-        evidence["file_path"] = ev(row["file_path"], "rule: /data/qtl_data/<dataset>/<source path>",
-                                   note="proposed; the file still has to be downloaded")
+        row["file_path"] = f"{fetch.folder_name(name)}/{fetch.safe_rel(c.glob)}"
+        evidence["file_path"] = ev(row["file_path"], "rule: <dataset>/<path in the repository>",
+                                   note="relative to the data folder; not downloaded")
 
         # Context.
         l1 = rules.label(u.get("level_1_context") or "")
@@ -646,6 +649,34 @@ def output_dir(db: Path) -> Path:
     return root / "manifest" if db.resolve().parent == root / "data" else db.parent / "manifest"
 
 
+# Row issues that only a person can settle (fetch the files elsewhere, raise the limit).
+HAND_ISSUES = {"download_failed", "data_too_large"}
+
+
+def needs_you(rows: list[dict[str, Any]], locations: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """What a person has to do before this paper can give (more) manifest rows: locations
+    to open by hand, files the server would not hand over, downloads that failed or were
+    over the limit. Empty when nothing waits on a person."""
+    out = []
+    for loc in locations:
+        if loc["status"] in ("manual", "error"):
+            out.append({"what": loc["url"], "why": loc["note"] or loc["status"]})
+        for item in loc["inventory"]:
+            if item.get("needs_hand"):
+                out.append({"what": item["path"], "why": item["why"]})
+    for r in rows:
+        if r["review"] == "rejected":
+            continue
+        for issue in HAND_ISSUES & set(r["issues"]):
+            note = (r["evidence"].get("data") or {}).get("note", "")
+            out.append({"what": r["source_path"], "why": f"{rules.ISSUES[issue]}{f' ({note})' if note else ''}"})
+    return out
+
+
+def row_key(record_id: int, c: Candidate) -> str:
+    return f"{record_id}|{records.url_key(c.location)}|{c.path}"
+
+
 class ManifestStore:
     """Candidate rows and per-location reports, in the records database."""
 
@@ -682,7 +713,7 @@ class ManifestStore:
             for r in rows:
                 c: Candidate = r["candidate"]
                 per_location[c.location] = per_location.get(c.location, 0) + 1
-                key = f"{record_id}|{records.url_key(c.location)}|{c.path}"
+                key = row_key(record_id, c)
                 if key in kept:
                     continue
                 values = {
@@ -707,6 +738,13 @@ class ManifestStore:
                      per_location.get(rep["url"], 0), json.dumps(rep["inventory"], ensure_ascii=False),
                      run_note, tokens, model, now])
         self.write_files()
+
+    def kept(self, record_id: int) -> set[str]:
+        """Row keys a rebuild leaves alone: approved, rejected or edited by a person."""
+        with self._connect() as db:
+            return {r[0] for r in db.execute(
+                "SELECT row_key FROM manifest_rows WHERE record_id = ? AND (review != 'pending' OR edited != '[]')",
+                [record_id])}
 
     def processed(self) -> set[int]:
         with self._connect() as db:
@@ -817,15 +855,22 @@ def eligible(record: dict[str, Any], *, all_species: bool = False) -> str:
 async def build_record(
     record: dict[str, Any], store: ManifestStore, judge: llm.Judge | None, *,
     target: rules.Target | None = None, include_supplements: bool = False,
+    step: Callable[[str], None] | None = None, data: fetch.Options | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
-    """Run the whole pipeline for one saved record and store the result."""
+    """Run the whole pipeline for one saved record and store the result.
+
+    ``step`` hears what is being done, for a progress line."""
+    step = step or (lambda _: None)
     target = target or rules.load_target()
+    step("listing the files and reading their headers")
     candidates, reports, texts = await asyncio.to_thread(
         retrieve, record, include_supplements=include_supplements)
     facts, model, note = None, "", ""
     usage = llm.new_usage()
     paper = None
     if candidates:
+        step(f"reading the paper ({len(candidates)} candidate table{'s' if len(candidates) != 1 else ''})")
         paper = await read_paper(record)
         if judge is not None:
             system = SYSTEM.format(level_1=", ".join(target.level_1))
@@ -833,6 +878,8 @@ async def build_record(
                 batch = candidates[start:start + LLM_BATCH]
                 prompt = build_prompt(record, paper, batch, texts, reports)
                 for attempt in (1, 2):  # a dropped stream or timeout is worth one more try
+                    step(f"asking the AI about tables {start + 1}–{start + len(batch)} of {len(candidates)}"
+                         + (" (second try)" if attempt == 2 else ""))
                     try:
                         answer, model = await judge.ask(system, prompt, usage, LLM_TIMEOUT)
                     except llm.LLMFailed as exc:
@@ -849,12 +896,24 @@ async def build_record(
                     break
         else:
             note = "LLM step skipped (--no-llm)"
+    step("checking the quotes")
     rows = assemble(record, paper, candidates, facts, texts, target)
+    if data is not None and rows:
+        rid = record["record_id"]
+        plan_model = await fetch.fetch_rows(
+            rows, rows[0]["row"]["dataset"], judge, usage, data, skip=store.kept(rid),
+            key=lambda c: row_key(rid, c), step=step, cancel=cancel)
+        model = model or plan_model
+    step("saving")
     store.save_run(record["record_id"], rows, reports, model=model, tokens=usage["total_tokens"], run_note=note)
     statuses: dict[str, int] = {}
     for r in rows:
         statuses[r["status"]] = statuses.get(r["status"], 0) + 1
-    return {"record_id": record["record_id"], "rows": len(rows), "statuses": statuses,
+    data_states: dict[str, int] = {}
+    for r in rows:
+        if d := r["evidence"].get("data"):
+            data_states[d["status"]] = data_states.get(d["status"], 0) + 1
+    return {"record_id": record["record_id"], "rows": len(rows), "statuses": statuses, "data": data_states,
             "locations": {r["url"]: r["status"] for r in reports}, "tokens": usage["total_tokens"],
             "model": model, "note": note}
 
@@ -877,8 +936,10 @@ def select(
 def describe(record: dict[str, Any], result: dict[str, Any]) -> str:
     states = ", ".join(f"{n} {s}" for s, n in sorted(result["statuses"].items())) or "no candidate table"
     where = ", ".join(sorted(set(result["locations"].values())))
+    data = ", ".join(f"{n} {s.replace('_', ' ')}" for s, n in sorted(result.get("data", {}).items()) if s != "skipped")
     return (f"#{record['record_id']} {record['publication_title'][:60]!r}: {states} · locations: {where}"
-            f" · {result['tokens']:,} tokens{' · ' + result['note'] if result['note'] else ''}")
+            + (f" · data: {data}" if data else "")
+            + f" · {result['tokens']:,} tokens{' · ' + result['note'] if result['note'] else ''}")
 
 
 class Batch:
@@ -886,14 +947,16 @@ class Batch:
     background so it outlives the page that started it; the CLI awaits one directly."""
 
     def __init__(self, todo: list[dict[str, Any]], store: ManifestStore, *, no_llm: bool = False,
-                 include_supplements: bool = False, target: rules.Target | None = None) -> None:
-        self.todo, self.store, self.no_llm = todo, store, no_llm
+                 include_supplements: bool = False, target: rules.Target | None = None,
+                 data: fetch.Options | None = None) -> None:
+        self.todo, self.store, self.no_llm, self.data = todo, store, no_llm, data
+        self.cancel = threading.Event()  # tells download and processing threads to stop
         self.include_supplements, self.target = include_supplements, target
         self.state = "running"  # running | done | stopped | usage_limit
         self.done = self.failed = self.rows = self.tokens = 0
         self.current: dict[str, Any] | None = None
         self.log: list[dict[str, Any]] = []
-        self.started = datetime.now().isoformat(timespec="seconds")
+        self.started = datetime.now().astimezone().isoformat(timespec="seconds")
         self.finished = ""
         self.task: asyncio.Task[None] | None = None
 
@@ -901,15 +964,30 @@ class Batch:
     def running(self) -> bool:
         return self.state == "running"
 
+    def add(self, todo: list[dict[str, Any]]) -> int:
+        """Queue more records on a running batch; returns how many were new."""
+        have = {r["record_id"] for r in self.todo[self.done:]}
+        new = [r for r in todo if r["record_id"] not in have]
+        self.todo += new  # the loop below walks the list by position and sees these
+        return len(new)
+
+    def queued(self) -> list[int]:
+        start = self.done + (1 if self.current else 0)
+        return [r["record_id"] for r in self.todo[start:]] if self.running else []
+
     def snapshot(self) -> dict[str, Any]:
         return {"state": self.state, "total": len(self.todo), "done": self.done, "failed": self.failed,
                 "rows": self.rows, "tokens": self.tokens, "current": self.current, "log": self.log[-200:],
+                "queue": self.queued(),
                 "started": self.started, "finished": self.finished, "no_llm": self.no_llm,
-                "include_supplements": self.include_supplements}
+                "include_supplements": self.include_supplements,
+                "download": bool(self.data and self.data.download),
+                "max_gb": self.data.max_bytes / 1e9 if self.data else 0}
 
     def stop(self) -> None:
         """Drop the record in progress (nothing of it is stored yet) and end the run."""
         if self.running and self.task is not None:
+            self.cancel.set()
             self.task.cancel()
 
     async def run(self, echo: Callable[[str, bool], None] | None = None) -> None:
@@ -917,10 +995,13 @@ class Batch:
         try:
             for record in self.todo:
                 rid = record["record_id"]
-                self.current = {"record_id": rid, "title": record["publication_title"]}
+                self.current = current = {"record_id": rid, "title": record["publication_title"], "step": "",
+                                          "since": datetime.now().astimezone().isoformat(timespec="seconds")}
                 try:
                     result = await build_record(record, self.store, judge, target=self.target,
-                                                include_supplements=self.include_supplements)
+                                                include_supplements=self.include_supplements,
+                                                data=self.data, cancel=self.cancel,
+                                                step=lambda s, c=current: c.update(step=s, step_since=datetime.now().astimezone().isoformat(timespec="seconds")))
                 except Exception as exc:  # one bad record must not stop a batch
                     self.failed += 1
                     self.done += 1
@@ -944,7 +1025,7 @@ class Batch:
             self.state = "stopped"
         finally:
             self.current = None
-            self.finished = datetime.now().isoformat(timespec="seconds")
+            self.finished = datetime.now().astimezone().isoformat(timespec="seconds")
             if judge is not None:
                 await judge.aclose()
 
@@ -956,7 +1037,9 @@ async def run(args: argparse.Namespace) -> int:
     todo = select(saved.all(), store.processed(), record_ids=args.record, limit=args.limit,
                   redo=args.redo, all_species=args.all_species)
     print(f"{len(todo)} record(s) to process · reference manifest: {target.path or 'not found (built-in vocabulary)'}")
-    batch = Batch(todo, store, no_llm=args.no_llm, include_supplements=args.include_supplements, target=target)
+    data = fetch.Options(fetch.data_dir(store.path), download=not args.no_download, max_bytes=args.max_gb * 1e9)
+    batch = Batch(todo, store, no_llm=args.no_llm, include_supplements=args.include_supplements, target=target,
+                  data=data)
     await batch.run(lambda line, ok: print(line, file=sys.stdout if ok else sys.stderr))
     if batch.state == "usage_limit":
         print("Stopping: the LLM's usage limit is reached. Re-run later; finished records are kept.")
@@ -975,6 +1058,8 @@ def main() -> None:  # pragma: no cover
     r.add_argument("--no-llm", action="store_true", help="files and rules only: no tokens, no context or sample size")
     r.add_argument("--include-supplements", action="store_true", help="also open supplementary tables")
     r.add_argument("--all-species", action="store_true", help="do not restrict to human records")
+    r.add_argument("--no-download", action="store_true", help="fill the rows only; leave the files where they are")
+    r.add_argument("--max-gb", type=float, default=fetch.MAX_PAPER_GB, help="download at most this much per paper")
     r.add_argument("--target", help="path to the reference qtl_manifest.tsv, read only (default: $LC2_QTL_MANIFEST)")
     e = sub.add_parser("export", help="write the candidate rows as TSV")
     e.add_argument("--out", required=True)

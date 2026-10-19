@@ -32,7 +32,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from dataqueryweb import __version__, checks, finder, llm, manifest, records, rubric
+from dataqueryweb import __version__, checks, fetch, finder, llm, manifest, records, rubric
 from dataqueryweb import manifest_rules as rules
 
 _FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
@@ -68,11 +68,22 @@ def _line(obj: dict[str, Any]) -> bytes:
     return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def n_locations(record: dict[str, Any]) -> int:
+    """How many download locations a saved record lists (``locations`` is stored as JSON text)."""
+    raw = record.get("locations")
+    try:
+        found = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        found = None
+    return len(found) if isinstance(found, list) and found else 1
+
+
 def create_app(store: records.RecordStore | None = None) -> FastAPI:
     app = FastAPI(title="dataqueryweb", version=__version__)
     saved = store or records.RecordStore()
     checked = checks.CheckStore(saved)
     manifests = manifest.ManifestStore(saved.path)
+    data_root = fetch.data_dir(saved.path)  # downloaded and processed files
     app.mount("/static", StaticFiles(directory=_FRONTEND / "static"), name="static")
     templates = Jinja2Templates(directory=_FRONTEND / "displays")
     # `?v=` on every script and stylesheet. The package version never changes between
@@ -175,17 +186,25 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
             request, "manifest.html",
             {"version": __version__, "active": "manifest", "db_path": str(saved.path),
              "reference": rules.load_target().path, "rules_version": rules.RULES_VERSION,
-             "manifest_file": str(manifests.out_dir / manifest.MANIFEST_FILE),
+             "manifest_file": str(manifests.out_dir / manifest.MANIFEST_FILE), "data_root": str(data_root),
+             "max_gb": fetch.MAX_PAPER_GB,
              "candidates_file": str(manifests.out_dir / manifest.CANDIDATES_FILE)},
         )
 
     @app.get("/api/manifest")
     async def list_manifest() -> dict[str, Any]:
         """Candidate manifest rows and per-location reports, with what explains them."""
-        papers = {r["record_id"]: {k: r[k] for k in ("publication_title", "doi", "first_author",
-                                                     "year", "journal", "qtl_type", "publication_url")}
+        papers = {r["record_id"]: {**{k: r[k] for k in ("publication_title", "doi", "first_author", "year", "journal",
+                                                         "qtl_type", "qtl_context", "publication_url", "species", "saved_by")},
+                                   "n_locations": n_locations(r),
+                                   "not_eligible": manifest.eligible(r)}
                   for r in saved.all()}
-        return {"rows": manifests.rows(), "locations": manifests.locations(), "records": papers,
+        rows, locations = manifests.rows(), manifests.locations()
+        hand = {rid: manifest.needs_you([r for r in rows if r["record_id"] == rid],
+                                        [loc for loc in locations if loc["record_id"] == rid])
+                for rid in {loc["record_id"] for loc in locations}}
+        return {"rows": rows, "locations": locations, "records": papers,
+                "built": sorted(manifests.processed()), "needs_you": {k: v for k, v in hand.items() if v},
                 "files": manifests.write_files(),
                 "issues": rules.ISSUES, "columns": rules.MANIFEST_COLUMNS,
                 "role_columns": list(rules.ROLE_COLUMN.values())}
@@ -231,8 +250,6 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         """Start building candidate rows in the background. One run at a time; it keeps
         going when the page is closed, and each finished record is stored at once."""
         job: manifest.Batch | None = getattr(app.state, "manifest_job", None)
-        if job is not None and job.running:
-            raise HTTPException(409, "A run is already in progress")
         try:
             ids = [int(x) for x in data.get("record_ids") or []]
             limit = max(0, int(data.get("limit") or 0))
@@ -243,8 +260,17 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
             redo=bool(data.get("redo")), all_species=bool(data.get("all_species")))
         if not todo:
             raise HTTPException(400, "No such saved record" if ids else "No saved record is waiting")
+        if job is not None and job.running:  # a Build click while a run goes: join its queue
+            job.add(todo)
+            return run_status()
+        try:
+            max_gb = float(data.get("max_gb") or fetch.MAX_PAPER_GB)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "max_gb must be a number") from exc
+        options = fetch.Options(data_root, download=data.get("download", True) is not False,
+                                max_bytes=max(0.0, max_gb) * 1e9)
         job = manifest.Batch(todo, manifests, no_llm=bool(data.get("no_llm")),
-                             include_supplements=bool(data.get("include_supplements")))
+                             include_supplements=bool(data.get("include_supplements")), data=options)
         job.task = asyncio.create_task(job.run())
         app.state.manifest_job = job
         return run_status()

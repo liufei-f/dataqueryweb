@@ -78,13 +78,19 @@ uv run dataqueryweb-manifest run --record 20 28      # these records again
 uv run dataqueryweb-manifest export --out rows.tsv --scope approved --format manifest
 ```
 
+Each row's files are then downloaded to `data/<dataset>/` (git-ignored; at most 50 GB per paper by
+default). When the importer cannot read them as they are, the LLM picks a plan from a fixed menu
+(split a column, −log10 p / chi-square / z → p), the code carries it out, checks the values and writes
+`<name>_processed.tsv.gz`; `file_path` points at it, relative to the data folder (the importer's
+`--data-root`). See `fetch.py` and MANIFEST_RULES.md.
+
 The result is kept in this repository: `manifest/qtl_manifest.tsv` (approved rows, the 27 manifest
 columns) and `manifest/qtl_manifest_candidates.tsv` (every row with status and evidence), both rewritten
 from the database on every change. LocusCompare's own manifest is only read, as a reference for
 dataset names and the context vocabulary.
 
-On the page, **Build rows → Start** does the same as `run` in the background of the server (progress,
-Stop, per-paper Rebuild), so nothing has to be typed in a terminal.
+On the page every saved record is listed with a **Build manifest** button; builds run one after another
+in the background of the server (clicks queue up), and a built paper shows its rows behind **Check**.
 
 API: `GET /api/manifest`, `PATCH /api/manifest/{row_id}`, `GET|POST /api/manifest/run`,
 `POST /api/manifest/run/stop`,
@@ -111,7 +117,7 @@ uv run pytest                        # offline parsing tests
 ```
 src/backend/dataqueryweb/   web.py (FastAPI), finder.py (network), extract.py (pure parsing),
                             llm.py (free-LLM verdict), records.py (saved records),
-                            probe.py (list and read remote files), manifest_rules.py (manifest
+                            probe.py (list and read remote files), fetch.py (download and process data), manifest_rules.py (manifest
                             rules), manifest.py (candidate manifest rows, CLI)
 src/frontend/displays/      Jinja templates (layout, index, records, manifest, checked, about)
 src/frontend/static/        css/base.css, js/app.js, js/manifest.js, …

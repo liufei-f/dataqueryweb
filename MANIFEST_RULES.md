@@ -6,7 +6,7 @@
 
 把 Saved records 里 AI 自动确认的论文，变成与 LocusCompare `scripts/qtl_manifest.tsv` 同格式的**候选行**，保存在本仓库的 `manifest/qtl_manifest.tsv`（LocusCompare 那份只作参考，不写入）：
 一行 = 一个数据集 × 一种 QTL 类型 × 一个 context，指向一张完整的 nominal summary statistics 表
-（或一组按染色体拆分的 `chr*` 文件），并写明导入脚本要读的列名。
+（或一组按染色体拆分的 `chr*` 文件），并写明导入脚本要读的列名。数据文件同时下载到本仓库的 `data/` 目录（已在 `.gitignore` 里），导入脚本读不了的会处理成 `_processed` 后缀的副本。
 
 候选行要人工 Approve 后才进入 `manifest/qtl_manifest.tsv`。每个字段都带来源和证据，人工在 `/manifest` 页面核对、修改、Approve；全部候选行连同证据另存在 `manifest/qtl_manifest_candidates.tsv`。
 
@@ -19,8 +19,10 @@
 | 3 读论文 | `finder.py` | 重新读论文全文（Europe PMC / 出版商页面） | 否 |
 | 4 问 LLM | `manifest.py` | 每篇论文一次调用（表多时每 30 张一次，失败重试一次）：context、样本量、祖源、基因组版本、数据集名，每项附原文引用 | 是 |
 | 5 核对与组装 | `manifest.py` | 引用必须能在给 LLM 的文本里找到才算证据；按规则给出状态 | 否 |
+| 6 下载 | `fetch.py` | 把每行的原始文件下载到 `data/<dataset>/<仓库内路径>`，断点续传，受每篇大小上限和磁盘剩余空间限制 | 否 |
+| 7 识别与处理 | `fetch.py` | 用下载后的真实前几行重新识别列；导入脚本能直接读就用原文件，否则由 LLM 从固定操作中选方案，代码执行并逐列检查，写出 `<原名>_processed.tsv.gz` | 是（只选方案） |
 
-LLM 只回答文件本身说不出来的事实。列名、文件范围、路径、状态全部由固定规则决定，同样的输入总是得到同样的结果。
+LLM 只回答文件本身说不出来的事实，以及“这张表要怎么处理”（只能从固定操作里选）。列名、文件范围、路径、状态由固定规则决定；处理结果一律经过代码的数值检查。
 
 ## 3. 27 列各自怎么填
 
@@ -35,8 +37,8 @@ LLM 只回答文件本身说不出来的事实。列名、文件范围、路径�
 | `level_2_context` | LLM | 细胞类型、亚区或"细胞+条件"，下划线连接（`CD14_Mono`、`macrophage_IFNg`）；bulk 组织没有更细一层时留空 |
 | `population` | LLM | `EUR/EAS/AFR/AMR/SAS`，多祖源队列用 `ALL`；文本没写就留空并标 `population_missing` |
 | `sample_size` | 见 §6 | 进入该 context QTL mapping 的基因分型个体数（不是细胞数、不是 QC 前样本数、不是 GWAS 队列） |
-| `file_path` | 规则 | `/data/qtl_data/<dataset 小写>/<源路径>`，按染色体拆分的写成 `chr*`。这是建议路径，文件仍需人工下载 |
-| `delimiter` | 文件 | 从前几行判断：`\t`、`,`、`;` 或空格 |
+| `file_path` | 下载结果 | 相对于数据目录的路径（导入时用 `--data-root <数据目录>`）：`<dataset 小写>/<仓库内路径>`，处理过的指向 `<原名>_processed.tsv.gz`，按染色体拆分的写成 `chr*`。没下载成功时是将来的位置，并带对应 issue |
+| `delimiter` | 文件 | 从前几行判断：`\t`、`,`、`;` 或空格；处理过的文件一律 `\t` |
 | `chrom_col` … `phenotype_id_col` | 文件表头 | 见 §4 |
 | `gene_id` | 规则 | 一律留空（与现有 manifest 一致） |
 | `gene_id_mode` | 文件取样值 | eQTL/sQTL/pQTL：取样值全是 `ENSG…` → `self`；最后一个 `:` 段是 `ENSG…` → `phenotype_last_segment`；都不是 → 标 `phenotype_id_not_ensembl`。caQTL 留空，但要求 peak id 是 `chr_start_end` |
@@ -123,6 +125,32 @@ LLM 的每个值都要带一句原文引用。程序拿引用去比对**当时�
 4. 文件名里的数字（`…_175samples_…`）
 5. LLM 给了数字但引用没通过 → 标 `sample_size_unverified`
 
+## 6b. 下载与处理（`fetch.py`）
+
+**下载哪些行**：状态不是 `not_loadable`、不是子集、QTL 类型在 eQTL/sQTL/caQTL/pQTL 之内的行。已审核或改过的行重跑时不动。
+
+**存放**：`data/<dataset 小写>/<文件在仓库里的路径>`，不同数据集在不同文件夹。zip/tar 内的成员处理后放在 `data/<dataset>/<压缩包名>/`。
+
+**大小**：每篇论文默认最多 50 GB（页面上可改，或 `--max-gb`、`MANIFEST_MAX_GB`），并始终给磁盘留 20 GB；超出的行标 `data_too_large`，不下载。已存在且大小一致的文件不重复下载，中断的从 `.part` 续传。
+
+**能否直接用**：导入脚本用 `pandas.read_csv` 读单个分隔文本表，需要 chrom、position、ref、alt、p 值、phenotype 各自成列。下列任一情况就要处理：在压缩包里、parquet 或表格文件、没有表头、需要从别的列推出必需列、空白分隔、压缩格式与扩展名不符（如 `.bgz`）。可以直接用的，也会按导入脚本的读法读每个文件的前 2000 行并检查数值。
+
+**处理方案**：
+
+1. 下载后先用真实的前几十行重新识别列（parquet 在下载前只有列名）。
+2. 表头相同的表归为一类，每篇论文问 LLM 一次：给它列名、前 5 行和规则的识别结果，要它从下面的操作里选，或者回答“做不到”。
+   - `split`：按给定字符拆一列（`1:12345:A:G`、`chr1_12345_A_G_b38` → chrom、pos、ref、alt）
+   - `neglog10_to_p`：p = 10^-x
+   - `chisq_to_p`：1 自由度卡方 → p
+   - `z_to_p`：z → 双侧 p
+3. 代码执行方案，先在前 2000 行上检查：chrom 是染色体名、position 是整数、ref/alt 是碱基、p 值在 0–1 之间、phenotype 非空，每项至少 95% 合格。不合格就丢弃该方案，改用规则从表头推出的方案；两个都不合格，标 `processing_failed`，页面上列出试过的方案和失败原因。
+4. 通过后处理全部文件：保留原有全部列，追加新列，写成 tab 分隔的 `<原名>_processed.tsv.gz`，行数与原文件一致。原始文件保留。
+5. 用处理后文件的 phenotype 取样值重新判断 `gene_id_mode`，并更新 manifest 行的列名、分隔符和 `file_path`。
+
+LLM 只给方案，不写代码，也不直接改文件。
+
+**证据**：每行的 Data 一节记录下载的文件和大小、为什么要处理、执行的步骤及方案来源（AI 或规则）、被拒的方案、逐列检查结果、处理后文件的前 5 行。
+
 ## 7. 状态
 
 一行的状态由它最严重的 issue 决定：
@@ -130,7 +158,7 @@ LLM 的每个值都要带一句原文引用。程序拿引用去比对**当时�
 | 状态 | 含义 | 触发的 issue |
 |---|---|---|
 | `not_loadable` | 现有文件装不进 manifest | `not_full_summary_statistics` `required_column_missing` `header_not_read` |
-| `needs_processing` | 先做一步转换就能装 | `columns_need_deriving` `no_header` `format_needs_conversion` `peak_id_needs_reformat` `needs_liftover` |
+| `needs_processing` | 数据还不在可导入的状态 | `columns_need_deriving` `no_header` `format_needs_conversion` `peak_id_needs_reformat` `peak_id_not_chr_start_end` `needs_liftover` `data_not_downloaded` `data_too_large` `download_failed` `processing_failed` |
 | `needs_review` | 文件可用，但有事实待人工确认 | 其余任何 issue |
 | `ready` | 没有任何 issue | — |
 
@@ -155,6 +183,10 @@ dataqueryweb-manifest run --record 20 28
 # 只跑取文件和规则，不花 token（没有 context / 样本量 / 祖源）
 dataqueryweb-manifest run --limit 50 --no-llm
 
+# 只填表、不下载；或改每篇的下载上限
+dataqueryweb-manifest run --limit 20 --no-download
+dataqueryweb-manifest run --record 28 --max-gb 200
+
 # 导出：全部行 + 状态、issue、源文件、证据摘要
 dataqueryweb-manifest export --out candidates.tsv
 # 导出：只要已 Approve 的行，27 列，可直接追加到 qtl_manifest.tsv
@@ -163,10 +195,11 @@ dataqueryweb-manifest export --out approved.tsv --scope approved --format manife
 
 **网页 `/manifest`（推荐）**：
 
-- **Build rows** 面板：填"接下来处理几条"（默认 20）或指定记录号，点 **Start**。运行在服务器后台进行，关掉页面不影响；每篇论文跑完立刻出现在下方。**Stop** 会丢弃正在处理的那一篇并停止，已完成的保留。同一时间只能有一个运行。
-- 选项：打开补充材料表格、包含非人类记录、重跑已处理的记录、只跑文件和规则（不调用 AI）。
-- 每篇论文标题旁的 **Rebuild**：只重跑这一篇。
-- 按论文分组列出下载位置和候选行；点 **Check** 展开证据表、列映射、文件预览，可改字段，然后 Approve / Reject。重跑不会覆盖已审核或已修改过的行。
+- 页面列出全部 Saved records，一篇一行（默认只显示人类记录，每次显示 100 篇，可搜索，可筛选“未建 / 已建 / 有待查行 / 有已批准行”）。
+- 每篇右边的 **Build manifest**：为这篇填 manifest 行，并下载、处理数据。在服务器后台一篇接一篇进行；同时点了多篇会排队，关掉页面也会继续。建过的显示 **Built**、各状态行数、数据情况和检查进度，按钮变成 **Rebuild**。
+- 页面上方的设置对之后点的 Build 生效：是否下载并处理数据及每篇上限（GB）、是否打开补充材料表格、是否跳过 AI。
+- 运行时顶部有一条状态栏，显示正在建哪篇、哪一步、还有几篇排队；**Stop** 丢弃正在建的那篇并清空队列。
+- 已建的论文点 **Check**（括号里是待查行数）展开下载位置和候选行；每行再点 **Check** 展开证据表、列映射、数据处理记录和文件预览，可改字段，然后 Approve / Reject。Rebuild 不会覆盖已审核或已修改过的行。
 - **输出文件**（本仓库 `manifest/` 目录，每次运行、修改、Approve / Reject 后自动重写，数据库是唯一来源，不要手改这两个文件）：
   - `manifest/qtl_manifest.tsv`：已 Approve 的行，27 列，格式与 LocusCompare 的 manifest 相同。
   - `manifest/qtl_manifest_candidates.tsv`：全部候选行，附状态、issue、源文件和证据摘要。
@@ -175,14 +208,16 @@ dataqueryweb-manifest export --out approved.tsv --scope approved --format manife
 
 上面的命令行与网页做的是同一件事，适合不开浏览器时用。
 
-环境变量：`DATAQUERY_MANIFEST_DIR`（输出目录，默认本仓库 `manifest/`）、`LC2_QTL_MANIFEST`（参考 manifest 路径，只读，默认找同级目录的 `lc2_newfeature_backend/scripts/qtl_manifest.tsv`）、`MANIFEST_MAX_PROBES`、`MANIFEST_TEXT_CHARS`（给 LLM 的论文文本上限，默认 24000 字符）、`GITHUB_TOKEN`（GitHub 列文件限流时用）。
+环境变量：`DATAQUERY_DATA_DIR`（数据目录，默认本仓库 `data/`）、`MANIFEST_MAX_GB`（每篇默认下载上限，50）、`DATAQUERY_MANIFEST_DIR`（输出目录，默认本仓库 `manifest/`）、`LC2_QTL_MANIFEST`（参考 manifest 路径，只读，默认找同级目录的 `lc2_newfeature_backend/scripts/qtl_manifest.tsv`）、`MANIFEST_MAX_PROBES`、`MANIFEST_TEXT_CHARS`（给 LLM 的论文文本上限，默认 24000 字符）、`GITHUB_TOKEN`（GitHub 列文件限流时用）。
 
 默认只处理物种为 human 的记录；`--all-species` 取消这个限制。
 
 ## 9. 已知局限
 
-- 不下载文件。行里的 `file_path` 是建议路径，拆列、转格式、liftover 都要另外做。
-- parquet 只读到列名，看不到取样值，所以 variant id 和 phenotype id 的格式未经检查（`phenotype_values_not_seen`）。
+- 不做 liftover（GRCh37 → GRCh38）、不补 peak 坐标、不把 UniProt 等编号换成 Ensembl：这些行下载处理后仍是 `needs_processing` 或 `needs_review`。
+- 不处理 xlsx 表格文件（补充材料默认也不下载）。
+- 大数据集下载很慢、很占空间：TenK10K 一篇约 1.2 TB，Zenodo 实测约 3 MB/s。超过上限的行要在磁盘够大的机器上提高上限再跑。
+- 下载和处理在网页服务的进程里进行；服务重启会中断，重跑时已下载完的文件不再下载，`.part` 会续传。
 - 每个位置最多开 14 个文件；沿用兄弟文件表头的行需要抽查。
 - 论文全文读不到时不会联网搜索，事实只能来自摘要和仓库文本。
 - 兄弟文件只有两三个且名字有公共词头时，标签可能被切短（`B_naive` / `B_memory` → `naive` / `memory`）。

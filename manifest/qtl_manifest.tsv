@@ -1,2 +1,1 @@
 dataset	source_project_id	use_in_lc2	qtl_type	biocontext	level_1_context	level_2_context	population	sample_size	file_path	delimiter	chrom_col	position_col	ref_col	alt_col	beta_col	se_col	pval_col	rsid_col	maf_col	variant_id_col	phenotype_id_col	gene_id	gene_id_mode	median_tpm	url	publication
-Sun_2026	Sun_2026	FALSE	eQTL	skin	Skin		EAS	150	/data/qtl_data/sun_2026/skin eQTL summary statistics.txt	\t					slope	slope_se	pval_nominal		maf	variant_id	gene_id		self		https://zenodo.org/records/19638349	https://doi.org/10.1038/s41467-026-76575-4

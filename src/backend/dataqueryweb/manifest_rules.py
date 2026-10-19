@@ -647,11 +647,17 @@ ISSUES: dict[str, str] = {
     "publication_already_in_manifest": "The manifest already has rows for this publication.",
     "access_not_open": "The location is not an open download.",
     "llm_facts_missing": "The LLM step did not run or failed; context, sample size and ancestry are empty.",
+    "data_not_downloaded": "The files are not in the data folder yet (downloading was off).",
+    "data_too_large": "Not downloaded: over the per-paper size limit or the free disk space; raise the limit or download elsewhere.",
+    "download_failed": "Downloading the files failed; see the data section for the error.",
+    "processing_failed": "No processing plan produced values the importer accepts; see the plans that were tried.",
 }
 BLOCKING = {"not_full_summary_statistics", "required_column_missing", "header_not_read"}
 # Conversions a curator can do without going back to the authors.
 PROCESSING = {"columns_need_deriving", "no_header", "format_needs_conversion",
-              "peak_id_needs_reformat", "needs_liftover"}
+              "peak_id_needs_reformat", "needs_liftover",
+              "peak_id_not_chr_start_end",  # the importer stops on such ids (parse_caqtl_phenotype_loci)
+              "data_not_downloaded", "data_too_large", "download_failed", "processing_failed"}
 
 
 def status_of(issues: list[str]) -> str:

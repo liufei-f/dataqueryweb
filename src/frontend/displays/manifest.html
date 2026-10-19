@@ -5,59 +5,45 @@
   <h1>Manifest rows</h1>
   <p class="muted lede">Candidate rows in the format of LocusCompare's <code>qtl_manifest.tsv</code>, built from the download locations of
     <a href="/records">saved records</a>: the files were listed and their headers read, fixed rules mapped the columns, and the AI
-    read the paper for context, sample size, ancestry and genome build. Every value shows where it came from; a quote counts only
+    read the paper for context, sample size, ancestry and genome build. The files are then downloaded into the data folder and,
+    when the importer cannot read them as they are, processed into a <code>_processed</code> copy by a plan the AI chose from a fixed
+    set of operations and that passed value checks. Every value shows where it came from; a quote counts only
     when it was found in the text the AI was given (<span class="mf-ok">✓</span>), otherwise it is marked
-    <span class="mf-bad">✗ unverified</span>. Open a row to check the evidence, correct a field, then <strong>Approve</strong> or
-    <strong>Reject</strong>. Rules <code>{{ rules_version }}</code> are written out in <code>MANIFEST_RULES.md</code>.</p>
+    <span class="mf-bad">✗ unverified</span>. Press <strong>Build manifest</strong> on a paper; builds run on the server one after another, so you can
+    queue several and close the page. When a paper is built, press <strong>Check</strong> to open its rows, check the evidence,
+    correct a field, then <strong>Approve</strong> or <strong>Reject</strong>. Rules <code>{{ rules_version }}</code> are written out in <code>MANIFEST_RULES.md</code>.</p>
 
   <div class="rec-toolbar">
-    <input type="search" id="mf-filter" class="dq-input" placeholder="Filter by dataset, context, file, DOI, issue…" aria-label="Filter manifest rows">
-    <select id="mf-status" class="rec-btn" aria-label="Status">
-      <option value="">Any status</option>
-      <option value="ready">Ready</option>
-      <option value="needs_review">Needs review</option>
-      <option value="needs_processing">Needs processing</option>
-      <option value="not_loadable">Not loadable</option>
+    <input type="search" id="mf-filter" class="dq-input" placeholder="Filter papers by title, author, DOI, dataset, context, issue…" aria-label="Filter papers">
+    <select id="mf-show" class="rec-btn" aria-label="Show">
+      <option value="">All papers</option>
+      <option value="unbuilt">Not built yet</option>
+      <option value="built">Built</option>
+      <option value="needs">Needs you (a manual step)</option>
+      <option value="tocheck">Built, rows to check</option>
+      <option value="approved">With approved rows</option>
     </select>
-    <select id="mf-review" class="rec-btn" aria-label="Review">
-      <option value="">Any review</option>
-      <option value="pending">To check</option>
-      <option value="approved">Approved</option>
-      <option value="rejected">Rejected</option>
-    </select>
+    <label class="muted mf-check" title="Species is human (Homo sapiens). Records saved by the AI and by you are both listed."><input type="checkbox" id="mf-human" checked> Species: human only</label>
     <span class="muted rec-count" id="mf-count"></span>
     <a class="rec-btn primary" href="/api/manifest/export?scope=approved&fmt=manifest" title="The 27 manifest columns, approved rows only">Download approved (manifest TSV)</a>
     <a class="rec-btn" href="/api/manifest/export?scope=all&fmt=review" title="Every row with status, issues, source files and evidence">Download all with evidence</a>
   </div>
-  <section class="mf-run" aria-label="Build rows">
-    <div class="mf-run-head">
-      <h2>Build rows</h2>
-      <span class="muted" id="mf-waiting"></span>
-    </div>
-    <div class="rec-toolbar">
-      <label class="muted" for="mf-limit">Next</label>
-      <input type="number" id="mf-limit" class="dq-input mf-num" min="1" value="20" aria-label="How many records">
-      <span class="muted">waiting records, or record #</span>
-      <input type="text" id="mf-record" class="dq-input mf-ids" placeholder="e.g. 20, 28" aria-label="Saved record numbers">
-      <button type="button" class="rec-btn primary" id="mf-run">Start</button>
-      <button type="button" class="rec-btn" id="mf-stop" hidden>Stop</button>
-    </div>
-    <div class="mf-opts">
-      <label><input type="checkbox" id="mf-supp"> Also open supplementary tables <span class="muted">(slower; usually significant hits only)</span></label>
-      <label><input type="checkbox" id="mf-species"> Include non-human records</label>
-      <label><input type="checkbox" id="mf-redo"> Rebuild records already done <span class="muted">(approved, rejected and edited rows are kept)</span></label>
-      <label><input type="checkbox" id="mf-nollm"> Files and rules only <span class="muted">(no AI: no context, sample size or ancestry)</span></label>
-    </div>
-    <div id="mf-progress" hidden>
-      <div class="mf-bar"><div id="mf-bar-fill"></div></div>
-      <p id="mf-run-status" role="status"></p>
-      <ol id="mf-log" class="mf-log"></ol>
-    </div>
-    <p class="muted mf-hint">The run happens on the server: you can close this page and come back. Each paper appears below as soon as it is finished.</p>
-  </section>
+  <div class="mf-opts" aria-label="Build settings">
+    <span class="muted">Build manifest also:</span>
+    <label><input type="checkbox" id="mf-download" checked> downloads and processes the data, up to
+      <input type="number" id="mf-maxgb" class="dq-input mf-gb" min="0" step="1" value="{{ max_gb|int }}" aria-label="Gigabytes per paper"> GB per paper</label>
+    <label><input type="checkbox" id="mf-supp"> opens supplementary tables <span class="muted">(usually significant hits only)</span></label>
+    <label><input type="checkbox" id="mf-nollm"> skips the AI <span class="muted">(no context, sample size or ancestry)</span></label>
+  </div>
+  <div class="mf-runbar" id="mf-runbar" hidden role="status">
+    <span id="mf-run-status"></span>
+    <button type="button" class="rec-btn" id="mf-stop">Stop</button>
+  </div>
 
   <div id="mf-body"><div class="rec-empty">Loading…</div></div>
-  <p class="muted rec-path">Manifest file (approved rows, rewritten on every change): <code>{{ manifest_file }}</code>
+  <p class="muted rec-path">Data folder (downloaded files and <code>*_processed.tsv.gz</code>; <code>file_path</code> is relative to it, use it as the importer's <code>--data-root</code>):
+    <code>{{ data_root }}</code><br>
+    Manifest file (approved rows, rewritten on every change): <code>{{ manifest_file }}</code>
     <span id="mf-file-rows"></span><br>
     All candidates with evidence: <code>{{ candidates_file }}</code><br>
     Database: <code>{{ db_path }}</code> · reference manifest (read only, for naming and vocabulary):

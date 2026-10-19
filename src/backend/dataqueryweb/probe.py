@@ -23,6 +23,7 @@ import lzma
 import os
 import re
 import tarfile
+import time
 import zipfile
 import zlib
 from dataclasses import dataclass, field
@@ -90,6 +91,7 @@ class Probe:
     members: list[str] = field(default_factory=list)
     note: str = ""
     compression: str = ""
+    transient: bool = False  # an error worth one more try (dropped connection, timeout)
 
 
 def client() -> httpx.Client:
@@ -759,7 +761,30 @@ def _probe_parquet(http: httpx.Client, url: str, size: int | None) -> Probe:
 
 
 def probe_file(http: httpx.Client, f: RemoteFile) -> Probe:
-    """Header and first rows of ``f`` (or of its members); never raises."""
+    """Header and first rows of ``f`` (or of its members); never raises. A dropped
+    connection or a timeout is tried once more before it counts."""
+    got = _probe_file(http, f)
+    if got.kind == "error" and got.transient:
+        time.sleep(2)
+        got = _probe_file(http, f)
+    return got
+
+
+def plain_error(exc: BaseException) -> tuple[str, bool]:
+    """(what went wrong in plain words, whether trying again may help)."""
+    text = f"{type(exc).__name__}: {str(exc)[:160]}"
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        why = {401: "login required", 403: "access refused", 404: "file not found", 429: "too many requests"}.get(code, "server error")
+        return f"HTTP {code}: {why}", code in (429, 500, 502, 503, 504)
+    if isinstance(exc, httpx.TimeoutException):
+        return f"the server did not answer in time ({text})", True
+    if isinstance(exc, (httpx.TransportError, ConnectionError)) or "reset by peer" in str(exc):
+        return f"the server cut the connection — it may refuse scripts or be down; try Rebuild later or download by hand ({text})", True
+    return text, False
+
+
+def _probe_file(http: httpx.Client, f: RemoteFile) -> Probe:
     name = (f.path or f.name).lower()
     try:
         if re.search(r"\.(tar(\.(gz|bz2|xz))?|tgz)$", name):
@@ -799,7 +824,8 @@ def probe_file(http: httpx.Client, f: RemoteFile) -> Probe:
             return Probe("unreadable", note="no rows in the first 256 KB", compression=compression)
         return Probe("table", tables=[table], compression=compression)
     except (httpx.HTTPError, OSError, ValueError, zipfile.BadZipFile, IndexError, KeyError) as exc:
-        return Probe("error", note=f"{type(exc).__name__}: {str(exc)[:160]}")
+        note, transient = plain_error(exc)
+        return Probe("error", note=note, transient=transient)
 
 
 def fetch_doc(http: httpx.Client, f: RemoteFile) -> str:
