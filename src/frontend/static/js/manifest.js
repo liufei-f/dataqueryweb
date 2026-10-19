@@ -124,7 +124,8 @@
   }
 
   // Why a row has its status: the issues that decide it, in a few words each.
-  const shortIssue = (code) => (data.issues[code] || code).split(/[;(—]|\. /)[0].replace(/\.$/, "").trim();
+  // An issue in a few words: its first sentence, without examples in brackets.
+  const shortIssue = (code) => (data.issues[code] || code).replace(/\s*\([^)]*\)/g, "").split(/;|\. | — /)[0].replace(/\.$/, "").trim();
   function deciding(r) {
     const set = new Set(r.status === "not_loadable" ? data.blocking : r.status === "needs_processing" ? data.processing : []);
     return set.size ? r.issues.filter((i) => set.has(i)) : r.issues;
