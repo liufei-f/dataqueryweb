@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import io
 import json
@@ -325,3 +326,14 @@ def test_papers_are_tagged_by_what_their_locations_offer() -> None:
     assert web.data_kind(as_json(loc("qtl_summary_statistics", "controlled"))) == "closed_sumstats"
     assert web.data_kind(as_json(loc("supplementary_table"))) == "supplement"
     assert web.data_kind(as_json(loc("qtl_results_browser"), loc("supplementary_table"))) == "browser"
+
+
+def test_a_paper_already_in_the_reference_manifest_is_skipped(tmp_path: Path, monkeypatch) -> None:
+    store = manifest.ManifestStore(tmp_path / "r.sqlite3")
+    target = rules.Target(publications={"10.1/x": "Tenk10k"})
+    monkeypatch.setattr(manifest, "retrieve", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fetch")))
+    result = asyncio.run(manifest.build_record(RECORD, store, None, target=target))
+    assert result["rows"] == 0 and "already exists" in result["skipped"] and "Tenk10k" in result["skipped"]
+    assert store.processed() == set()  # nothing is stored: the paper is not built
+    assert "already exists in the reference manifest as Tenk10k" in manifest.describe(RECORD, result)
+    assert manifest.select([RECORD | {"species": "human"}], set(), target=target) == []

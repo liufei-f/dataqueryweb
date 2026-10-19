@@ -71,7 +71,7 @@
         || `<tr><td colspan="${t.columns.length}" class="muted">No rows sampled.</td></tr>`}</tbody></table></div>`;
   }
 
-  const DATA = { in_reference: ["Already in LC2", "mf-d-none"], processed: ["Processed", "mf-d-ok"], as_is: ["Downloaded", "mf-d-ok"], too_large: ["Too large", "mf-d-warn"],
+  const DATA = { processed: ["Processed", "mf-d-ok"], as_is: ["Downloaded", "mf-d-ok"], too_large: ["Too large", "mf-d-warn"],
     download_failed: ["Download failed", "mf-d-bad"], processing_failed: ["Processing failed", "mf-d-bad"],
     not_downloaded: ["Not downloaded", "mf-d-warn"], skipped: ["Skipped", "mf-d-none"] };
   const dataBadge = (r) => { const d = r.evidence.data; if (!d) return '<span class="muted">—</span>';
@@ -157,7 +157,8 @@
   const isBuilt = (id) => (data.built || []).includes(id);
   const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-  function stateOf(id) { // building | queued | built | unbuilt
+  function stateOf(id) { // exists | building | queued | built | unbuilt
+    if ((data.records[id] || {}).already_exists && !isBuilt(id)) return "exists";
     if (job && job.state === "running") {
       if (job.current && job.current.record_id === id) return "building";
       if ((job.queue || []).includes(id)) return "queued";
@@ -215,7 +216,6 @@
   const KIND = { open_sumstats: ["full summary statistics", "mf-k-good"], closed_sumstats: ["summary statistics, access by request", "mf-k-warn"],
     browser: ["results browser only", "mf-k-none"], supplement: ["supplementary tables only", "mf-k-none"] };
   const kindTag = (p) => {
-    if (p.in_reference) return `<span class="mf-kind mf-k-ref" title="LocusCompare already has this publication's data; Build fills the rows without downloading">already in the LC2 manifest (${esc(p.in_reference)})</span>`;
     const k = KIND[p.data_kind]; return k ? `<span class="mf-kind ${k[1]}">${k[0]}</span>` : "";
   };
 
@@ -225,9 +225,11 @@
     const status = st === "building" ? `<span class="badge mf-b-run">Building…</span> <span class="rec-sub">${esc(job.current.step || "starting")}</span>`
       : st === "queued" ? `<span class="badge mf-b-queue">Queued</span> <span class="rec-sub">${job.queue.indexOf(id) + 1} in line</span>`
       : st === "built" ? `<span class="badge mf-b-done">Built</span> ${builtSummary(id)}`
+      : st === "exists" ? `<span class="badge mf-b-exists">Already exists</span> <span class="rec-sub">in the reference manifest as
+          <strong>${esc(p.already_exists)}</strong> — skipped, nothing to build or download</span>`
       : `<span class="muted">Not built</span>${p.not_eligible ? `<span class="rec-sub"> · ${esc(p.not_eligible)}</span>` : ""}`;
     const busy = st === "building" || st === "queued";
-    const build = `<button type="button" class="rec-btn ${st === "built" ? "" : "primary"} mf-build" data-record="${id}" ${busy ? "disabled" : ""}
+    const build = st === "exists" ? "" : `<button type="button" class="rec-btn ${st === "built" ? "" : "primary"} mf-build" data-record="${id}" ${busy ? "disabled" : ""}
       title="${st === "built" ? "Build again; approved, rejected and edited rows are kept" : "List the files, read the paper, fill the manifest rows and download the data"}">${st === "built" ? "Rebuild" : "Build manifest"}</button>`;
     const check = st === "built" || (busy && isBuilt(id))
       ? `<button type="button" class="rec-btn ${toCheck && !openPapers.has(id) ? "primary" : ""} mf-open" data-record="${id}">${openPapers.has(id) ? "Close" : toCheck ? `Check (${toCheck})` : "Check"}</button>` : "";
@@ -264,6 +266,7 @@
       const p = data.records[id], rows = rowsOf(id), st = stateOf(id);
       if (human.checked && p.not_eligible) return false;
       if (show.value === "sumstats" && p.data_kind !== "open_sumstats") return false;
+      if (show.value === "exists" && st !== "exists") return false;
       if (show.value === "unbuilt" && st !== "unbuilt") return false;
       if (show.value === "built" && st !== "built") return false;
       if (show.value === "needs" && !needsYou(id).length) return false;
@@ -276,8 +279,7 @@
   }
 
   const buildAll = $("mf-build-all");
-  // Papers whose data LocusCompare already has are left out; their own button still builds them.
-  const toBuild = (ids) => ids.filter((id) => stateOf(id) === "unbuilt" && !(data.records[id] || {}).in_reference);
+  const toBuild = (ids) => ids.filter((id) => stateOf(id) === "unbuilt");
 
   function updateCount(ids) {
     const n = toBuild(ids).length;

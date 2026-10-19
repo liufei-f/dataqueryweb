@@ -164,11 +164,3 @@ def test_a_headerless_chi_square_table_gets_a_p_value(tmp_path: Path, serve) -> 
     assert list(out.columns[:8]) == cols and r["row"]["pval_col"] in out.columns
     assert abs(out[r["row"]["pval_col"]][0] - 0.05) < 1e-3  # chi-square 3.84 on 1 df
 
-
-def test_a_publication_already_in_the_reference_is_not_downloaded(tmp_path: Path, serve) -> None:
-    serve["eqtl.chr1.parquet"] = _parquet(ROWS)
-    r = _row("eqtl.chr1.parquet", serve["eqtl.chr1.parquet"], "parquet")
-    asyncio.run(fetch.fetch_rows([r], "Chen_2025", None, {}, fetch.Options(tmp_path), already="Tenk10k"))
-    assert r["evidence"]["data"]["status"] == "in_reference" and "Tenk10k" in r["evidence"]["data"]["note"]
-    assert not any(tmp_path.rglob("*")) and "data_not_downloaded" not in r["issues"]
-    assert manifest.needs_you([r | {"review": "pending", "source_path": "x"}], []) == []

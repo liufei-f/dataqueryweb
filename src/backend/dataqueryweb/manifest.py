@@ -845,6 +845,12 @@ def evidence_summary(evidence: dict[str, Any]) -> str:
 # ── running ──────────────────────────────────────────────────────────────────
 
 
+def already_exists(record: dict[str, Any], target: rules.Target) -> str:
+    """The dataset name under which the reference manifest already holds this publication
+    (matched by DOI), or "". Such papers are not built: LocusCompare has their data."""
+    return target.publications.get((record.get("doi") or "").strip().lower(), "")
+
+
 def eligible(record: dict[str, Any], *, all_species: bool = False) -> str:
     """"" when the record should be processed, else why not."""
     if not all_species and not HUMAN_RE.search(record.get("species", "")):
@@ -863,6 +869,9 @@ async def build_record(
     ``step`` hears what is being done, for a progress line."""
     step = step or (lambda _: None)
     target = target or rules.load_target()
+    if exists := already_exists(record, target):
+        return {"record_id": record["record_id"], "rows": 0, "statuses": {}, "locations": {}, "tokens": 0,
+                "model": "", "note": "", "skipped": f"already exists in the reference manifest as {exists} — skipped"}
     step("listing the files and reading their headers")
     candidates, reports, texts = await asyncio.to_thread(
         retrieve, record, include_supplements=include_supplements)
@@ -902,8 +911,7 @@ async def build_record(
         rid = record["record_id"]
         plan_model = await fetch.fetch_rows(
             rows, rows[0]["row"]["dataset"], judge, usage, data, skip=store.kept(rid),
-            key=lambda c: row_key(rid, c), step=step, cancel=cancel,
-            already=target.publications.get((record.get("doi") or "").lower(), ""))
+            key=lambda c: row_key(rid, c), step=step, cancel=cancel)
         model = model or plan_model
     step("saving")
     store.save_run(record["record_id"], rows, reports, model=model, tokens=usage["total_tokens"], run_note=note)
@@ -921,7 +929,7 @@ async def build_record(
 
 def select(
     saved: list[dict[str, Any]], done: set[int], *, record_ids: list[int] | None = None,
-    limit: int = 0, redo: bool = False, all_species: bool = False,
+    limit: int = 0, redo: bool = False, all_species: bool = False, target: rules.Target | None = None,
 ) -> list[dict[str, Any]]:
     """The records a run would process: those asked for, in the order asked; else the
     waiting ones, oldest first."""
@@ -933,12 +941,15 @@ def select(
         if record_ids:
             if record["record_id"] in record_ids:
                 todo.append(record)
-        elif (redo or record["record_id"] not in done) and not eligible(record, all_species=all_species):
+        elif ((redo or record["record_id"] not in done) and not eligible(record, all_species=all_species)
+              and not already_exists(record, target or rules.load_target())):
             todo.append(record)
     return todo[:limit] if limit and not record_ids else todo
 
 
 def describe(record: dict[str, Any], result: dict[str, Any]) -> str:
+    if result.get("skipped"):
+        return f"#{record['record_id']} {record['publication_title'][:60]!r}: {result['skipped']}"
     states = ", ".join(f"{n} {s}" for s, n in sorted(result["statuses"].items())) or "no candidate table"
     where = ", ".join(sorted(set(result["locations"].values())))
     data = ", ".join(f"{n} {s.replace('_', ' ')}" for s, n in sorted(result.get("data", {}).items()) if s != "skipped")

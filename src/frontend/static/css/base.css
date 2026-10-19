@@ -597,4 +597,4 @@ select.rec-btn { padding: 7px 8px; }
 .mf-k-good { background: #dcfce7; color: #166534; }
 .mf-k-warn { background: #fef3c7; color: #92400e; }
 .mf-k-none { background: #f1f5f9; color: var(--muted); }
-.mf-k-ref { background: #e0e7ff; color: #3730a3; }
+.mf-b-exists { background: #e0e7ff; color: #3730a3; }

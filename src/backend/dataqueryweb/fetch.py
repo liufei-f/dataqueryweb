@@ -546,7 +546,6 @@ async def fetch_rows(
     rows: list[dict[str, Any]], dataset: str, judge: llm.Judge | None, usage: dict[str, int],
     opts: Options, *, skip: set[str] = frozenset(), key: Callable[[Candidate], str] = str,
     step: Callable[[str], None] = lambda _: None, cancel: threading.Event | None = None,
-    already: str = "",
 ) -> str:
     """Download, inspect and if needed process each row's files; update the rows in place.
     Returns "provider · model" of the planning call, if one was made."""
@@ -566,11 +565,6 @@ async def fetch_rows(
         r["evidence"]["file_path"] = {"value": r["row"]["file_path"], "source": "rule: <dataset>/<path in the repository>",
                                       "quote": "", "verified": None, "note": "relative to the data folder (the importer's --data-root)"}
         jobs.append(job)
-    if already:  # LocusCompare has this publication's data: nothing to fetch
-        for job in jobs:
-            job.r["evidence"]["data"] = {"status": "in_reference", "note": f"already in the reference manifest as "
-                                         f"{already}; its data are in place, so nothing was downloaded"}
-        return ""
     if not opts.download:
         for job in jobs:
             job.r["evidence"]["data"] = {"status": "not_downloaded", "note": "downloading was switched off for this run"}

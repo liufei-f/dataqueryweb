@@ -217,7 +217,7 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         papers = {r["record_id"]: {**{k: r[k] for k in ("publication_title", "doi", "first_author", "year", "journal",
                                                          "qtl_type", "qtl_context", "publication_url", "species", "saved_by")},
                                    "n_locations": n_locations(r), "data_kind": data_kind(r),
-                                   "in_reference": reference.get((r.get("doi") or "").lower(), ""),
+                                   "already_exists": reference.get((r.get("doi") or "").strip().lower(), ""),
                                    "not_eligible": manifest.eligible(r)}
                   for r in saved.all()}
         rows, locations = manifests.rows(), manifests.locations()
