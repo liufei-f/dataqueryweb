@@ -26,6 +26,7 @@
     </select>
     <label class="muted mf-check" title="Species is human (Homo sapiens). Records saved by the AI and by you are both listed."><input type="checkbox" id="mf-human" checked> Species: human only</label>
     <span class="muted rec-count" id="mf-count"></span>
+    <button type="button" class="rec-btn primary" id="mf-build-all" title="Queue every paper the filter shows that is not built yet">Build all shown</button>
     <a class="rec-btn primary" href="/api/manifest/export?scope=approved&fmt=manifest" title="The 27 manifest columns, approved rows only">Download approved (manifest TSV)</a>
     <a class="rec-btn" href="/api/manifest/export?scope=all&fmt=review" title="Every row with status, issues, source files and evidence">Download all with evidence</a>
   </div>

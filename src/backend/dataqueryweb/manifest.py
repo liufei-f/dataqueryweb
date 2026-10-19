@@ -922,7 +922,11 @@ def select(
     saved: list[dict[str, Any]], done: set[int], *, record_ids: list[int] | None = None,
     limit: int = 0, redo: bool = False, all_species: bool = False,
 ) -> list[dict[str, Any]]:
-    """The records a run would process, oldest first."""
+    """The records a run would process: those asked for, in the order asked; else the
+    waiting ones, oldest first."""
+    if record_ids:
+        by_id = {r["record_id"]: r for r in saved}
+        return [by_id[i] for i in dict.fromkeys(record_ids) if i in by_id]
     todo = []
     for record in sorted(saved, key=lambda r: r["record_id"]):
         if record_ids:

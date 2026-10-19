@@ -272,7 +272,13 @@
     }).sort((a, b) => b - a);
   }
 
+  const buildAll = $("mf-build-all");
+  const toBuild = (ids) => ids.filter((id) => stateOf(id) === "unbuilt");
+
   function updateCount(ids) {
+    const n = toBuild(ids).length;
+    buildAll.textContent = n ? `Build all shown (${n})` : "Build all shown";
+    buildAll.disabled = !n;
     const builtN = ids.filter(isBuilt).length, toCheck = ids.reduce((n, id) => n + rowsOf(id).filter((r) => r.review === "pending").length, 0);
     const handN = ids.filter((id) => needsYou(id).length).length;
     count.textContent = `${plural(ids.length, "paper")} · ${builtN} built · ${handN} need you · ${plural(toCheck, "row")} to check`;
@@ -325,6 +331,7 @@
     } else {
       refreshHeads();
     }
+    updateCount(shownIds());
     runbar.hidden = !running && !(job && END[job.state]);
     if (running) {
       const c = job.current;
@@ -346,17 +353,29 @@
   const options = () => ({ include_supplements: $("mf-supp").checked, no_llm: $("mf-nollm").checked,
     download: $("mf-download").checked, max_gb: +$("mf-maxgb").value || 0 });
 
-  async function build(id) {
+  async function build(ids) {
     const resp = await fetch("/api/manifest/run", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...options(), record_ids: [id] }) });
+      body: JSON.stringify({ ...options(), record_ids: ids }) });
     const out = await resp.json().catch(() => ({}));
-    if (!resp.ok) { alert(`Could not build #${id}: ${out.detail || resp.status}`); return; }
+    if (!resp.ok) { alert(`Could not build ${ids.length > 1 ? `${ids.length} papers` : `#${ids[0]}`}: ${out.detail || resp.status}`); return; }
     await showRun(out);
+    updateCount(shownIds());
   }
+
+  buildAll.addEventListener("click", async () => {
+    const ids = toBuild(shownIds());
+    if (!ids.length) return;
+    const o = options();
+    if (!confirm(`Build ${plural(ids.length, "paper")}? They are built one after another on the server`
+      + (o.download ? `, downloading and processing up to ${o.max_gb} GB of data per paper` : "")
+      + ". You can close this page; Stop ends the queue.")) return;
+    buildAll.disabled = true;
+    await build(ids.slice().sort((a, b) => b - a));  // in the order they are listed
+  });
 
   body.addEventListener("click", (e) => {
     const b = e.target.closest(".mf-build");
-    if (b) { b.disabled = true; build(+b.dataset.record); return; }
+    if (b) { b.disabled = true; build([+b.dataset.record]); return; }
     const o = e.target.closest(".mf-open");
     if (o) {
       const id = +o.dataset.record;
