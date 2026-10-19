@@ -211,6 +211,11 @@
     return hit && !hit.ok ? `<div class="rec-sub mf-bad">${esc(hit.text.replace(/^#\d+ /, ""))}</div>` : "";
   }
 
+  // What the saved download locations offer, as the search recorded it.
+  const KIND = { open_sumstats: ["full summary statistics", "mf-k-good"], closed_sumstats: ["summary statistics, access by request", "mf-k-warn"],
+    browser: ["results browser only", "mf-k-none"], supplement: ["supplementary tables only", "mf-k-none"] };
+  const kindTag = (p) => { const k = KIND[p.data_kind]; return k ? `<span class="mf-kind ${k[1]}">${k[0]}</span>` : ""; };
+
   function headHtml(id) {
     const p = data.records[id] || {}, st = stateOf(id), rows = rowsOf(id);
     const toCheck = rows.filter((r) => r.review === "pending").length;
@@ -225,7 +230,7 @@
       ? `<button type="button" class="rec-btn ${toCheck && !openPapers.has(id) ? "primary" : ""} mf-open" data-record="${id}">${openPapers.has(id) ? "Close" : toCheck ? `Check (${toCheck})` : "Check"}</button>` : "";
     return `<div class="mf-paper-main">
         <a class="mf-paper-title" href="${esc(safeUrl(p.doi ? `https://doi.org/${p.doi}` : p.publication_url))}" target="_blank" rel="noopener">${esc(p.publication_title || `Record #${id}`)}</a>
-        <div class="dq-paper-meta">#${id} · ${esc([p.first_author && `${p.first_author} et al.`, p.journal, p.year, p.qtl_type, p.species && `species: ${p.species}`,
+        <div class="dq-paper-meta">${kindTag(p)} #${id} · ${esc([p.first_author && `${p.first_author} et al.`, p.journal, p.year, p.qtl_type, p.species && `species: ${p.species}`,
           p.n_locations > 1 && `${p.n_locations} download locations`, p.saved_by === "auto" ? "saved by the AI" : "saved by you"].filter(Boolean).join(" · "))}</div>
         <div class="mf-paper-status">${status}</div>${lastFailure(id)}
       </div><div class="mf-paper-btns">${build}${check}</div>`;
@@ -255,6 +260,7 @@
     return Object.keys(data.records).map(Number).filter((id) => {
       const p = data.records[id], rows = rowsOf(id), st = stateOf(id);
       if (human.checked && p.not_eligible) return false;
+      if (show.value === "sumstats" && p.data_kind !== "open_sumstats") return false;
       if (show.value === "unbuilt" && st !== "unbuilt") return false;
       if (show.value === "built" && st !== "built") return false;
       if (show.value === "needs" && !needsYou(id).length) return false;

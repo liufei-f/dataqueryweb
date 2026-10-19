@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import io
 import zipfile
 from pathlib import Path
@@ -315,3 +316,12 @@ def test_what_needs_a_person_is_collected_per_paper() -> None:
     assert "50 GB" in hand[2]["why"]
     # Subsets and documentation are not a person's job; a rejected row is not either.
     assert manifest.needs_you([too_big | {"review": "rejected"}], [loc | {"inventory": loc["inventory"][1:]}]) == []
+
+
+def test_papers_are_tagged_by_what_their_locations_offer() -> None:
+    loc = lambda content, access="open": {"content": content, "access_route": access}  # noqa: E731
+    as_json = lambda *locs: {"locations": json.dumps(list(locs))}  # noqa: E731
+    assert web.data_kind(as_json(loc("supplementary_table"), loc("qtl_summary_statistics"))) == "open_sumstats"
+    assert web.data_kind(as_json(loc("qtl_summary_statistics", "controlled"))) == "closed_sumstats"
+    assert web.data_kind(as_json(loc("supplementary_table"))) == "supplement"
+    assert web.data_kind(as_json(loc("qtl_results_browser"), loc("supplementary_table"))) == "browser"

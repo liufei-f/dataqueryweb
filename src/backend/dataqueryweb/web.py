@@ -68,14 +68,33 @@ def _line(obj: dict[str, Any]) -> bytes:
     return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def n_locations(record: dict[str, Any]) -> int:
-    """How many download locations a saved record lists (``locations`` is stored as JSON text)."""
+def _locations(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """The download locations a saved record lists (stored as JSON text)."""
     raw = record.get("locations")
     try:
         found = json.loads(raw) if isinstance(raw, str) else raw
     except ValueError:
         found = None
-    return len(found) if isinstance(found, list) and found else 1
+    return [x for x in found if isinstance(x, dict)] if isinstance(found, list) else []
+
+
+def n_locations(record: dict[str, Any]) -> int:
+    return len(_locations(record)) or 1
+
+
+def data_kind(record: dict[str, Any]) -> str:
+    """What the saved locations offer, as the search recorded it: "open_sumstats" (full
+    summary statistics, open), "closed_sumstats" (summary statistics behind a request or
+    controlled access), "browser" (a results browser only), "supplement" (supplementary
+    tables only, usually significant hits) or "" (not recorded)."""
+    locs = _locations(record) or [{"content": record.get("content"), "access_route": record.get("access_route")}]
+    sums = [x for x in locs if x.get("content") == "qtl_summary_statistics"]
+    if any(x.get("access_route") in ("open", "unknown", "") for x in sums):
+        return "open_sumstats"
+    if sums:
+        return "closed_sumstats"
+    kinds = {x.get("content") for x in locs}
+    return "browser" if "qtl_results_browser" in kinds else "supplement" if "supplementary_table" in kinds else ""
 
 
 def create_app(store: records.RecordStore | None = None) -> FastAPI:
@@ -196,7 +215,7 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         """Candidate manifest rows and per-location reports, with what explains them."""
         papers = {r["record_id"]: {**{k: r[k] for k in ("publication_title", "doi", "first_author", "year", "journal",
                                                          "qtl_type", "qtl_context", "publication_url", "species", "saved_by")},
-                                   "n_locations": n_locations(r),
+                                   "n_locations": n_locations(r), "data_kind": data_kind(r),
                                    "not_eligible": manifest.eligible(r)}
                   for r in saved.all()}
         rows, locations = manifests.rows(), manifests.locations()

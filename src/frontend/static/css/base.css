@@ -593,3 +593,7 @@ select.rec-btn { padding: 7px 8px; }
 .mf-norows code { overflow-wrap: anywhere; }
 .mf-b-hand { background: #ffedd5; color: #9a3412; }
 .mf-nothing { background: #f8fafc; border-color: var(--line); }
+.mf-kind { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 4px; margin-right: 4px; }
+.mf-k-good { background: #dcfce7; color: #166534; }
+.mf-k-warn { background: #fef3c7; color: #92400e; }
+.mf-k-none { background: #f1f5f9; color: var(--muted); }
