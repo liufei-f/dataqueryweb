@@ -164,3 +164,11 @@ def test_a_headerless_chi_square_table_gets_a_p_value(tmp_path: Path, serve) -> 
     assert list(out.columns[:8]) == cols and r["row"]["pval_col"] in out.columns
     assert abs(out[r["row"]["pval_col"]][0] - 0.05) < 1e-3  # chi-square 3.84 on 1 df
 
+
+
+def test_skipped_rows_say_why() -> None:
+    row = lambda **kw: {"holds": "all_pairs", "status": "needs_review", "issues": [], "row": {"qtl_type": "eQTL"}} | kw  # noqa: E731
+    assert fetch.skip_reason(row()) == ""
+    assert "selected subset" in fetch.skip_reason(row(holds="subset"))
+    assert fetch.skip_reason(row(row={"qtl_type": "mQTL"})).startswith("mQTL is not a type the manifest holds")
+    assert "header could not be read" in fetch.skip_reason(row(status="not_loadable", issues=["header_not_read"]))

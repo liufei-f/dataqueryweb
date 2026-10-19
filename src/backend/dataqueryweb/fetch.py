@@ -380,6 +380,21 @@ def plan_prompt(groups: list[tuple[str, Candidate, pd.DataFrame, str]]) -> str:
     return "Tables:\n" + "\n".join(out)
 
 
+def skip_reason(r: dict[str, Any]) -> str:
+    """Why a row's files are not worth downloading, or "" when they are."""
+    qtl_type = r["row"]["qtl_type"]
+    if r["holds"] == "subset":
+        return "the file is a selected subset (significant or lead hits), not every tested pair"
+    if not qtl_type:
+        return "the QTL type is unknown"
+    if qtl_type not in rules.MANIFEST_QTL_TYPES:
+        return f"{qtl_type} is not a type the manifest holds ({', '.join(rules.MANIFEST_QTL_TYPES)})"
+    if r["status"] == "not_loadable":
+        blocking = [rules.ISSUES[i].split(";")[0].rstrip(".") for i in r["issues"] if i in rules.BLOCKING]
+        return "; ".join(blocking) or "the row cannot be loaded"
+    return ""
+
+
 @dataclass
 class RowJob:
     r: dict[str, Any]  # the assembled row
@@ -556,8 +571,8 @@ async def fetch_rows(
         c: Candidate = r["candidate"]
         if key(c) in skip:
             continue
-        if r["status"] == "not_loadable" or r["holds"] == "subset" or r["row"]["qtl_type"] not in rules.MANIFEST_QTL_TYPES:
-            r["evidence"]["data"] = {"status": "skipped", "note": "not downloaded: the row cannot become a manifest row as it is"}
+        if why := skip_reason(r):
+            r["evidence"]["data"] = {"status": "skipped", "note": f"not downloaded: {why}"}
             continue
         job = RowJob(r, c)
         job.targets = [(f, folder / safe_rel(f.path or f.name)) for f in (c.files[:1] if c.member else c.files)]
