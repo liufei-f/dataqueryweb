@@ -359,3 +359,19 @@ def test_how_each_build_ended_is_kept_with_its_reason(tmp_path: Path, monkeypatc
     assert runs[2]["outcome"] == "skipped" and "Tenk10k" in runs[2]["note"]
     assert runs[3]["outcome"] == "failed" and "disk full" in runs[3]["note"]
     assert probe.http_words(403) == "HTTP 403: access refused"
+
+
+def test_an_archive_that_breaks_off_counts_as_a_failed_read(monkeypatch) -> None:
+    import tarfile as tf
+    buf = io.BytesIO()
+    with tf.open(fileobj=buf, mode="w") as t:
+        for name in ("readme.md", "genotypes.bed"):
+            info = tf.TarInfo(name)
+            info.size = 3000
+            t.addfile(info, io.BytesIO(b"x" * 3000))
+    cut = buf.getvalue()[:2000]  # the connection drops inside the first member
+    monkeypatch.setattr(probe.time, "sleep", lambda s: None)
+    stream = lambda r: httpx.Response(200, stream=httpx.ByteStream(cut))  # noqa: E731 — a real download streams
+    with httpx.Client(transport=httpx.MockTransport(stream)) as http:
+        got = probe.probe_file(http, probe.RemoteFile("all.tar", "https://example.org/all.tar"))
+    assert got.kind == "error" and got.note.startswith("the archive broke off after")

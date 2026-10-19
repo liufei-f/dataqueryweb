@@ -626,8 +626,12 @@ def _probe_tar(http: httpx.Client, url: str) -> Probe:
                             out.tables.append(table)
                     if len(out.members) >= 200:
                         break
-        except (tarfile.TarError, EOFError, OSError, zlib.error) as exc:
-            out.note = f"read the first {len(out.members)} members ({type(exc).__name__})"
+        except (tarfile.TarError, EOFError, OSError, zlib.error, httpx.HTTPError) as exc:
+            words, _ = plain_error(exc)
+            if not out.tables:  # nothing usable came through: a failed read, worth another try
+                return Probe("error", members=out.members, transient=True,
+                             note=f"the archive broke off after {len(out.members)} files ({words})")
+            out.note = f"read only the first {len(out.members)} files of the archive ({words})"
     return out
 
 

@@ -181,7 +181,8 @@ def _retrieve_location(
             else:
                 out.append(Candidate(**base, issues=["header_not_read"], note="not opened (probe budget)"))
         elif not p.tables:
-            note = p.note or (f"archive with {len(p.members)} members, none a readable table" if p.members else "")
+            shown = ", ".join(m.rsplit("/", 1)[-1] for m in p.members[:4])
+            note = p.note or (f"archive with {len(p.members)} files, none a readable table (e.g. {shown})" if p.members else "")
             out.append(Candidate(**base, issues=["header_not_read"], note=note,
                                  needs_hand=p.kind in ("error", "unreadable")))
         else:
