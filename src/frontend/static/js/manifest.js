@@ -164,11 +164,11 @@
 
   function locationHtml(l, expanded = false) {
     const inv = l.inventory.map((i) => `<tr><td class="rec-url">${esc(i.path)}</td><td>${i.n_files > 1 ? `${i.n_files} files` : ""}</td>
-      <td>${size(i.size)}</td><td>${esc(i.holds)}</td><td>${esc(i.why)}</td></tr>`).join("");
+      <td>${size(i.size)}</td><td>${esc(i.holds)}</td><td>${esc(reword(i.why) || HOLDS[i.holds] || "")}</td></tr>`).join("");
     return `<details class="mf-loc" ${expanded ? "open" : ""}><summary><span class="badge mf-l-${l.status}">${esc(l.status)}</span>
       <a class="rec-url" href="${esc(safeUrl(l.url))}" target="_blank" rel="noopener">${esc(l.url)}</a>
-      <span class="rec-sub">${esc([LOC[l.status] && `${LOC[l.status]}${l.note ? ":" : ""}`, l.note, l.resolver && `via ${l.resolver}`,
-        l.n_files && `${l.n_files} files`, `${l.n_rows} row${l.n_rows === 1 ? "" : "s"}`, l.run_note].filter(Boolean).join(" · ").replace(": ·", ":"))}</span></summary>
+      <span class="rec-sub">${esc([LOC[l.status] && `${LOC[l.status]}${l.note ? ":" : ""}`, reword(l.note), l.resolver && `via ${l.resolver}`,
+        l.n_files && `${l.n_files} files`, `${l.n_rows} row${l.n_rows === 1 ? "" : "s"}`, reword(l.run_note)].filter(Boolean).join(" · ").replace(": ·", ":"))}</span></summary>
       ${inv ? `<table class="mf-ev"><thead><tr><th>File</th><th></th><th>Size</th><th>Holds</th><th>Why</th></tr></thead><tbody>${inv}</tbody></table>` : '<p class="muted">Nothing was listed here.</p>'}</details>`;
   }
 
@@ -193,15 +193,19 @@
 
   // Why a built paper has no row, in plain words: per location, its own note or each file's reason.
   const HOLDS = { doc: "documentation", subset: "a subset of results, not every tested pair", not_qtl: "not a QTL table",
-    unknown_scope: "could not tell what it holds" };
+    unknown_scope: "could not tell what it holds",
+    other: "not a table file (by its name: e.g. a PDF, image, script, genotype or binary file), so it was not opened" };
+  // Notes stored by earlier builds named command-line flags; say what to tick instead.
+  const reword = (t) => String(t || "").replace("(--include-supplements opens it)", '(tick "opens supplementary tables" to open it)')
+    .replace("LLM step skipped (--no-llm)", 'AI step skipped ("skips the AI" was ticked)');
   function noRowReasons(id) {
     const out = [];
     data.locations.filter((l) => l.record_id === id).forEach((l) => {
       if (l.status === "duplicate") return;
-      if (l.status !== "listed" && l.status !== "direct") { out.push([l.url, l.note || l.status]); return; }
+      if (l.status !== "listed" && l.status !== "direct") { out.push([l.url, reword(l.note) || LOC[l.status] || l.status]); return; }
       const files = l.inventory.filter((i) => i.holds !== "doc");
       if (!files.length) out.push([l.url, l.inventory.length ? "only documentation files" : "no files were listed"]);
-      files.forEach((i) => out.push([i.path, i.why || HOLDS[i.holds] || i.holds]));
+      files.forEach((i) => out.push([i.path, reword(i.why) || HOLDS[i.holds] || i.holds]));
     });
     return out;
   }
