@@ -58,6 +58,7 @@ def serve(monkeypatch):
         return httpx.Response(200, content=files[name]) if name in files else httpx.Response(404)
 
     monkeypatch.setattr(fetch, "http_client", lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(fetch, "MIN_FREE", 0)  # tmp_path may sit on a small RAM disk
     return files
 
 
