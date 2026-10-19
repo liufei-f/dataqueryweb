@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import gzip
-import json
 import io
+import json
 import zipfile
 from pathlib import Path
 
