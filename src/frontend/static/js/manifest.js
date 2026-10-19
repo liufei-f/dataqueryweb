@@ -136,9 +136,20 @@
       esc(why.slice(0, 2).map(shortIssue).join("; "))}${why.length > 2 ? ` (+${why.length - 2})` : ""}</div>`;
   }
   // What happened to the data, with the reason when it is not in place.
+  const MANIFEST_TYPES = ["eQTL", "sQTL", "caQTL", "pQTL"];
+  // Rows built before skipped downloads said why: work the reason out the same way the server now does.
+  function skipWhy(r) {
+    if (r.holds === "subset") return "not downloaded: the file is a selected subset (significant or lead hits), not every tested pair";
+    if (!r.qtl_type) return "not downloaded: the QTL type is unknown";
+    if (!MANIFEST_TYPES.includes(r.qtl_type)) return `not downloaded: ${r.qtl_type} is not a type the manifest holds (${MANIFEST_TYPES.join(", ")})`;
+    const blocking = r.issues.filter((i) => (data.blocking || []).includes(i)).map(shortIssue);
+    return `not downloaded: ${blocking.join("; ") || "the row cannot be loaded"}`;
+  }
+
   function dataWhy(r) {
     const d = r.evidence.data;
     if (!d) return "";
+    if (d.status === "skipped" && /cannot become a manifest row as it is/.test(d.note || "")) d.note = skipWhy(r);
     const note = d.status === "processed" ? `${d.plan_source === "LLM" ? "AI" : "rule"} plan: ${(d.steps || []).join("; ")}`
       : d.status === "as_is" ? "readable as it is" : d.note || "";
     return note ? `<div class="rec-sub mf-why" title="${esc(note)}">${esc(note.slice(0, 90))}${note.length > 90 ? "…" : ""}</div>` : "";
