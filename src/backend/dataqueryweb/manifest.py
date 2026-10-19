@@ -902,7 +902,8 @@ async def build_record(
         rid = record["record_id"]
         plan_model = await fetch.fetch_rows(
             rows, rows[0]["row"]["dataset"], judge, usage, data, skip=store.kept(rid),
-            key=lambda c: row_key(rid, c), step=step, cancel=cancel)
+            key=lambda c: row_key(rid, c), step=step, cancel=cancel,
+            already=target.publications.get((record.get("doi") or "").lower(), ""))
         model = model or plan_model
     step("saving")
     store.save_run(record["record_id"], rows, reports, model=model, tokens=usage["total_tokens"], run_note=note)

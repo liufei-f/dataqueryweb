@@ -213,9 +213,11 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
     @app.get("/api/manifest")
     async def list_manifest() -> dict[str, Any]:
         """Candidate manifest rows and per-location reports, with what explains them."""
+        reference = rules.load_target().publications
         papers = {r["record_id"]: {**{k: r[k] for k in ("publication_title", "doi", "first_author", "year", "journal",
                                                          "qtl_type", "qtl_context", "publication_url", "species", "saved_by")},
                                    "n_locations": n_locations(r), "data_kind": data_kind(r),
+                                   "in_reference": reference.get((r.get("doi") or "").lower(), ""),
                                    "not_eligible": manifest.eligible(r)}
                   for r in saved.all()}
         rows, locations = manifests.rows(), manifests.locations()

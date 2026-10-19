@@ -71,7 +71,7 @@
         || `<tr><td colspan="${t.columns.length}" class="muted">No rows sampled.</td></tr>`}</tbody></table></div>`;
   }
 
-  const DATA = { processed: ["Processed", "mf-d-ok"], as_is: ["Downloaded", "mf-d-ok"], too_large: ["Too large", "mf-d-warn"],
+  const DATA = { in_reference: ["Already in LC2", "mf-d-none"], processed: ["Processed", "mf-d-ok"], as_is: ["Downloaded", "mf-d-ok"], too_large: ["Too large", "mf-d-warn"],
     download_failed: ["Download failed", "mf-d-bad"], processing_failed: ["Processing failed", "mf-d-bad"],
     not_downloaded: ["Not downloaded", "mf-d-warn"], skipped: ["Skipped", "mf-d-none"] };
   const dataBadge = (r) => { const d = r.evidence.data; if (!d) return '<span class="muted">—</span>';
@@ -214,7 +214,10 @@
   // What the saved download locations offer, as the search recorded it.
   const KIND = { open_sumstats: ["full summary statistics", "mf-k-good"], closed_sumstats: ["summary statistics, access by request", "mf-k-warn"],
     browser: ["results browser only", "mf-k-none"], supplement: ["supplementary tables only", "mf-k-none"] };
-  const kindTag = (p) => { const k = KIND[p.data_kind]; return k ? `<span class="mf-kind ${k[1]}">${k[0]}</span>` : ""; };
+  const kindTag = (p) => {
+    if (p.in_reference) return `<span class="mf-kind mf-k-ref" title="LocusCompare already has this publication's data; Build fills the rows without downloading">already in the LC2 manifest (${esc(p.in_reference)})</span>`;
+    const k = KIND[p.data_kind]; return k ? `<span class="mf-kind ${k[1]}">${k[0]}</span>` : "";
+  };
 
   function headHtml(id) {
     const p = data.records[id] || {}, st = stateOf(id), rows = rowsOf(id);
@@ -273,7 +276,8 @@
   }
 
   const buildAll = $("mf-build-all");
-  const toBuild = (ids) => ids.filter((id) => stateOf(id) === "unbuilt");
+  // Papers whose data LocusCompare already has are left out; their own button still builds them.
+  const toBuild = (ids) => ids.filter((id) => stateOf(id) === "unbuilt" && !(data.records[id] || {}).in_reference);
 
   function updateCount(ids) {
     const n = toBuild(ids).length;
