@@ -158,7 +158,7 @@ def list_location(http: httpx.Client, url: str) -> Listing:
     try:
         return _list(http, url, follow=True)
     except (httpx.HTTPError, ValueError, KeyError) as exc:
-        return Listing("error", landing=url, note=f"{type(exc).__name__}: {str(exc)[:160]}")
+        return Listing("error", landing=url, note=plain_error(exc)[0])
 
 
 def _list(http: httpx.Client, url: str, *, follow: bool) -> Listing:
@@ -183,7 +183,7 @@ def _zenodo(http: httpx.Client, url: str, m: re.Match[str]) -> Listing:
                      params={"q": f"conceptrecid:{rid}", "sort": "mostrecent", "size": 1})
         hits = (s.json().get("hits") or {}).get("hits") or [] if s.status_code == 200 else []
         if not hits:
-            return Listing("error", "Zenodo API", url, f"record {rid}: HTTP {r.status_code}")
+            return Listing("error", "Zenodo API", url, f"record {rid}: {http_words(r.status_code)}")
         data = hits[0]
     else:
         data = r.json()
@@ -212,7 +212,7 @@ def _figshare(http: httpx.Client, url: str, m: re.Match[str]) -> Listing:
             if a.status_code == 200:
                 articles.append(a.json())
     if not articles:
-        return Listing("error", "figshare API", url, f"article {fid}: HTTP {r.status_code}")
+        return Listing("error", "figshare API", url, f"article {fid}: {http_words(r.status_code)}")
     out = Listing("listed", "figshare API", articles[0].get("url_public_html") or url)
     for a in articles:
         prefix = f"{a.get('title', '')}/" if len(articles) > 1 else ""
@@ -233,7 +233,7 @@ def _github(http: httpx.Client, url: str, m: re.Match[str]) -> Listing:
     r = http.get(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{ref}",
                  params={"recursive": 1}, headers=headers)
     if r.status_code != 200:
-        return Listing("error", "GitHub API", url, f"HTTP {r.status_code} (set GITHUB_TOKEN if rate-limited)")
+        return Listing("error", "GitHub API", url, f"{http_words(r.status_code)} (set GITHUB_TOKEN if rate-limited)")
     out = Listing("listed", "GitHub API", f"https://github.com/{owner}/{repo}")
     for item in r.json().get("tree") or []:
         path = item.get("path", "")
@@ -258,7 +258,7 @@ def _huggingface(http: httpx.Client, url: str, m: re.Match[str]) -> Listing:
         r = http.get(nxt)
         if r.status_code != 200:
             if not out.files:
-                return Listing("error", "Hugging Face API", url, f"HTTP {r.status_code}")
+                return Listing("error", "Hugging Face API", url, http_words(r.status_code))
             break
         for item in r.json():
             if item.get("type") == "file":
@@ -288,7 +288,7 @@ def _osf(http: httpx.Client, url: str, m: re.Match[str]) -> Listing:
         r = http.get(link)
         if r.status_code != 200:
             if not out.files:
-                return Listing("manual", "OSF API", url, f"HTTP {r.status_code}: not a public project id")
+                return Listing("manual", "OSF API", url, f"{http_words(r.status_code)}: not a public project id")
             continue
         body = r.json()
         for item in body.get("data") or []:
@@ -324,7 +324,7 @@ def _list_page(http: httpx.Client, url: str, *, follow: bool) -> Listing:
         final = str(r.url)
         ctype = r.headers.get("content-type", "").lower()
         if r.status_code >= 400:
-            return Listing("error", "web page", url, f"HTTP {r.status_code}")
+            return Listing("error", "web page", url, http_words(r.status_code))
         if "html" not in ctype and "xml" not in ctype:
             size = r.headers.get("content-length")
             disp = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', r.headers.get("content-disposition", ""))
@@ -612,7 +612,7 @@ def _probe_tar(http: httpx.Client, url: str) -> Probe:
     out = Probe("archive")
     with http.stream("GET", url) as r:
         if r.status_code >= 400:
-            return Probe("error", note=f"HTTP {r.status_code}")
+            return Probe("error", note=http_words(r.status_code), transient=r.status_code >= 500)
         try:
             with tarfile.open(fileobj=io.BufferedReader(StreamFile(r.iter_raw())), mode="r|*") as tf:
                 for member in tf:
@@ -770,13 +770,21 @@ def probe_file(http: httpx.Client, f: RemoteFile) -> Probe:
     return got
 
 
+HTTP_WORDS = {400: "bad request", 401: "login required", 403: "access refused", 404: "not found",
+              410: "removed", 429: "too many requests", 500: "server error", 502: "server error",
+              503: "server unavailable", 504: "server timed out"}
+
+
+def http_words(code: int) -> str:
+    return f"HTTP {code}: {HTTP_WORDS.get(code, 'server error' if code >= 500 else 'refused')}"
+
+
 def plain_error(exc: BaseException) -> tuple[str, bool]:
     """(what went wrong in plain words, whether trying again may help)."""
     text = f"{type(exc).__name__}: {str(exc)[:160]}"
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
-        why = {401: "login required", 403: "access refused", 404: "file not found", 429: "too many requests"}.get(code, "server error")
-        return f"HTTP {code}: {why}", code in (429, 500, 502, 503, 504)
+        return http_words(code), code in (429, 500, 502, 503, 504)
     if isinstance(exc, httpx.TimeoutException):
         return f"the server did not answer in time ({text})", True
     if isinstance(exc, (httpx.TransportError, ConnectionError)) or "reset by peer" in str(exc):

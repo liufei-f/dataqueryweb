@@ -125,7 +125,7 @@ def retrieve(
                     report.update(status="manual", note="results browser: no file to open")
                 else:
                     report.update(status="skipped", note="supplementary table: a selected subset by rule, "
-                                                         "not opened (--include-supplements opens it)")
+                                                         "not opened (tick \"opens supplementary tables\" to open it)")
             else:
                 found = _retrieve_location(http, loc, report, texts, seen_listings)
                 for f in found:
@@ -628,6 +628,12 @@ CREATE TABLE IF NOT EXISTS manifest_locations (
     run_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS manifest_locations_record ON manifest_locations (record_id);
+CREATE TABLE IF NOT EXISTS manifest_runs (
+    record_id INTEGER PRIMARY KEY,
+    outcome TEXT NOT NULL,  -- built | failed | skipped | stopped | usage_limit
+    note TEXT NOT NULL DEFAULT '',
+    at TEXT NOT NULL
+);
 """
 REVIEWS = ("pending", "approved", "rejected")
 # Extra columns of the review export, after the manifest's own 27.
@@ -745,6 +751,18 @@ class ManifestStore:
             return {r[0] for r in db.execute(
                 "SELECT row_key FROM manifest_rows WHERE record_id = ? AND (review != 'pending' OR edited != '[]')",
                 [record_id])}
+
+    def note_run(self, record_id: int, outcome: str, note: str = "") -> None:
+        """How the last build of a paper ended, with the reason, shown next to it."""
+        at = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self._connect() as db:
+            db.execute("INSERT OR REPLACE INTO manifest_runs (record_id, outcome, note, at) VALUES (?, ?, ?, ?)",
+                       [record_id, outcome, note[:600], at])
+
+    def runs(self) -> dict[int, dict[str, str]]:
+        with self._connect() as db:
+            return {r["record_id"]: {"outcome": r["outcome"], "note": r["note"], "at": r["at"]}
+                    for r in db.execute("SELECT * FROM manifest_runs")}
 
     def processed(self) -> set[int]:
         with self._connect() as db:
@@ -904,7 +922,7 @@ async def build_record(
                 if note:
                     break
         else:
-            note = "LLM step skipped (--no-llm)"
+            note = "AI step skipped (\"skips the AI\" was ticked)"
     step("checking the quotes")
     rows = assemble(record, paper, candidates, facts, texts, target)
     if data is not None and rows:
@@ -1021,6 +1039,7 @@ class Batch:
                 except Exception as exc:  # one bad record must not stop a batch
                     self.failed += 1
                     self.done += 1
+                    self.store.note_run(rid, "failed", f"{type(exc).__name__}: {exc}")
                     line = f"#{rid}: failed — {type(exc).__name__}: {exc}"
                     self.log.append({"record_id": rid, "ok": False, "text": line})
                     if echo:
@@ -1030,6 +1049,12 @@ class Batch:
                 self.rows += result["rows"]
                 self.tokens += result["tokens"]
                 line = describe(record, result)
+                if result.get("skipped"):
+                    self.store.note_run(rid, "skipped", result["skipped"])
+                elif "usage limit" in result["note"]:
+                    self.store.note_run(rid, "usage_limit", result["note"])
+                else:
+                    self.store.note_run(rid, "built", result["note"])
                 self.log.append({"record_id": rid, "ok": not result["note"], "text": line})
                 if echo:
                     echo(line, True)
@@ -1039,6 +1064,9 @@ class Batch:
             self.state = "done"
         except asyncio.CancelledError:
             self.state = "stopped"
+            if self.current:
+                self.store.note_run(self.current["record_id"], "stopped",
+                                    f"stopped while {self.current.get('step') or 'starting'}; nothing of this build was kept")
         finally:
             self.current = None
             self.finished = datetime.now().astimezone().isoformat(timespec="seconds")

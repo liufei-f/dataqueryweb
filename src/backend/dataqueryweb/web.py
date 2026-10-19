@@ -226,6 +226,7 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
                 for rid in {loc["record_id"] for loc in locations}}
         return {"rows": rows, "locations": locations, "records": papers,
                 "built": sorted(manifests.processed()), "needs_you": {k: v for k, v in hand.items() if v},
+                "runs": manifests.runs(), "blocking": sorted(rules.BLOCKING), "processing": sorted(rules.PROCESSING),
                 "files": manifests.write_files(),
                 "issues": rules.ISSUES, "columns": rules.MANIFEST_COLUMNS,
                 "role_columns": list(rules.ROLE_COLUMN.values())}

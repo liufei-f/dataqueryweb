@@ -337,3 +337,25 @@ def test_a_paper_already_in_the_reference_manifest_is_skipped(tmp_path: Path, mo
     assert store.processed() == set()  # nothing is stored: the paper is not built
     assert "already exists in the reference manifest as Tenk10k" in manifest.describe(RECORD, result)
     assert manifest.select([RECORD | {"species": "human"}], set(), target=target) == []
+
+
+def test_how_each_build_ended_is_kept_with_its_reason(tmp_path: Path, monkeypatch) -> None:
+    store = manifest.ManifestStore(tmp_path / "r.sqlite3")
+    good, bad = RECORD | {"record_id": 1}, RECORD | {"record_id": 2, "doi": "10.1/known"}
+    broken = RECORD | {"record_id": 3, "doi": "10.1/z"}
+
+    async def fake_build(record, store, judge, **kw):
+        if record["record_id"] == 3:
+            raise RuntimeError("disk full")
+        return await real(record, store, judge, **kw)
+
+    real = manifest.build_record
+    monkeypatch.setattr(manifest, "build_record", fake_build)
+    monkeypatch.setattr(manifest, "retrieve", lambda *a, **k: ([], [], {}))
+    monkeypatch.setattr(rules, "load_target", lambda *a: rules.Target(publications={"10.1/known": "Tenk10k"}))
+    asyncio.run(manifest.Batch([good, bad, broken], store, no_llm=True).run())
+    runs = store.runs()
+    assert runs[1]["outcome"] == "built"
+    assert runs[2]["outcome"] == "skipped" and "Tenk10k" in runs[2]["note"]
+    assert runs[3]["outcome"] == "failed" and "disk full" in runs[3]["note"]
+    assert probe.http_words(403) == "HTTP 403: access refused"

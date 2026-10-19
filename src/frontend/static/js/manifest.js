@@ -123,27 +123,52 @@
       </div></td></tr>`;
   }
 
+  // Why a row has its status: the issues that decide it, in a few words each.
+  const shortIssue = (code) => (data.issues[code] || code).split(/[;(—]|\. /)[0].replace(/\.$/, "").trim();
+  function deciding(r) {
+    const set = new Set(r.status === "not_loadable" ? data.blocking : r.status === "needs_processing" ? data.processing : []);
+    return set.size ? r.issues.filter((i) => set.has(i)) : r.issues;
+  }
+  function statusWhy(r) {
+    if (r.status === "ready") return '<div class="rec-sub">no open issue</div>';
+    const why = deciding(r);
+    return `<div class="rec-sub mf-why" title="${esc(why.map((i) => `${i}: ${data.issues[i] || ""}`).join("\n"))}">${
+      esc(why.slice(0, 2).map(shortIssue).join("; "))}${why.length > 2 ? ` (+${why.length - 2})` : ""}</div>`;
+  }
+  // What happened to the data, with the reason when it is not in place.
+  function dataWhy(r) {
+    const d = r.evidence.data;
+    if (!d) return "";
+    const note = d.status === "processed" ? `${d.plan_source === "LLM" ? "AI" : "rule"} plan: ${(d.steps || []).join("; ")}`
+      : d.status === "as_is" ? "readable as it is" : d.note || "";
+    return note ? `<div class="rec-sub mf-why" title="${esc(note)}">${esc(note.slice(0, 90))}${note.length > 90 ? "…" : ""}</div>` : "";
+  }
+
   function rowHtml(r) {
     const unverified = FACTS.filter(([k]) => r.evidence[k] && r.evidence[k].verified === false).length;
     return `<tr class="mf-row mf-${r.review}" data-id="${r.row_id}">
-      <td><span class="badge mf-s-${r.status}">${STATUS[r.status] || r.status}</span>
+      <td><span class="badge mf-s-${r.status}">${STATUS[r.status] || r.status}</span>${statusWhy(r)}
         ${r.review !== "pending" ? `<div class="rec-sub mf-rev-${r.review}">${r.review}</div>` : ""}</td>
       <td>${esc(r.dataset)}<div class="rec-sub">${esc(r.qtl_type)}</div></td>
       <td><strong>${esc(r.biocontext) || "—"}</strong><div class="rec-sub">${esc(r.level_1_context)}${r.level_2_context ? ` / ${esc(r.level_2_context)}` : ""}</div></td>
       <td>${esc(r.population) || "—"}</td><td>${esc(r.sample_size) || "—"}</td><td>${esc(r.genome_build) || "—"}</td>
       <td class="rec-url">${esc(r.source_path)}<div class="rec-sub">${r.n_files > 1 ? `${r.n_files} files · ` : ""}${size(r.file_size)}</div></td>
-      <td>${dataBadge(r)}</td>
+      <td>${dataBadge(r)}${dataWhy(r)}</td>
       <td>${r.issues.length ? `${r.issues.length} issue${r.issues.length > 1 ? "s" : ""}` : "—"}${unverified ? `<div class="rec-sub mf-bad">${unverified} unverified</div>` : ""}</td>
       <td><button type="button" class="rec-btn mf-toggle">${open.has(r.row_id) ? "Close" : "Check"}</button></td></tr>
       ${open.has(r.row_id) ? detail(r) : ""}`;
   }
+
+  const LOC = { listed: "files listed", direct: "a direct file link", manual: "needs a person", skipped: "not opened",
+    error: "could not be read", duplicate: "same files as another location" };
 
   function locationHtml(l, expanded = false) {
     const inv = l.inventory.map((i) => `<tr><td class="rec-url">${esc(i.path)}</td><td>${i.n_files > 1 ? `${i.n_files} files` : ""}</td>
       <td>${size(i.size)}</td><td>${esc(i.holds)}</td><td>${esc(i.why)}</td></tr>`).join("");
     return `<details class="mf-loc" ${expanded ? "open" : ""}><summary><span class="badge mf-l-${l.status}">${esc(l.status)}</span>
       <a class="rec-url" href="${esc(safeUrl(l.url))}" target="_blank" rel="noopener">${esc(l.url)}</a>
-      <span class="rec-sub">${esc([l.resolver, l.n_files && `${l.n_files} files`, `${l.n_rows} row${l.n_rows === 1 ? "" : "s"}`, l.note, l.run_note].filter(Boolean).join(" · "))}</span></summary>
+      <span class="rec-sub">${esc([LOC[l.status] && `${LOC[l.status]}${l.note ? ":" : ""}`, l.note, l.resolver && `via ${l.resolver}`,
+        l.n_files && `${l.n_files} files`, `${l.n_rows} row${l.n_rows === 1 ? "" : "s"}`, l.run_note].filter(Boolean).join(" · ").replace(": ·", ":"))}</span></summary>
       ${inv ? `<table class="mf-ev"><thead><tr><th>File</th><th></th><th>Size</th><th>Holds</th><th>Why</th></tr></thead><tbody>${inv}</tbody></table>` : '<p class="muted">Nothing was listed here.</p>'}</details>`;
   }
 
@@ -204,12 +229,24 @@
     const checked = rows.filter((r) => r.review !== "pending").length, approved = rows.filter((r) => r.review === "approved").length;
     return `${states}<span class="rec-sub"> · ${plural(rows.length, "row")}${dataStates ? ` · data: ${esc(dataStates)}` : ""} ·
       ${checked === rows.length ? "all checked" : `${checked} of ${rows.length} checked`}${approved ? `, ${approved} approved` : ""}</span>
-      ${needsBadge(id)}`;
+      ${needsBadge(id)}${notReadyWhy(rows)}`;
   }
 
-  function lastFailure(id) {
-    const hit = job && job.log.filter((l) => l.record_id === id).pop();
-    return hit && !hit.ok ? `<div class="rec-sub mf-bad">${esc(hit.text.replace(/^#\d+ /, ""))}</div>` : "";
+  function notReadyWhy(rows) {
+    const counts = {};
+    rows.filter((r) => r.status !== "ready" && r.review !== "rejected").forEach((r) => deciding(r).forEach((i) => { counts[i] = (counts[i] || 0) + 1; }));
+    const top = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    if (!top.length) return "";
+    return `<div class="rec-sub mf-why mf-notready">Not ready because: ${top.slice(0, 3).map(([i, n]) => `${esc(shortIssue(i))} (${n})`).join(" · ")}${top.length > 3 ? ` · +${top.length - 3} more` : ""}</div>`;
+  }
+
+  // How the last build of this paper ended, when it did not end well (kept on the server).
+  const OUTCOME = { failed: "Last build failed", stopped: "Last build was stopped", usage_limit: "Last build stopped: the AI's usage limit was reached" };
+  function lastOutcome(id) {
+    const run = (data.runs || {})[id];
+    if (!run || !OUTCOME[run.outcome] || stateOf(id) === "building" || stateOf(id) === "queued") return "";
+    const when = new Date(run.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    return `<div class="rec-sub mf-bad">${OUTCOME[run.outcome]} (${esc(when)})${run.note ? `: ${esc(run.note.slice(0, 300))}` : ""}</div>`;
   }
 
   // What the saved download locations offer, as the search recorded it.
@@ -237,7 +274,7 @@
         <a class="mf-paper-title" href="${esc(safeUrl(p.doi ? `https://doi.org/${p.doi}` : p.publication_url))}" target="_blank" rel="noopener">${esc(p.publication_title || `Record #${id}`)}</a>
         <div class="dq-paper-meta">${kindTag(p)} #${id} · ${esc([p.first_author && `${p.first_author} et al.`, p.journal, p.year, p.qtl_type, p.species && `species: ${p.species}`,
           p.n_locations > 1 && `${p.n_locations} download locations`, p.saved_by === "auto" ? "saved by the AI" : "saved by you"].filter(Boolean).join(" · "))}</div>
-        <div class="mf-paper-status">${status}</div>${lastFailure(id)}
+        <div class="mf-paper-status">${status}</div>${lastOutcome(id)}
       </div><div class="mf-paper-btns">${build}${check}</div>`;
   }
 
