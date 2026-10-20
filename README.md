@@ -61,6 +61,13 @@ See `records.autosave`.
 
 ## Manifest rows
 
+By default each paper is built by the LLM itself, through tools (`agent.py`): it reads the
+paper, follows every data link, lists repositories, peeks into remote files, downloads, writes
+Python to convert tables the importer cannot read (run without network or keys, scripts kept in
+`data/.agent_scripts/`), validates each file the way `load_gwas_qtl_catalog.py` reads it, and
+submits rows whose quotes, file paths and vocabulary the program checks. `MANIFEST_AGENT=0`
+(or "skips the AI") uses the older rules-first pipeline described below.
+
 `dataqueryweb-manifest run` turns saved records into candidate rows of LocusCompare's
 `scripts/qtl_manifest.tsv`. For each record it lists the files behind every download location
 (Zenodo, figshare, GitHub, Hugging Face, OSF, direct links), reads each table's header and

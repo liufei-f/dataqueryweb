@@ -12,6 +12,29 @@
 
 ## 2. 流程
 
+### 2a. 默认：LLM 逐篇调查（`agent.py`）
+
+从 2026-10-20 起，每篇论文由 LLM 自己用工具完成，程序只提供工具并检查结果：
+
+| 工具 | 做什么 |
+|---|---|
+| `read_paper` | 按关键词搜索或按顺序读论文全文；全文没取到时也搜已打开网页的文字 |
+| `open_url` | 打开网页 / DOI，返回文字（`offset` 往下读，`find` 只看匹配段落）和全部链接 |
+| `list_files` | 列出仓库（Zenodo、figshare、GitHub、Hugging Face、OSF）或网页上的文件、大小、下载地址 |
+| `peek_file` | 不下载，读远程文件 / 压缩包成员 / xlsx / parquet 的表头和前几行 |
+| `download` | 下载到 `data/<dataset>/`，断点续传，受每篇上限和磁盘剩余空间限制；别的论文下过的同一 URL 直接复用（`data/.downloads.json`） |
+| `inspect_local` | 看已下载文件或压缩包成员的前几行、文件夹或压缩包的内容 |
+| `run_python` | LLM 写 Python 处理数据，生成 `<原名>_processed.tsv.gz`；在数据集文件夹里运行，无网络（`unshare -n`）、无 API key、有时间上限；出现联网、子进程、删除文件、读环境变量、绝对路径等写法的代码直接拒绝执行；脚本保存在 `data/.agent_scripts/<record_id>/` |
+| `validate` | 按导入脚本的方式（`pandas.read_csv`，manifest 的分隔符和列名）读文件前 2 万行，逐列检查数值、导入脚本过滤后保留的比例、gene id / caQTL peak id 格式 |
+| `note_location` | 记录某个数据位置的结论（需要人工、打不开、不是数据……） |
+| `submit` / `give_up` | 提交行；程序检查：`file_path` 必须通过 `validate` 且列名一致、QTL 类型在 manifest 范围内、引用逐字出现在 LLM 实际看过的文本里、context 词表、标签格式、同一 context 不重复。有问题退回给 LLM 改，最多 3 轮 |
+
+上限：每篇 80 次工具调用（`MANIFEST_AGENT_STEPS`）、400 万 token（`MANIFEST_AGENT_TOKENS`），单个脚本最长 6 小时（`MANIFEST_RUN_MAX_SECONDS`）。用完后要求 LLM 立即提交已通过验证的行。行的证据里保存 LLM 的总结、运行过的脚本和每次工具调用，在 Check 面板的 “AI work” 里看。
+
+`MANIFEST_AGENT=0` 或勾选“skips the AI”时，用下面 2b 的旧流程。
+
+### 2b. 规则优先的旧流程
+
 | 步骤 | 模块 | 做什么 | 是否用 LLM |
 |---|---|---|---|
 | 1 取文件 | `probe.py` | 列出每个下载位置里的文件；只读每张表的前 256 KB 拿到表头和前 5 行 | 否 |

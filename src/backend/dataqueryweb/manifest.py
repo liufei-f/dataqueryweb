@@ -46,9 +46,12 @@ from typing import Any
 
 import httpx
 
-from dataqueryweb import fetch, finder, llm, probe, records
+from dataqueryweb import agent, fetch, finder, llm, probe, records
 from dataqueryweb import manifest_rules as rules
 
+# The LLM investigates each paper with tools (agent.py); MANIFEST_AGENT=0 keeps the older
+# rules-first pipeline in which the LLM only fills the facts files do not carry.
+AGENT = os.environ.get("MANIFEST_AGENT", "1").lower() not in ("0", "false", "no")
 MAX_PROBES = int(os.environ.get("MANIFEST_MAX_PROBES") or 14)  # files opened per location
 MAX_CANDIDATES = 120  # tables kept per record
 LLM_BATCH = 30  # tables per LLM call; a long list makes one answer slow
@@ -891,6 +894,9 @@ async def build_record(
     if exists := already_exists(record, target):
         return {"record_id": record["record_id"], "rows": 0, "statuses": {}, "locations": {}, "tokens": 0,
                 "model": "", "note": "", "skipped": f"already exists in the reference manifest as {exists} — skipped"}
+    if judge is not None and data is not None and AGENT:
+        return await build_with_agent(record, store, judge, target=target, step=step, data=data,
+                                      cancel=cancel or threading.Event())
     step("listing the files and reading their headers")
     candidates, reports, texts = await asyncio.to_thread(
         retrieve, record, include_supplements=include_supplements)
@@ -946,6 +952,39 @@ async def build_record(
             "model": model, "note": note}
 
 
+async def build_with_agent(
+    record: dict[str, Any], store: ManifestStore, judge: llm.Judge, *, target: rules.Target,
+    step: Callable[[str], None], data: fetch.Options, cancel: threading.Event,
+) -> dict[str, Any]:
+    """The LLM investigates, downloads, processes and fills the rows itself (agent.py)."""
+    rid = record["record_id"]
+    step("reading the paper")
+    paper = await read_paper(record)
+    previous = []
+    for r in store.rows(rid):
+        d = r["evidence"].get("data") or {}
+        previous += [r["file_path"], *(d.get("raw") or []), *(d.get("outputs") or [])]
+    previous = [p for p in dict.fromkeys(previous) if p and fetch.data_dir(store.path).joinpath(p).exists()]
+    usage = llm.new_usage()
+    out = await agent.run(record, judge, root=data.root, max_bytes=data.max_bytes if data.download else 0,
+                          target=target, paper=paper, step=step, cancel=cancel, usage=usage, previous=previous)
+    rows = out["rows"]
+    for r in rows:
+        r["evidence"]["agent"] = {"summary": out["summary"], "log": out["log"][-120:], "scripts": out["scripts"]}
+    step("saving")
+    note = out["note"] or ("" if rows else f"no row: {out['summary'][:300]}")
+    store.save_run(rid, rows, out["reports"], model=out["model"], tokens=usage["total_tokens"], run_note=note)
+    statuses: dict[str, int] = {}
+    data_states: dict[str, int] = {}
+    for r in rows:
+        statuses[r["status"]] = statuses.get(r["status"], 0) + 1
+        if d := r["evidence"].get("data"):
+            data_states[d["status"]] = data_states.get(d["status"], 0) + 1
+    return {"record_id": rid, "rows": len(rows), "statuses": statuses, "data": data_states,
+            "locations": {r["url"]: r["status"] for r in out["reports"]}, "tokens": usage["total_tokens"],
+            "model": out["model"], "note": out["note"], "summary": out["summary"]}
+
+
 def select(
     saved: list[dict[str, Any]], done: set[int], *, record_ids: list[int] | None = None,
     limit: int = 0, redo: bool = False, all_species: bool = False, target: rules.Target | None = None,
@@ -972,6 +1011,8 @@ def describe(record: dict[str, Any], result: dict[str, Any]) -> str:
     states = ", ".join(f"{n} {s}" for s, n in sorted(result["statuses"].items())) or "no candidate table"
     where = ", ".join(sorted(set(result["locations"].values())))
     data = ", ".join(f"{n} {s.replace('_', ' ')}" for s, n in sorted(result.get("data", {}).items()) if s != "skipped")
+    if result.get("summary") and not result["rows"]:
+        states = f"no row — {result['summary'][:160]}"
     return (f"#{record['record_id']} {record['publication_title'][:60]!r}: {states} · locations: {where}"
             + (f" · data: {data}" if data else "")
             + f" · {result['tokens']:,} tokens{' · ' + result['note'] if result['note'] else ''}")

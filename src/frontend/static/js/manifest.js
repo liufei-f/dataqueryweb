@@ -84,12 +84,17 @@
     const facts = [];
     if (d.raw) facts.push(["Downloaded", `${list(d.raw, d.n_raw)}${d.bytes ? `<div class="rec-sub">${size(d.bytes)}${d.fresh_files === 0 ? " · already there, not downloaded again" : ""}</div>` : ""}`]);
     if (d.why_processing) facts.push(["Why processing", esc(d.why_processing.join("; "))]);
-    if (d.steps) facts.push(["What was done", `${d.steps.map(esc).join("<br>")}<div class="rec-sub">plan from ${d.plan_source === "LLM" ? "the AI" : "the header rules"}${d.plan_reason ? `: ${esc(d.plan_reason)}` : ""}</div>`]);
+    if (d.steps) facts.push(["What was done", `${d.steps.map(esc).join("<br>")}<div class="rec-sub">plan from ${d.plan_source === "LLM code" ? "Python the AI wrote" : d.plan_source === "LLM" ? "the AI" : "the header rules"}${d.plan_reason ? `: ${esc(d.plan_reason)}` : ""}</div>`]);
     if (d.outputs) facts.push(["Written", `${list(d.outputs, d.n_outputs)}${d.rows != null ? `<div class="rec-sub">${d.rows.toLocaleString()} rows, same as read</div>` : ""}`]);
     if (d.tried && d.tried.length) facts.push(["Plans rejected", d.tried.map((t) => `<div><strong>${t.source === "LLM" ? "AI" : "rules"}</strong>: ${esc((t.steps || []).join("; "))} — ${esc(t.result)}</div>`).join("")]);
     if (d.note) facts.push(["Note", esc(d.note)]);
+    if (d.kept_share != null) facts.push(["Importer keeps", `${Math.round(d.kept_share * 100)}% of the sampled rows (single-base autosomal SNVs with position and p-value)`]);
+    const gid = (d.checks || {}).gene_id, peak = (d.checks || {}).peak_id;
+    if (gid) facts.push(["Gene ids", `${esc(gid.mode)}: ${Math.round(gid.ensembl_share * 100)}% Ensembl, e.g. <code>${esc(gid.example)}</code>${gid.warning ? ` — ${esc(gid.warning)}` : ""}`]);
+    if (peak) facts.push(["Peak ids", `${Math.round(peak.chr_start_end_share * 100)}% chr_start_end, e.g. <code>${esc(peak.example)}</code>`]);
+    if (d.problems && d.problems.length) facts.push(["Check problems", d.problems.map(esc).join("<br>")]);
     const checks = d.checks ? `<table class="mf-ev"><thead><tr><th>Importer needs</th><th>Column</th><th>Values that look right</th><th>Example</th></tr></thead><tbody>${
-      Object.entries(d.checks).filter(([k]) => k !== "file").map(([role, c]) => `<tr><th>${esc(role)}</th><td><code>${esc(c.column)}</code></td>
+      Object.entries(d.checks).filter(([k, c]) => k !== "file" && c && c.column !== undefined).map(([role, c]) => `<tr><th>${esc(role)}</th><td><code>${esc(c.column)}</code></td>
         <td class="${c.checked && c.pass === c.checked ? "mf-ok" : "mf-bad"}">${c.problem ? esc(c.problem) : `${c.pass.toLocaleString()} / ${c.checked.toLocaleString()}`}</td><td><code>${esc(c.example)}</code></td></tr>`).join("")}</tbody></table>` : "";
     const pv = d.preview && d.preview.columns ? `<p class="rec-sub">First rows of ${d.status === "processed" ? "the processed file" : "the file"}:</p>
       <div class="table-wrap"><table class="mf-preview"><thead><tr>${d.preview.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead>
@@ -97,6 +102,18 @@
     return `<p>${dataBadge(r)} ${r.file_path && ["processed", "as_is"].includes(d.status) ? `<code>${esc(r.file_path)}</code>` : ""}</p>
       ${facts.length ? `<table class="mf-ev mf-data"><tbody>${facts.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join("")}</tbody></table>` : ""}
       ${checks}${pv}`;
+  }
+
+  // What the AI did for this paper: its summary, the scripts it ran and every tool call.
+  function agentSection(r) {
+    const a = r.evidence.agent;
+    if (!a) return "";
+    const scripts = (a.scripts || []).map((x) => `<li><code>${esc(x.script)}</code> — ${esc(x.purpose)} <span class="rec-sub">exit ${esc(x.exit_code)}, ${esc(x.seconds)} s</span></li>`).join("");
+    const log = (a.log || []).map((x, i) => `<tr><td>${i + 1}</td><td><code>${esc(x.tool)}</code></td><td class="rec-url">${esc(x.args)}</td><td class="rec-url">${esc(x.result)}</td></tr>`).join("");
+    return `<h3>AI work</h3>${a.summary ? `<p>${esc(a.summary)}</p>` : ""}
+      ${scripts ? `<p class="rec-sub">Python it wrote and ran (kept in the data folder):</p><ul class="mf-issues">${scripts}</ul>` : ""}
+      <details class="mf-loc"><summary>${(a.log || []).length} tool calls</summary>
+      <div class="table-wrap"><table class="mf-ev"><thead><tr><th>#</th><th>Tool</th><th>Asked</th><th>Got</th></tr></thead><tbody>${log}</tbody></table></div></details>`;
   }
 
   function detail(r) {
@@ -110,6 +127,7 @@
         <div><h3>Columns</h3>${columnTable(r)}</div>
       </div>
       <h3>Data</h3>${dataSection(r)}
+      ${agentSection(r)}
       <h3>Source file <span class="rec-sub">${esc(r.source_path)} · ${r.n_files} file${r.n_files > 1 ? "s" : ""}${r.file_size ? ` · ${size(r.file_size)}` : ""}</span></h3>
       ${preview(r)}<p>${files}${r.file_urls.length > 4 ? `<span class="rec-sub"> … ${r.file_urls.length - 4} more</span>` : ""}</p>
       <h3>Correct and decide</h3>

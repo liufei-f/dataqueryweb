@@ -488,6 +488,52 @@ class Judge:
                         errors.append(f"{model}: {type(exc).__name__}")
         raise LLMFailed("; ".join(errors) or "no model configured")
 
+    async def chat_tools(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+        usage: dict[str, int] | None = None, timeout: float | None = None,
+    ) -> tuple[dict[str, Any], str]:
+        """One assistant turn (text and/or tool calls) of a tool-using conversation, from the
+        primary endpoint. Returns (message, "provider · model"); raises :class:`LLMFailed`."""
+        config, errors = self.config, []
+        headers = {"Content-Type": "application/json"}
+        if config.api_key:
+            headers["Authorization"] = f"Bearer {config.api_key}"
+        url = f"{config.base_url.rstrip('/')}/chat/completions"
+        async with self.gates[config.name]:
+            for model in config.models:
+                if (config.name, model) in self.exhausted:
+                    continue
+                body = {"model": model, "messages": messages, "tools": tools}
+                for attempt in range(4):
+                    try:
+                        r = await self.http.post(url, headers=headers, json=body,
+                                                 **({"timeout": timeout} if timeout else {}))
+                    except httpx.HTTPError as exc:
+                        if attempt < 2:
+                            await asyncio.sleep(5 * (attempt + 1))
+                            continue
+                        errors.append(f"{model}: {type(exc).__name__}")
+                        break
+                    if r.status_code in (402, 403, 429) and QUOTA_RE.search(r.text):
+                        # Not remembered as exhausted: the caller may wait for the window to reset.
+                        errors.append(f"{model}: usage limit ({r.text[:200]})")
+                        break
+                    if r.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                        await asyncio.sleep(float(r.headers.get("retry-after") or 5 * (attempt + 1)))
+                        continue
+                    if r.status_code >= 400:
+                        errors.append(f"{model}: HTTP {r.status_code} {r.text[:160]}")
+                        break
+                    try:
+                        data = r.json()
+                        message = data["choices"][0]["message"]
+                    except (ValueError, KeyError, IndexError) as exc:
+                        errors.append(f"{model}: {type(exc).__name__}")
+                        break
+                    add_usage(usage, data.get("usage"))
+                    return message, f"{config.name} · {data.get('model') or model}"
+        raise LLMFailed("; ".join(errors) or "no model configured")
+
     async def judge(self, paper: Paper) -> dict[str, Any]:
         """Text verdict, then — when needed and supported — a web-research pass.
 
