@@ -91,7 +91,8 @@ WHAT THE MANIFEST NEEDS
 conditional, fine-mapped or colocalised hits are NOT wanted — list them in skipped_tables.
 - qtl_type must be one of: eQTL, sQTL, caQTL, pQTL. Other types (mQTL, meQTL, metabolite QTL, \
 edQTL, apaQTL, …) go to skipped_tables with the reason.
-- Human data only.
+- Human data only, and only THIS paper's own new QTL results — never public resources the \
+paper merely used (eQTLGen, GTEx, eQTL Catalogue, UKB-PPP, deCODE, MetaBrain, PsychENCODE, …).
 - Already in LocusCompare (do not download again): {datasets}. GTEx is there as GTEx_v10, so \
 older GTEx releases (v6, v6p, v7, v8) — or a paper's copy of GTEx results — are not \
 downloaded: list them in skipped_tables as "already in the manifest as GTEx_v10". The same \
