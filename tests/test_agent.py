@@ -135,3 +135,12 @@ def test_older_gtex_releases_are_not_downloaded(tmp_path: Path, served) -> None:
                                    "https://example.org/GTEx_Analysis_v8_eQTL/Lung.txt.gz"])
     assert all("GTEx_v10" in f["error"] for f in out["files"])
     assert agent.OLD_GTEX.search("GTEx_v8") and not agent.OLD_GTEX.search("GTEx_v10")
+
+
+def test_only_summary_statistics_are_downloaded(tmp_path: Path, served) -> None:
+    s = session(tmp_path)
+    out = s.download("X", urls=["https://hgdownload.soe.ucsc.edu/goldenPath/hg19/database/snp151Common.txt.gz",
+                                "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC1/fullTextXML",
+                                "https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/hgnc_complete_set.txt"])
+    assert all("only QTL summary statistics" in f["error"] for f in out["files"])
+    assert not agent.NOT_SUMSTATS.search("https://zenodo.org/f/eqtl.allpairs.tsv.gz")

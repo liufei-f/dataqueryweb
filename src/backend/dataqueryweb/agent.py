@@ -62,6 +62,12 @@ TRACE = bool(os.environ.get("MANIFEST_AGENT_TRACE"))  # print every tool call (d
 INDEX_FILE = ".downloads.json"  # url → local file, shared by every paper
 SCRIPTS_DIR = ".agent_scripts"
 
+# Never QTL summary statistics: reference/annotation data, pages, papers.
+NOT_SUMSTATS = re.compile(
+    r"hgdownload|ucsc\.edu/goldenpath|ftp\.ensembl|ensembl\.org|gencodegenes|genenames\.org|/hgnc/|dbsnp|snp1[0-9]{2}"
+    r"|/geo/query/|/geo/series/.*_RAW\.tar|europepmc/webservices|/pmc/articles/|pmc\.ncbi\.nlm\.nih\.gov/articles"
+    r"|api\.figshare\.com/v2/articles/\d+$|zenodo\.org/api/records/\d+$|\.(fa|fasta|fna|2bit|chain|gtf|gff3?|bam|bai|cram"
+    r"|vcf|bcf|bed|bigwig|bw|pdf|docx?|html?|xml|json|h5ad|rds|rdata)(\.gz)?([?#].*)?$", re.I)
 # Older GTEx releases: the manifest already has GTEx v10.
 OLD_GTEX = re.compile(r"gtex[^/]{0,20}?v(6p?|7|8)(?![0-9])|gtex_analysis_v(6p?|7|8)", re.I)
 FORBIDDEN = re.compile(
@@ -106,6 +112,17 @@ chi-square instead of p, no header, is parquet/xlsx/inside an archive, or uses w
 write Python with run_python that produces <original name>_processed.tsv.gz (tab-separated, \
 with a header) next to the original. Never invent values: if alleles or positions exist \
 nowhere, the table cannot be used (say so in skipped_tables).
+
+DOWNLOAD ONLY QTL SUMMARY STATISTICS. Download a file only after peek_file (or a listing \
+with a clear README) showed it is a table of QTL associations, or an archive of such tables. \
+Never download anything else: no reference or annotation data (dbSNP, gene annotation, HGNC, \
+Ensembl/GENCODE, genome FASTA, chain files, array platform annotations), no genotypes, \
+expression matrices, peaks or counts, no supplementary bundles, web pages, XML or PDFs \
+(read those with open_url). Processing may only use the downloaded summary statistics \
+themselves. If a table can only be made loadable with outside reference data (e.g. it has \
+rsIDs or positions but no chromosome anywhere), do not process it: list it in \
+skipped_tables with what it lacks. Phenotype ids that are not Ensembl (gene symbols, RefSeq, \
+probe ids) are kept as they are; the row is flagged for a person.
 
 THE SERVER: 2 CPUs, 3 GB RAM. Process big tables in chunks (pandas chunksize ≤ 200000, \
 write with gzip in append mode). A 3 GB .gz file takes ~20 minutes; that is fine. Files \
@@ -395,7 +412,8 @@ class Session:
         for u in urls or []:
             todo.append(probe.RemoteFile(probe._name_of(u), u))
         refused = [f for f in todo if OLD_GTEX.search(f"{f.url} {f.path or f.name}")]
-        todo = [f for f in todo if f not in refused]
+        not_data = [f for f in todo if f not in refused and NOT_SUMSTATS.search(f"{f.url} {f.path or f.name}")]
+        todo = [f for f in todo if f not in refused and f not in not_data]
         idx, out, http = self._index(), [], fetch.http_client()
         try:
             for k, f in enumerate(todo, 1):
@@ -446,6 +464,13 @@ class Session:
                 except Exception as exc:
                     out.append({"url": f.url, "error": f"{type(exc).__name__}: {exc}"[:300]})
                     continue
+                with dest.open("rb") as fh:
+                    head = fh.read(512).lstrip().lower()
+                if head.startswith((b"<!doctype", b"<html", b"<?xml", b"{", b"%pdf")):
+                    dest.unlink()  # a page, XML, JSON or PDF: not summary statistics
+                    out.append({"url": f.url, "error": "not kept: the link returned a web page / XML / JSON / PDF, "
+                                "not a data table; read it with open_url"})
+                    continue
                 size = dest.stat().st_size
                 self.used_bytes += size
                 rel = str(dest.relative_to(self.root))
@@ -460,6 +485,8 @@ class Session:
             http.close()
         out += [{"url": f.url, "error": "not downloaded: an older GTEx release; the manifest already has GTEx_v10 "
                  "(list it in skipped_tables)"} for f in refused]
+        out += [{"url": f.url, "error": "not downloaded: only QTL summary statistics are downloaded (this looks like "
+                 "reference data, a page, a paper or another file type); read pages with open_url"} for f in not_data]
         return {"folder": str(folder.relative_to(self.root)), "files": out}
 
     def inspect_local(self, path: str, lines: int = 8) -> dict[str, Any]:
