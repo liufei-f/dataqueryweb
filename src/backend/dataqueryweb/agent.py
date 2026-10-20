@@ -62,6 +62,8 @@ TRACE = bool(os.environ.get("MANIFEST_AGENT_TRACE"))  # print every tool call (d
 INDEX_FILE = ".downloads.json"  # url → local file, shared by every paper
 SCRIPTS_DIR = ".agent_scripts"
 
+# Older GTEx releases: the manifest already has GTEx v10.
+OLD_GTEX = re.compile(r"gtex[^/]{0,20}?v(6p?|7|8)(?![0-9])|gtex_analysis_v(6p?|7|8)", re.I)
 FORBIDDEN = re.compile(
     r"\b(subprocess|socket|ctypes|multiprocessing|requests|urllib|httpx|aiohttp|http\.client|ftplib"
     r"|paramiko|importlib|__import__|shutil\.rmtree|shutil\.move|os\.system|os\.popen|os\.exec\w*"
@@ -84,6 +86,10 @@ conditional, fine-mapped or colocalised hits are NOT wanted — list them in ski
 - qtl_type must be one of: eQTL, sQTL, caQTL, pQTL. Other types (mQTL, meQTL, metabolite QTL, \
 edQTL, apaQTL, …) go to skipped_tables with the reason.
 - Human data only.
+- Already in LocusCompare (do not download again): {datasets}. GTEx is there as GTEx_v10, so \
+older GTEx releases (v6, v6p, v7, v8) — or a paper's copy of GTEx results — are not \
+downloaded: list them in skipped_tables as "already in the manifest as GTEx_v10". The same \
+holds for any other resource above.
 - The importer (load_gwas_qtl_catalog.py) reads each file with \
 pandas.read_csv(path, sep=delimiter, compression="infer", dtype=str) and needs these columns, \
 named in the row: chrom_col, position_col, ref_col, alt_col, pval_col (nominal p-value, not \
@@ -388,6 +394,8 @@ class Session:
                 return {"error": f"nothing in the listing matches {pattern!r} ({listing.status}: {listing.note})"}
         for u in urls or []:
             todo.append(probe.RemoteFile(probe._name_of(u), u))
+        refused = [f for f in todo if OLD_GTEX.search(f"{f.url} {f.path or f.name}")]
+        todo = [f for f in todo if f not in refused]
         idx, out, http = self._index(), [], fetch.http_client()
         try:
             for k, f in enumerate(todo, 1):
@@ -450,6 +458,8 @@ class Session:
                 self.downloads.append(item)
         finally:
             http.close()
+        out += [{"url": f.url, "error": "not downloaded: an older GTEx release; the manifest already has GTEx_v10 "
+                 "(list it in skipped_tables)"} for f in refused]
         return {"folder": str(folder.relative_to(self.root)), "files": out}
 
     def inspect_local(self, path: str, lines: int = 8) -> dict[str, Any]:
@@ -923,7 +933,7 @@ async def run(
               "\n".join([paper.title, paper.abstract, *paper.availability, *paper.paragraphs]))
     for loc in records._locations_of(record):
         s.location(loc["download_url"], content=loc.get("content", ""), access=loc.get("access_route", ""))
-    system = SYSTEM.format(level_1=", ".join(target.level_1))
+    system = SYSTEM.format(level_1=", ".join(target.level_1), datasets=", ".join(target.datasets) or "GTEx_v10")
     messages: list[dict[str, Any]] = [{"role": "system", "content": system},
                                       {"role": "user", "content": first_message(s, list(previous))}]
     tools = [{"type": "function", "function": t} for t in TOOLS]

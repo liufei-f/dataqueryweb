@@ -527,6 +527,7 @@ class Target:
 
     level_1: list[str] = field(default_factory=lambda: list(BROAD_CONTEXTS))
     publications: dict[str, str] = field(default_factory=dict)  # doi → dataset
+    datasets: list[str] = field(default_factory=list)  # every dataset name it holds
     path: str = ""
 
 
@@ -542,6 +543,9 @@ def load_target(path: str | Path | None = None) -> Target:
                     l1 = (row.get("level_1_context") or "").strip()
                     if l1 and l1 not in target.level_1:
                         target.level_1.append(l1)
+                    name = (row.get("dataset") or "").strip()
+                    if name and name not in target.datasets:
+                        target.datasets.append(name)
                     doi = doi_of(row.get("publication") or "")
                     if doi:
                         target.publications.setdefault(doi, row.get("dataset") or "")

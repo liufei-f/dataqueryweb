@@ -127,3 +127,11 @@ def test_the_model_downloads_processes_validates_and_submits(tmp_path: Path, ser
     s = session(tmp_path)
     again = s.download("Other", urls=["https://zenodo.org/f/eqtl.tsv.gz"])
     assert "reused" in again["files"][0]["note"]
+
+
+def test_older_gtex_releases_are_not_downloaded(tmp_path: Path, served) -> None:
+    s = session(tmp_path)
+    out = s.download("GTEx", urls=["https://storage.googleapis.com/gtex_analysis_v6p/single_tissue_eqtl_data/Whole_Blood.allpairs.txt.gz",
+                                   "https://example.org/GTEx_Analysis_v8_eQTL/Lung.txt.gz"])
+    assert all("GTEx_v10" in f["error"] for f in out["files"])
+    assert agent.OLD_GTEX.search("GTEx_v8") and not agent.OLD_GTEX.search("GTEx_v10")
