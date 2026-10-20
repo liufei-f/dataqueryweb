@@ -488,6 +488,17 @@ class Judge:
                         errors.append(f"{model}: {type(exc).__name__}")
         raise LLMFailed("; ".join(errors) or "no model configured")
 
+    async def ping(self) -> bool:
+        """Does the primary model answer a one-word question now (no usage limit)?"""
+        try:
+            await self.chat_tools([{"role": "user", "content": "Reply with the word OK."}],
+                                  [{"type": "function", "function": {"name": "noop", "description": "unused",
+                                                                     "parameters": {"type": "object", "properties": {}}}}],
+                                  None, 60)
+        except LLMFailed:
+            return False
+        return True
+
     async def chat_tools(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
         usage: dict[str, int] | None = None, timeout: float | None = None,

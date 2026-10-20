@@ -144,3 +144,35 @@ def test_only_summary_statistics_are_downloaded(tmp_path: Path, served) -> None:
                                 "https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/hgnc_complete_set.txt"])
     assert all("only QTL summary statistics" in f["error"] for f in out["files"])
     assert not agent.NOT_SUMSTATS.search("https://zenodo.org/f/eqtl.allpairs.tsv.gz")
+
+
+def test_a_run_waits_for_the_usage_limit_and_resumes(tmp_path: Path, monkeypatch) -> None:
+    from dataqueryweb import llm, manifest
+
+    calls = []
+
+    async def fake_build(record, store, judge, **kw):
+        calls.append(record["record_id"])
+        note = "LLM step failed: gpt: usage limit (window)" if len(calls) == 1 else ""
+        return {"record_id": record["record_id"], "rows": 0, "statuses": {}, "data": {}, "locations": {},
+                "tokens": 10, "model": "", "note": note}
+
+    class FakeJudge:
+        def __init__(self):
+            self.exhausted = set()
+        pings = 0
+
+        async def ping(self):
+            FakeJudge.pings += 1
+            return FakeJudge.pings >= 2  # still limited at the first check
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(manifest, "build_record", fake_build)
+    monkeypatch.setattr(manifest, "QUOTA_CHECK_SECONDS", 0)
+    monkeypatch.setattr(llm, "Judge", FakeJudge)
+    store = manifest.ManifestStore(tmp_path / "db.sqlite3", tmp_path / "out")
+    batch = manifest.Batch([{"record_id": 1, "publication_title": "A"}, {"record_id": 2, "publication_title": "B"}], store)
+    asyncio.run(batch.run())
+    assert calls == [1, 1, 2] and FakeJudge.pings == 2 and batch.state == "done" and batch.done == 2

@@ -275,7 +275,7 @@
   }
 
   // How the last build of this paper ended, when it did not end well (kept on the server).
-  const OUTCOME = { failed: "Last build failed", stopped: "Last build was stopped", usage_limit: "Last build stopped: the AI's usage limit was reached" };
+  const OUTCOME = { failed: "Last build failed", stopped: "Last build was stopped", usage_limit: "Waiting: the AI's usage limit was reached; the run checks every hour and resumes with this paper" };
   function lastOutcome(id) {
     const run = (data.runs || {})[id];
     if (!run || !OUTCOME[run.outcome] || stateOf(id) === "building" || stateOf(id) === "queued") return "";

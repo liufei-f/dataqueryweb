@@ -40,7 +40,7 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +52,8 @@ from dataqueryweb import manifest_rules as rules
 # The LLM investigates each paper with tools (agent.py); MANIFEST_AGENT=0 keeps the older
 # rules-first pipeline in which the LLM only fills the facts files do not carry.
 AGENT = os.environ.get("MANIFEST_AGENT", "1").lower() not in ("0", "false", "no")
+# How often a run stopped by the LLM's usage limit checks whether it can go on.
+QUOTA_CHECK_SECONDS = int(os.environ.get("MANIFEST_QUOTA_CHECK_SECONDS") or 3600)
 MAX_PROBES = int(os.environ.get("MANIFEST_MAX_PROBES") or 14)  # files opened per location
 MAX_CANDIDATES = 120  # tables kept per record
 LLM_BATCH = 30  # tables per LLM call; a long list makes one answer slow
@@ -971,6 +973,9 @@ async def build_with_agent(
     rows = out["rows"]
     for r in rows:
         r["evidence"]["agent"] = {"summary": out["summary"], "log": out["log"][-120:], "scripts": out["scripts"]}
+    if "usage limit" in out["note"]:  # cut short: keep what the last full build stored
+        return {"record_id": rid, "rows": 0, "statuses": {}, "data": {}, "locations": {}, "tokens": usage["total_tokens"],
+                "model": out["model"], "note": out["note"], "summary": out["summary"]}
     step("saving")
     note = out["note"] or ("" if rows else f"no row: {out['summary'][:300]}")
     store.save_run(rid, rows, out["reports"], model=out["model"], tokens=usage["total_tokens"], run_note=note)
@@ -1069,7 +1074,9 @@ class Batch:
     async def run(self, echo: Callable[[str, bool], None] | None = None) -> None:
         judge = None if self.no_llm else llm.Judge()
         try:
-            for record in self.todo:
+            i = 0
+            while i < len(self.todo):  # the list grows when records are queued during the run
+                record = self.todo[i]
                 rid = record["record_id"]
                 self.current = current = {"record_id": rid, "title": record["publication_title"], "step": "",
                                           "since": datetime.now().astimezone().isoformat(timespec="seconds")}
@@ -1081,28 +1088,34 @@ class Batch:
                 except Exception as exc:  # one bad record must not stop a batch
                     self.failed += 1
                     self.done += 1
+                    i += 1
                     self.store.note_run(rid, "failed", f"{type(exc).__name__}: {exc}")
                     line = f"#{rid}: failed — {type(exc).__name__}: {exc}"
                     self.log.append({"record_id": rid, "ok": False, "text": line})
                     if echo:
                         echo(line, False)
                     continue
-                self.done += 1
-                self.rows += result["rows"]
                 self.tokens += result["tokens"]
+                if "usage limit" in result["note"] and judge is not None:
+                    # Nothing of this paper was stored. Check the LLM every hour; go on with
+                    # this same paper once it answers again.
+                    self.store.note_run(rid, "usage_limit", result["note"] + " — waiting, the run resumes by itself")
+                    self.log.append({"record_id": rid, "ok": False,
+                                     "text": f"#{rid}: the LLM's usage limit is reached; checking every "
+                                             f"{QUOTA_CHECK_SECONDS // 60} min and resuming with this paper"})
+                    await self.wait_for_llm(judge, current)
+                    continue
+                self.done += 1
+                i += 1
+                self.rows += result["rows"]
                 line = describe(record, result)
                 if result.get("skipped"):
                     self.store.note_run(rid, "skipped", result["skipped"])
-                elif "usage limit" in result["note"]:
-                    self.store.note_run(rid, "usage_limit", result["note"])
                 else:
                     self.store.note_run(rid, "built", result["note"])
                 self.log.append({"record_id": rid, "ok": not result["note"], "text": line})
                 if echo:
                     echo(line, True)
-                if "usage limit" in result["note"]:
-                    self.state = "usage_limit"
-                    return
             self.state = "done"
         except asyncio.CancelledError:
             self.state = "stopped"
@@ -1114,6 +1127,21 @@ class Batch:
             self.finished = datetime.now().astimezone().isoformat(timespec="seconds")
             if judge is not None:
                 await judge.aclose()
+
+    async def wait_for_llm(self, judge: llm.Judge, current: dict[str, Any]) -> None:
+        """Sleep, then ask the LLM a one-word question; repeat until it answers."""
+        tries = 0
+        while True:
+            tries += 1
+            nxt = datetime.now().astimezone() + timedelta(seconds=QUOTA_CHECK_SECONDS)
+            current.update(step=f"waiting for the LLM's usage limit to reset — check {tries} at {nxt:%H:%M}",
+                           step_since=datetime.now().astimezone().isoformat(timespec="seconds"))
+            await asyncio.sleep(QUOTA_CHECK_SECONDS)
+            if await judge.ping():
+                judge.exhausted.clear()
+                self.log.append({"record_id": current["record_id"], "ok": True,
+                                 "text": f"#{current['record_id']}: the LLM answers again; resuming"})
+                return
 
 
 async def run(args: argparse.Namespace) -> int:
