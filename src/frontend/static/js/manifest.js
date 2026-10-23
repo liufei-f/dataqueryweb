@@ -343,6 +343,8 @@
       if (show.value === "needs" && !needsYou(id).length) return false;
       if (show.value === "tocheck" && !rows.some((r) => r.review === "pending")) return false;
       if (show.value === "approved" && !rows.some((r) => r.review === "approved")) return false;
+      if (show.value === "processed" && !rows.some((r) => (r.evidence.data || {}).status === "processed")) return false;
+      if (show.value === "as_is" && !rows.some((r) => (r.evidence.data || {}).status === "as_is")) return false;
       return !q || [id, p.publication_title, p.doi, p.first_author, p.journal, p.qtl_type, p.qtl_context, p.species,
         ...rows.map((r) => [r.dataset, r.biocontext, r.level_1_context, r.level_2_context, r.source_path, r.issues.join(" ")].join(" "))]
         .join(" ").toLowerCase().includes(q);
