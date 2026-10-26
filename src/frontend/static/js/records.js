@@ -4,6 +4,7 @@
   const filter = document.getElementById("rec-filter");
   const count = document.getElementById("rec-count");
   const by = document.getElementById("rec-by");
+  const context = document.getElementById("rec-context");
   let rows = [];
 
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -43,8 +44,11 @@
 
   function render() {
     const q = filter.value.trim().toLowerCase();
+    // Context words must all appear in the Context column (any order), e.g. "liver mice".
+    const words = context.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const shown = rows
       .filter((r) => !by.value || r.saved_by === by.value)
+      .filter((r) => words.every((w) => String(r.qtl_context || "").toLowerCase().includes(w)))
       .filter((r) => !q || Object.values(r).join(" ").toLowerCase().includes(q));
     const autos = rows.filter((r) => r.saved_by === "auto").length;
     count.textContent = (shown.length !== rows.length ? `${shown.length} of ${rows.length} records` : `${rows.length} record${rows.length === 1 ? "" : "s"}`)
@@ -64,6 +68,7 @@
   }
 
   filter.addEventListener("input", render);
+  context.addEventListener("input", render);
   by.addEventListener("change", render);
 
   body.addEventListener("click", async (e) => {
@@ -102,9 +107,10 @@
     }
   });
 
-  // /records?q=… (linked from Find QTL data) opens with that filter applied.
+  // /records?q=…&context=… (q is linked from Find QTL data) opens with those filters applied.
   const params = new URLSearchParams(location.search);
   filter.value = params.get("q") || "";
   by.value = params.get("by") || "";
+  context.value = params.get("context") || "";
   load();
 })();
