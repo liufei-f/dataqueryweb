@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import sqlite3
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -66,9 +67,102 @@ COLUMNS = [
     "search_terms",
     "curator_note",
     "saved_by",
+    "record_code",
     "saved_at",
 ]
 TEXT_FIELDS = [c for c in COLUMNS if c not in ("record_id", "saved_at")]
+
+
+# The one word of a record code: the first tissue or cell type its context names.
+TOPICS: list[tuple[str, str]] = [
+    ("ipsc", r"\bipscs?\b|induced pluripotent"),
+    ("lcl", r"lymphoblastoid|\blcls?\b"),
+    ("pbmc", r"\bpbmcs?\b|peripheral blood mononuclear"),
+    ("monocyte", r"monocyte"),
+    ("macrophage", r"macrophage"),
+    ("tcell", r"\bt[ -]?cells?\b|\bcd[48]\+"),
+    ("bcell", r"\bb[ -]?cells?\b"),
+    ("immune", r"immune"),
+    ("blood", r"blood|plasma|serum|platelet|erythro"),
+    ("brain", r"brain|cortex|cortical|hippocamp|cerebell|hypothalam|striatum|nigra|accumbens|dlpfc"
+              r"|prefrontal|neuron|microglia|astrocyte"),
+    ("csf", r"cerebrospinal|\bcsf\b"),
+    ("retina", r"retina"),
+    ("liver", r"liver|hepat"),
+    ("skin", r"\bskin|keratinocyte|epiderm|dermal"),
+    ("muscle", r"muscle|myoblast|myotube|longissimus"),
+    ("adipose", r"adipo|\bfat\b"),
+    ("heart", r"heart|cardiac|cardiomyocyte|ventric|myocard"),
+    ("lung", r"lung|airway|bronch|alveol"),
+    ("kidney", r"kidney|renal"),
+    ("gut", r"intestin|colon|ileum|duoden|jejun|\bgut\b|rectum"),
+    ("stomach", r"stomach|gastric"),
+    ("pancreas", r"pancrea|islet"),
+    ("breast", r"breast|mammary"),
+    ("prostate", r"prostate"),
+    ("placenta", r"placenta"),
+    ("cartilage", r"cartilage|chondrocyte"),
+    ("synovium", r"synovi"),
+    ("bone", r"\bbones?\b|osteo"),
+    ("thyroid", r"thyroid"),
+    ("fibroblast", r"fibroblast"),
+    ("spleen", r"spleen"),
+    ("testis", r"testis|testes|sperm"),
+    ("ovary", r"ovar"),
+    ("uterus", r"uter|endometri"),
+    ("esophagus", r"esophag|oesophag"),
+    ("tumor", r"tumou?r|cancer"),
+    ("microbiome", r"microbio|\b16s\b"),
+    ("urine", r"urine"),
+    ("milk", r"\bmilk"),
+    ("leaf", r"\bleaf|\bleaves"),
+    ("root", r"\broots?\b"),
+    ("seed", r"\bseeds?\b|\bgrains?\b|kernel"),
+    ("fruit", r"fruit"),
+]
+# Words of one tissue family count once when deciding whether a context spans several tissues.
+FAMILY = {w: "blood" for w in ("lcl", "pbmc", "monocyte", "macrophage", "tcell", "bcell", "immune")}
+MULTI_RE = re.compile(r"multiple (\w+ ){0,2}(tissues|cell types)|multi-?tissue|across tissues|\b\d+ (\w+ ){0,2}tissues", re.I)
+INITIALS_RE = re.compile(r"^(?:[A-Z]\.?){1,3}$")
+
+
+def _ascii(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if c.isascii() and c.isalnum())
+
+
+def surname(first_author: str) -> str:
+    """The family name in "Sun Z", "R. P. Denault W" or "Höglund A", ASCII letters only."""
+    tokens = str(first_author or "").replace(",", " ").split()
+    names = [t for t in tokens if not INITIALS_RE.match(t)] or tokens
+    name = _ascii(names[0]) if names else ""
+    return name[:1].upper() + name[1:] if name else "Anon"
+
+
+def topic(record: dict[str, Any]) -> str:
+    """One word for what a record is about: its tissue or cell type, else its QTL type."""
+    for text in (record.get("qtl_context", ""), record.get("publication_title", "")):
+        text = str(text or "")
+        if MULTI_RE.search(text):
+            return "multitissue"
+        hits = sorted((m.start(), word) for word, pat in TOPICS if (m := re.search(pat, text, re.I)))
+        words = list(dict.fromkeys(w for _, w in hits))
+        if len({FAMILY.get(w, w) for w in words}) >= 3:
+            return "multitissue"
+        if words:
+            return words[0]
+    qtl = _ascii(str(record.get("qtl_type") or "").split(";")[0]).lower()
+    return qtl or "qtl"
+
+
+def make_code(record: dict[str, Any], taken: set[str]) -> str:
+    """Surname_Year_topic (Sun_2026_skin); a second paper with the same code gets _2, _3, …"""
+    year = m.group(0) if (m := re.search(r"\d{4}", str(record.get("year") or ""))) else "nd"
+    base = f"{surname(record.get('first_author') or str(record.get('authors') or '').split(',')[0])}_{year}_{topic(record)}"
+    code, n = base, 1
+    while code.lower() in taken:
+        n += 1
+        code = f"{base}_{n}"
+    return code
 
 
 def db_path() -> Path:
@@ -171,6 +265,19 @@ class RecordStore:
                 db.execute("ALTER TABLE records ADD COLUMN locations TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE records SET saved_by = 'human' WHERE saved_by = ''")
         self._migrate_keys()
+        self._assign_codes()
+
+    def _assign_codes(self) -> None:
+        """Give every record without one its code, oldest first; codes never change after."""
+        with self._connect() as db:
+            rows = [dict(r) for r in db.execute("SELECT * FROM records ORDER BY record_id")]
+            taken = {r["record_code"].lower() for r in rows if r["record_code"]}
+            for r in rows:
+                if not r["record_code"]:
+                    code = make_code(r, taken)
+                    taken.add(code.lower())
+                    db.execute("UPDATE records SET record_code = ? WHERE record_id = ?", [code, r["record_id"]])
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS records_code ON records (record_code COLLATE NOCASE)")
 
     def _migrate_keys(self) -> None:
         """Re-derive keys, merging rows of one publication into its oldest record.
@@ -231,6 +338,7 @@ class RecordStore:
         """
         values = {f: _text(data.get(f)) for f in TEXT_FIELDS}
         values["saved_by"] = "auto" if auto else "human"
+        values["record_code"] = ""  # assigned below for a new record, kept for an old one
         if not values["download_url"]:
             raise ValueError("download_url is required")
         if not values["first_author"] and values["authors"]:
@@ -240,6 +348,8 @@ class RecordStore:
         with self._connect() as db:
             existing = db.execute("SELECT * FROM records WHERE record_key = ?", [key]).fetchone()
             if existing is None:
+                taken = {r[0].lower() for r in db.execute("SELECT record_code FROM records")}
+                values["record_code"] = make_code(values, taken)
                 locs = [_location(values)]
                 values |= _flatten(locs)
                 db.execute(
@@ -256,6 +366,7 @@ class RecordStore:
                 merged |= _flatten(locs)
                 merged["curator_note"] = values["curator_note"] or old["curator_note"]
                 merged["saved_by"] = values["saved_by"]
+                merged["record_code"] = old["record_code"]
                 db.execute(
                     f"UPDATE records SET {', '.join(f'{f} = ?' for f in TEXT_FIELDS)}, "
                     "saved_at = ?, locations = ? WHERE record_key = ?",

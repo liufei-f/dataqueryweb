@@ -527,14 +527,16 @@ class Target:
 
     level_1: list[str] = field(default_factory=lambda: list(BROAD_CONTEXTS))
     publications: dict[str, str] = field(default_factory=dict)  # doi → dataset
+    rows: dict[str, list[str]] = field(default_factory=dict)  # doi → "qtl_type biocontext", one per row
     datasets: list[str] = field(default_factory=list)  # every dataset name it holds
     path: str = ""
 
 
 def load_target(path: str | Path | None = None) -> Target:
-    """Read $LC2_QTL_MANIFEST, or lc2_newfeature_backend's manifest next to this project."""
+    """Read $LC2_QTL_MANIFEST, or this project's copy of LocusCompare's manifest
+    (``reference/qtl_manifest.tsv``; copied in, so nothing outside this project is read)."""
     candidates = [path, os.environ.get("LC2_QTL_MANIFEST"),
-                  Path(__file__).resolve().parents[4] / "lc2_newfeature_backend/scripts/qtl_manifest.tsv"]
+                  Path(__file__).resolve().parents[3] / "reference" / "qtl_manifest.tsv"]
     target = Target()
     for cand in candidates:
         if cand and Path(cand).is_file():
@@ -549,6 +551,8 @@ def load_target(path: str | Path | None = None) -> Target:
                     doi = doi_of(row.get("publication") or "")
                     if doi:
                         target.publications.setdefault(doi, row.get("dataset") or "")
+                        target.rows.setdefault(doi, []).append(
+                            f"{(row.get('qtl_type') or '').strip()} {(row.get('biocontext') or '').strip()}")
             target.path = str(cand)
             break
     return target
@@ -655,6 +659,10 @@ ISSUES: dict[str, str] = {
     "data_too_large": "Not downloaded: over the per-paper size limit or the free disk space; raise the limit or download elsewhere.",
     "download_failed": "Downloading the files failed; see the data section for the error.",
     "processing_failed": "No processing plan produced values the importer accepts; see the plans that were tried.",
+    "rsid_not_added": "The table has no rs id column; add_rsid fills one from the local dbSNP copy.",
+    "non_full_summary_statistics": "Not full summary statistics: the table lacks some tested variant–phenotype pairs "
+                                   "(e.g. significant pairs only); kept because no full table was found. "
+                                   "The row's note says what it holds.",
 }
 BLOCKING = {"not_full_summary_statistics", "required_column_missing", "header_not_read"}
 # Conversions a curator can do without going back to the authors.

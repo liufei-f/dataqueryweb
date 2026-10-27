@@ -65,8 +65,11 @@ By default each paper is built by the LLM itself, through tools (`agent.py`): it
 paper, follows every data link, lists repositories, peeks into remote files, downloads, writes
 Python to convert tables the importer cannot read (run without network or keys, scripts kept in
 `data/.agent_scripts/`), validates each file the way `load_gwas_qtl_catalog.py` reads it, and
-submits rows whose quotes, file paths and vocabulary the program checks. `MANIFEST_AGENT=0`
-(or "skips the AI") uses the older rules-first pipeline described below.
+submits rows whose quotes, file paths and vocabulary the program checks. The order of work it
+follows is the skill [skills/build-manifest/SKILL.md](skills/build-manifest/SKILL.md), which
+goes into the system prompt of every build (`MANIFEST_SKILL` points at another file); edit it
+to change the procedure. `MANIFEST_AGENT=0` (or "skips the AI") uses the older rules-first
+pipeline described below.
 
 `dataqueryweb-manifest run` turns saved records into candidate rows of LocusCompare's
 `scripts/qtl_manifest.tsv`. For each record it lists the files behind every download location
@@ -91,10 +94,23 @@ default). When the importer cannot read them as they are, the LLM picks a plan f
 `<name>_processed.tsv.gz`; `file_path` points at it, relative to the data folder (the importer's
 `--data-root`). See `fetch.py` and MANIFEST_RULES.md.
 
+rs ids are filled from a local copy of NCBI dbSNP for GRCh38 (build 157, ~30 GB, shared by every
+paper) at `data/reference/dbsnp/GCF_000001405.40.gz` with its `.tbi` index, or `$DBSNP_VCF`:
+
+```bash
+mkdir -p data/reference/dbsnp && cd data/reference/dbsnp
+curl -O https://ftp.ncbi.nih.gov/snp/latest_release/VCF/GCF_000001405.40.gz.tbi
+curl -C - -O https://ftp.ncbi.nih.gov/snp/latest_release/VCF/GCF_000001405.40.gz
+```
+
+The build's `add_rsid` tool (`dbsnp.py`) matches chrom, position, ref and alt (alleles also tried
+swapped) through the tabix index; a variant dbSNP does not hold keeps an empty rs id.
+
 The result is kept in this repository: `manifest/qtl_manifest.tsv` (approved rows, the 27 manifest
 columns) and `manifest/qtl_manifest_candidates.tsv` (every row with status and evidence), both rewritten
-from the database on every change. LocusCompare's own manifest is only read, as a reference for
-dataset names and the context vocabulary.
+from the database on every change. LocusCompare's manifest is used as a reference for dataset names and
+the context vocabulary, from the copy in `reference/qtl_manifest.tsv` (copy it again when LocusCompare's
+changes); nothing outside this repository is read or written.
 
 On the page every saved record is listed with a **Build manifest** button; builds run one after another
 in the background of the server (clicks queue up), and a built paper shows its rows behind **Check**.

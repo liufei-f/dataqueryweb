@@ -47,7 +47,7 @@ from urllib.parse import urljoin
 import httpx
 import pandas as pd
 
-from dataqueryweb import fetch, finder, llm, probe, records
+from dataqueryweb import dbsnp, fetch, finder, llm, probe, records
 from dataqueryweb import manifest_rules as rules
 
 MAX_STEPS = int(os.environ.get("MANIFEST_AGENT_STEPS") or 80)  # tool calls per paper
@@ -88,7 +88,11 @@ tools per turn and keep going until you call submit (or give_up when nothing can
 WHAT THE MANIFEST NEEDS
 - One row per table of FULL QTL summary statistics: every tested variant–phenotype pair \
 (nominal results, "allpairs", "full_assoc", "sumstats"). Tables of only significant, lead, \
-conditional, fine-mapped or colocalised hits are NOT wanted — list them in skipped_tables.
+conditional, fine-mapped or colocalised hits are not wanted while a full table may exist — \
+list them in skipped_tables. Only when a careful search of the paper and everything it points \
+to (PROCEDURE phase 3b) shows that no full table is public, keep the most complete non-full \
+table of that QTL type and context as a row with scope "non_full", a non_full_reason and a \
+scope_note that says with numbers why it is not full.
 - qtl_type must be one of: eQTL, sQTL, caQTL, pQTL. Other types (mQTL, meQTL, metabolite QTL, \
 edQTL, apaQTL, …) go to skipped_tables with the reason.
 - Human data only, and only THIS paper's own new QTL results — never public resources the \
@@ -99,15 +103,20 @@ downloaded: list them in skipped_tables as "already in the manifest as GTEx_v10"
 holds for any other resource above.
 - The importer (load_gwas_qtl_catalog.py) reads each file with \
 pandas.read_csv(path, sep=delimiter, compression="infer", dtype=str) and needs these columns, \
-named in the row: chrom_col, position_col, ref_col, alt_col, pval_col (nominal p-value, not \
-FDR/q/permutation), phenotype_id_col. Optional: beta_col, se_col, maf_col, rsid_col, \
-variant_id_col. It keeps only single-base ref/alt on autosomes. file_path is relative to the \
+named in the row: chrom_col, position_col, ref_col, alt_col, variant_id_col, pval_col \
+(nominal p-value, not FDR/q/permutation), phenotype_id_col, and rsid_col (rs ids, empty where \
+dbSNP has none; fill it with add_rsid). Optional: beta_col, se_col, maf_col.
+- REQUIRED VALUE FORMATS, in every row: chromosome digits only (1, not chr1; drop X/Y/MT \
+rows), position digits only, ref and alt upper-case A/C/G/T/N, and a variant id written \
+chr<chrom>_<pos>_<ref>_<alt> joined by underscores (chr1_12345_A_G — with the chr prefix, \
+never colons, never a _b38 suffix) that matches those four columns. Files that differ are processed with \
+run_python first; validate refuses them. It keeps only single-base ref/alt on autosomes. file_path is relative to the \
 data folder and may use a glob (chr*.tsv.gz) for per-chromosome files of one context.
 - gene_id_mode: for eQTL/sQTL/pQTL the importer derives the gene from phenotype_id: "self" \
 (the id is an Ensembl gene id, version allowed) or "phenotype_last_segment" (the gene is the \
 last ":"-separated part, e.g. leafcutter clusters chr1:100:200:clu_1:ENSG…). caQTL phenotype \
 ids MUST be chr_start_end (chr1_1000_2000); rewrite them if they are written otherwise.
-- If a table lacks separate chrom/position/ref/alt columns, has a variant id like \
+- If a table breaks the value formats above, lacks separate chrom/position/ref/alt columns, has a variant id like \
 1:12345:A:G, chr1_12345_A_G_b38 or rs ids plus a separate position, -log10 p, z or \
 chi-square instead of p, no header, is parquet/xlsx/inside an archive, or uses whitespace: \
 write Python with run_python that produces <original name>_processed.tsv.gz (tab-separated, \
@@ -129,20 +138,7 @@ THE SERVER: 2 CPUs, 3 GB RAM. Process big tables in chunks (pandas chunksize ≤
 write with gzip in append mode). A 3 GB .gz file takes ~20 minutes; that is fine. Files \
 that exist already are not downloaded again.
 
-HOW TO WORK
-1. read_paper: data availability, methods (cohort, ancestry, genotyping/imputation, genome \
-build, QTL mapping software and outputs), sample sizes per context.
-2. For every data location the paper or the saved record names (repositories, lab pages, \
-supplementary data, portals, GWAS Catalog, GEO, …): open_url / list_files, follow links \
-from landing pages (download pages, "Data", "Files", FTP/HTTP mirrors). Record dead ends \
-and anything a person must do (login, application, browser-only portal) with note_location.
-3. peek_file the candidate tables to see the columns and values BEFORE downloading.
-4. download the files of full summary statistics (all chromosomes / all contexts).
-5. inspect_local, then run_python if the format must change. Check your output with \
-inspect_local.
-6. validate every file_path with the exact columns you will put in the row. Fix and \
-validate again until it passes.
-7. submit: one row per context (tissue / cell type / condition) and QTL type, with evidence.
+HOW TO WORK: follow the PROCEDURE at the end of these instructions, phase by phase.
 
 FIELDS
 - dataset: the resource or cohort name the paper uses (OneK1K, SingleBrain, GALA_II, …), \
@@ -163,6 +159,22 @@ Quotes are checked word by word against the texts you were shown; never paraphra
 fact is not stated anywhere, leave the quote empty and say so in note.
 
 Be thorough but do not loop: if a location is unreachable after a retry, note it and move on."""
+
+# The step-by-step procedure, kept as a skill file in the repository so it can be edited
+# without touching code; appended to SYSTEM on every build.
+SKILL_FILE = Path(os.environ.get("MANIFEST_SKILL") or
+                  Path(__file__).resolve().parents[3] / "skills" / "build-manifest" / "SKILL.md")
+
+
+def skill(path: Path = SKILL_FILE) -> str:
+    """The skill's body (front matter dropped), as the PROCEDURE section of the prompt."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"manifest skill not found: {path} (set MANIFEST_SKILL)") from None
+    if text.startswith("---"):
+        text = text.split("---", 2)[2]
+    return f"PROCEDURE ({path.name})\n\n{text.strip()}"
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -187,7 +199,8 @@ TOOLS: list[dict[str, Any]] = [
     {"name": "download", "description": "Download files into data/<dataset folder>/. Give 'urls' "
      "(a list) or 'listing_url' plus 'pattern' (a glob on the listed paths) to fetch many at once.",
      "parameters": {"type": "object", "properties": {
-         "dataset": {"type": "string", "description": "dataset name; sets the folder"},
+         "dataset": {"type": "string", "description": "dataset name (files go to the record's folder, "
+                     "named by its record code)"},
          "urls": {"type": "array", "items": {"type": "string"}},
          "listing_url": {"type": "string"}, "pattern": {"type": "string"},
          "subfolder": {"type": "string"}}, "required": ["dataset"]}},
@@ -203,20 +216,34 @@ TOOLS: list[dict[str, Any]] = [
          "purpose": {"type": "string", "description": "one line: what this script does"},
          "timeout_seconds": {"type": "integer"}}, "required": ["dataset", "code", "purpose"]}},
     {"name": "validate", "description": "Read file_path (relative to the data folder; globs allowed) "
-     "the way the importer does and check the mapped columns' values. Rows may only use paths that passed.",
+     "the way the importer does and check the mapped columns' values, including the required formats: "
+     "chrom and position digits only, upper-case alleles, variant id chr<chrom>_<pos>_<ref>_<alt> (chr1_12345_A_G). "
+     "Rows may only use paths that passed.",
      "parameters": {"type": "object", "properties": {
          "file_path": {"type": "string"}, "delimiter": {"type": "string", "description": "\\t , ; or a space"},
          "qtl_type": {"type": "string"}, "gene_id_mode": {"type": "string"},
          "columns": {"type": "object", "description": "chrom_col, position_col, ref_col, alt_col, pval_col, "
                      "phenotype_id_col and optional beta_col, se_col, maf_col, rsid_col, variant_id_col"}},
                     "required": ["file_path", "delimiter", "qtl_type", "columns"]}},
+    {"name": "add_rsid", "description": "Fill the rs id column of a processed table (<name>_processed.tsv.gz; globs "
+     "allowed) from the local dbSNP copy (GRCh38, build 157), matching chrom, position, ref and alt (alleles "
+     "also tried swapped). Variants dbSNP does not hold keep an empty rs id. Existing rs ids are kept. Then "
+     "validate again with rsid_col.",
+     "parameters": {"type": "object", "properties": {
+         "file_path": {"type": "string"},
+         "columns": {"type": "object", "description": "chrom_col, position_col, ref_col, alt_col of the table"},
+         "rsid_col": {"type": "string", "description": "column to fill (default rsid)"}},
+                    "required": ["file_path", "columns"]}},
     {"name": "note_location", "description": "Record what a data location is: status one of listed, "
      "downloaded, manual (a person must act: login, application, browser-only), error, not_data, duplicate.",
      "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "status": {"type": "string"},
                                                      "note": {"type": "string"}}, "required": ["url", "status", "note"]}},
     {"name": "submit", "description": "Finish with the manifest rows. Each row: the manifest fields, "
-     "'source_url' (where the files came from), 'genome_build', 'evidence' and 'note'. skipped_tables: "
-     "tables found but not usable, with the reason.",
+     "'source_url' (where the files came from), 'genome_build', 'evidence', 'note', and 'scope': 'full' "
+     "(default) or 'non_full' (not every tested pair) — only when no full table exists anywhere — with "
+     "'non_full_reason' (significant_phenotypes_only, significant_pairs_only, lead_variants_only, "
+     "example_subset, some_chromosomes_or_regions, selected_phenotypes) and 'scope_note' saying, with "
+     "numbers, why it is not full: what the paper tested and what the table holds. skipped_tables: tables found but not usable, with the reason.",
      "parameters": {"type": "object", "properties": {
          "rows": {"type": "array", "items": {"type": "object"}},
          "skipped_tables": {"type": "array", "items": {"type": "object", "properties": {
@@ -249,13 +276,19 @@ class Session:
     log: list[dict[str, str]] = field(default_factory=list)
     used_bytes: float = 0.0
     folder_by_dataset: dict[str, Path] = field(default_factory=dict)
+    rsid_lookup: dbsnp.Lookup | None = None
     result: dict[str, Any] | None = None
     submit_rounds: int = 0
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
+    def folder_name(self) -> str:
+        return fetch.record_folder(self.record, rules.default_dataset(
+            self.record.get("first_author", ""), self.record.get("year", "")))
+
     def folder(self, dataset: str) -> Path:
-        d = self.root / fetch.folder_name(dataset or rules.default_dataset(
+        """The record's data folder, named by its record code; every file of the paper goes there."""
+        d = self.root / fetch.record_folder(self.record, dataset or rules.default_dataset(
             self.record.get("first_author", ""), self.record.get("year", "")))
         d.mkdir(parents=True, exist_ok=True)
         self.folder_by_dataset[dataset] = d
@@ -577,6 +610,32 @@ class Session:
             self.see(f"file {key}", " ".join(result["header"]) + " " + " ".join(" ".join(r) for r in result["sample"]))
         return result
 
+    def add_rsid(self, file_path: str, columns: dict[str, str], rsid_col: str = "rsid") -> dict[str, Any]:
+        """Fill rsid_col of a processed table from the local dbSNP copy (chrom, pos, ref, alt)."""
+        vcf = dbsnp.vcf_path(self.root)
+        if not vcf.exists() or not vcf.with_name(vcf.name + ".tbi").exists():
+            return {"error": f"the dbSNP reference is not in place ({vcf}); leave rsid_col empty and say so in note"}
+        files = expand(self.root, file_path)
+        if not files:
+            return {"error": f"no file matches {file_path} under the data folder"}
+        if any("_processed" not in f.name or not f.name.endswith(".tsv.gz") for f in files):
+            return {"error": "add_rsid writes into processed tables only (<name>_processed.tsv.gz); process the file first"}
+        need = ("chrom_col", "position_col", "ref_col", "alt_col")
+        if missing := [k for k in need if not columns.get(k)]:
+            return {"error": f"name the columns: {', '.join(missing)}"}
+        if self.rsid_lookup is None:
+            self.rsid_lookup = dbsnp.Lookup(vcf)
+        out = {"files": len(files), "rows": 0, "with_rsid": 0}
+        for f in files:
+            res = dbsnp.annotate(f, self.rsid_lookup, columns, rsid_col.strip() or "rsid",
+                                 step=lambda m, f=f: self.step(f"AI: add_rsid {f.name}: {m}"))
+            out["rows"] += res["rows"]
+            out["with_rsid"] += res["with_rsid"]
+        out |= {"rsid_col": rsid_col.strip() or "rsid", "share": round(out["with_rsid"] / out["rows"], 4) if out["rows"] else 0.0,
+                "next": "validate again with rsid_col set to this column"}
+        self.validated.pop(file_path.strip(), None)  # the file changed
+        return out
+
     def note_location(self, url: str, status: str, note: str) -> dict[str, Any]:
         self.location(url, status=status if status in ("listed", "direct", "downloaded", "manual", "error",
                                                          "not_data", "duplicate") else "listed", note=note[:400])
@@ -656,6 +715,63 @@ def expand(root: Path, file_path: str) -> list[Path]:
     return [p] if p.is_file() else []
 
 
+# The values every manifest file must hold exactly, in every row: chromosome and position as
+# plain digits (1, not chr1), upper-case alleles, and a variant id chr<chrom>_<pos>_<ref>_<alt>
+# joined by underscores (chr1_12345_A_G) that matches those four columns.
+FORMAT_REQUIRED = ("chrom_col", "position_col", "ref_col", "alt_col", "variant_id_col")
+# Why a kept table is not full summary statistics (it lacks some tested variant–phenotype pairs).
+NON_FULL_REASONS = {
+    "significant_phenotypes_only": "every tested variant, but only for the significant phenotypes (e.g. eGenes)",
+    "significant_pairs_only": "only the variant–phenotype pairs that passed a significance threshold",
+    "lead_variants_only": "only the lead (top) variant of each phenotype",
+    "example_subset": "an example or truncated extract of the results",
+    "some_chromosomes_or_regions": "only some chromosomes or regions",
+    "selected_phenotypes": "only some phenotypes, selected for another reason than significance",
+}
+FORMAT_RULES = {
+    "chrom_col": (re.compile(r"[0-9]+"), "digits only (1, not chr1; drop X/Y/MT rows)"),
+    "position_col": (re.compile(r"[0-9]+"), "digits only"),
+    "ref_col": (re.compile(r"[ACGTN]+"), "upper-case A/C/G/T/N"),
+    "alt_col": (re.compile(r"[ACGTN]+"), "upper-case A/C/G/T/N"),
+}
+NUMERIC_COLS = ("pval_col", "beta_col", "se_col", "maf_col")
+
+
+def format_problems(df: pd.DataFrame, cols: dict[str, str], name: str) -> list[str]:
+    """What breaks the required value formats in ``df`` (every row read, not a share)."""
+    problems = []
+    values = {k: df[cols[k]].astype("string") for k in FORMAT_REQUIRED}
+    for key, (pattern, rule) in FORMAT_RULES.items():
+        bad = ~values[key].str.fullmatch(pattern.pattern).fillna(False)
+        if bad.any():
+            problems.append(f"{name}: {key} {cols[key]!r} must be {rule}; {int(bad.sum())} of {len(df)} rows "
+                            f"are not, e.g. {values[key][bad].iloc[0]!r}")
+    expected = "chr" + values["chrom_col"] + "_" + values["position_col"] + "_" + values["ref_col"] + "_" + values["alt_col"]
+    bad = ~(values["variant_id_col"] == expected).fillna(False)
+    if bad.any():
+        i = bad.idxmax()
+        problems.append(f"{name}: variant_id_col {cols['variant_id_col']!r} must be chr<chrom>_<pos>_<ref>_<alt> joined by "
+                        f"underscores, matching those columns; {int(bad.sum())} of {len(df)} rows are not, e.g. "
+                        f"{values['variant_id_col'][i]!r} (expected {expected[i]!r})")
+    # rs ids are rs<digits>, or empty where dbSNP holds no such variant.
+    if cols.get("rsid_col") and cols["rsid_col"] in df.columns:
+        rs = df[cols["rsid_col"]]
+        bad = rs.notna() & ~rs.astype("string").str.fullmatch(r"rs\d+").fillna(False)
+        if bad.any():
+            problems.append(f"{name}: rsid_col {cols['rsid_col']!r} must hold rs ids (rs<digits>) or be empty; "
+                            f"{int(bad.sum())} of {len(df)} rows do not, e.g. {rs[bad].iloc[0]!r}")
+    # Numbers stay numbers: a missing value is empty, never a placeholder word.
+    for key in NUMERIC_COLS:
+        if not cols.get(key) or cols[key] not in df.columns:
+            continue
+        raw = df[cols[key]]
+        text = raw.notna() & pd.to_numeric(raw, errors="coerce").isna()
+        if text.any():
+            problems.append(f"{name}: {key} {cols[key]!r} must hold numbers (empty when missing); {int(text.sum())} "
+                            f"of {len(df)} rows hold text, e.g. {raw[text].iloc[0]!r}")
+    return problems
+
+
 def validate_file(root: Path, file_path: str, delimiter: str, qtl_type: str, columns: dict[str, str],
                   gene_id_mode: str = "") -> dict[str, Any]:
     """Read the first rows of (some of) the files as load_gwas_qtl_catalog.py will and check them."""
@@ -664,8 +780,7 @@ def validate_file(root: Path, file_path: str, delimiter: str, qtl_type: str, col
         return {"ok": False, "problems": [f"no file matches {file_path} under the data folder"]}
     sep = resolve_delimiter(delimiter)
     cols = {k: v for k, v in columns.items() if v and k in rules.ROLE_COLUMN.values()}
-    missing_map = [k for k in ("chrom_col", "position_col", "ref_col", "alt_col", "pval_col", "phenotype_id_col")
-                   if k not in cols]
+    missing_map = [k for k in (*FORMAT_REQUIRED, "pval_col", "phenotype_id_col") if k not in cols]
     problems: list[str] = [f"no column named for {k}" for k in missing_map]
     canonical = rules.canonical_qtl_type(qtl_type) or qtl_type
     if canonical not in rules.MANIFEST_QTL_TYPES:
@@ -704,6 +819,7 @@ def validate_file(root: Path, file_path: str, delimiter: str, qtl_type: str, col
                 problems.append(f"{f.name}: {role} ({col}): only {share:.0%} of values look right, e.g. {bad!r}")
         if missing_map:
             continue
+        problems += format_problems(df, cols, f.name)
         chrom = df[cols["chrom_col"]].astype("string").str.replace(r"(?i)^chr", "", regex=True)
         ref = df[cols["ref_col"]].astype("string").str.strip().str.upper()
         alt = df[cols["alt_col"]].astype("string").str.strip().str.upper()
@@ -794,6 +910,9 @@ def check_submission(s: Session, sub: dict[str, Any]) -> tuple[list[dict[str, An
                 problems.append(f"{tag}: the row's delimiter or columns differ from those validated for {row['file_path']}")
             if (v.get("checks") or {}).get("gene_id", {}).get("warning"):
                 issues.append("phenotype_id_not_ensembl")
+        if not row["rsid_col"]:
+            issues.append("rsid_not_added")
+            problems.append(f"{tag}: no rsid_col; call add_rsid on {row['file_path']!r}, validate again and name the column")
         row["delimiter"] = "\\t" if resolve_delimiter(row["delimiter"]) == "\t" else row["delimiter"]
 
         proof = s.texts | {"file path": "\n".join([*s.validated, *(d["path"] for d in s.downloads)])}
@@ -856,8 +975,27 @@ def check_submission(s: Session, sub: dict[str, Any]) -> tuple[list[dict[str, An
         evidence["dataset"] = {"value": row["dataset"], "source": "LLM", "quote": "", "verified": None, "note": ""}
         evidence["file_path"] = {"value": row["file_path"], "source": "downloaded" + (" and processed by the AI's Python" if processed else ""),
                                  "quote": "", "verified": bool(v and v.get("ok")), "note": f"relative to the data folder {s.root}"}
-        evidence["holds"] = {"value": "all_pairs", "source": "LLM", "quote": "", "verified": None,
-                             "note": str(raw.get("note") or "")[:300]}
+        # A non-full table (not every tested pair) is kept only when no full one exists anywhere,
+        # and says why it is not full: a reason from NON_FULL_REASONS and the numbers behind it.
+        non_full = str(raw.get("scope") or "full").strip().lower().replace("-", "_") in ("non_full", "partial", "subset")
+        reason = str(raw.get("non_full_reason") or "").strip().lower()
+        scope_note = str(raw.get("scope_note") or "").strip()[:300]
+        if non_full:
+            issues.append("non_full_summary_statistics")
+            if reason not in NON_FULL_REASONS:
+                problems.append(f"{tag}: scope is non_full; set non_full_reason to one of {', '.join(NON_FULL_REASONS)}")
+            if len(re.findall(r"(?:https?|ftp)://", str(raw.get("source_url") or ""))) > 1:
+                problems.append(f"{tag}: a non-full table must come from one source; give one source_url and do not "
+                                "merge tables from different files, deposits or analyses")
+            if not re.search(r"\d", scope_note):
+                problems.append(f"{tag}: scope is non_full; say in scope_note why the table is not full, with numbers: "
+                                "what the paper tested and what the table holds (counts or threshold)")
+        holds = "non_full" if non_full else "all_pairs"
+        label = NON_FULL_REASONS.get(reason, "reason not given") if non_full else ""
+        evidence["holds"] = {"value": holds, "source": "LLM", "quote": "", "verified": None,
+                             "reason": reason if non_full else "", "reason_label": label,
+                             "note": (f"Not full summary statistics — {label}. {scope_note}" if non_full
+                                      else str(raw.get("note") or ""))[:400]}
         evidence["qtl_type"] = {"value": row["qtl_type"], "source": "LLM", "quote": "", "verified": None, "note": ""}
         evidence["context"] = bio | {"value": ", ".join(x for x in (row["level_1_context"], row["level_2_context"], row["biocontext"]) if x)}
         if v:
@@ -874,7 +1012,7 @@ def check_submission(s: Session, sub: dict[str, Any]) -> tuple[list[dict[str, An
                              for d in s.downloads if v and d["path"] in (v.get("files") or [])][:30],
                       access="open")
         rows.append({"row": row, "issues": list(dict.fromkeys(x for x in issues if x in rules.ISSUES)),
-                     "genome_build": build, "holds": "all_pairs", "evidence": evidence, "candidate": c,
+                     "genome_build": build, "holds": holds, "evidence": evidence, "candidate": c,
                      "llm_note": str(raw.get("note") or "")[:300]})
     seen_bio: dict[tuple[str, str], int] = {}
     for r in rows:
@@ -907,6 +1045,8 @@ def first_message(s: Session, previous: list[str]) -> str:
         f"Authors: {r.get('authors', '')[:300]}",
         f"Journal: {r.get('journal', '')} {r.get('year', '')}   DOI: {r.get('doi', '')}   PMID: {r.get('pmid', '')}",
         f"Article: {r.get('publication_url', '')}",
+        f"Record code: {r.get('record_code') or '(none)'} — every download and processed file of this paper goes "
+        f"to the folder {s.folder_name()}/, so each file_path starts with {s.folder_name()}/",
         f"Earlier AI check — QTL types: {r.get('qtl_type', '')}; context: {r.get('qtl_context', '')}; species: {r.get('species', '')}",
         "",
         "Saved data locations (found when the paper was screened; may be incomplete or wrong):",
@@ -922,6 +1062,15 @@ def first_message(s: Session, previous: list[str]) -> str:
             lines.append("Sections: " + "; ".join(sections[:40]))
     else:
         lines += ["", "The paper text could not be fetched: open the article with open_url."]
+    doi = (r.get("doi") or "").strip().lower()
+    if s.target.publications.get(doi):
+        have = s.target.rows.get(doi, [])
+        lines += ["", f"Reference manifest ({s.target.path or 'LocusCompare qtl_manifest.tsv'}): this paper is already "
+                  f"there as dataset {s.target.publications[doi]}, with {len(have)} row(s) (qtl_type biocontext):",
+                  *[f"- {x}" for x in have[:60]],
+                  "Use that dataset name; add only QTL types or contexts it does not have yet."]
+    else:
+        lines += ["", "Reference manifest: this paper is not in it yet."]
     if previous:
         lines += ["", "Files already in the data folder from an earlier build of this paper (reuse them):",
                   *[f"- {x}" for x in previous[:40]]]
@@ -962,6 +1111,7 @@ async def run(
     for loc in records._locations_of(record):
         s.location(loc["download_url"], content=loc.get("content", ""), access=loc.get("access_route", ""))
     system = SYSTEM.format(level_1=", ".join(target.level_1), datasets=", ".join(target.datasets) or "GTEx_v10")
+    system += "\n\n" + skill()
     messages: list[dict[str, Any]] = [{"role": "system", "content": system},
                                       {"role": "user", "content": first_message(s, list(previous))}]
     tools = [{"type": "function", "function": t} for t in TOOLS]
@@ -1060,7 +1210,7 @@ async def dispatch(s: Session, name: str, args: dict[str, Any]) -> dict[str, Any
         return {"accepted": True}
     fn = {"read_paper": s.read_paper, "open_url": s.open_url, "list_files": s.list_files, "peek_file": s.peek_file,
           "download": s.download, "inspect_local": s.inspect_local, "run_python": s.run_python,
-          "validate": s.validate, "note_location": s.note_location}.get(name)
+          "validate": s.validate, "add_rsid": s.add_rsid, "note_location": s.note_location}.get(name)
     if fn is None:
         return {"error": f"no tool {name!r}"}
     s.step(f"AI: {name} {short(args)[:100]}")

@@ -27,7 +27,7 @@
       <option value="processed">Data processed (rows with a _processed file)</option>
       <option value="as_is">Data downloaded (rows readable as downloaded)</option>
     </select>
-    <label class="muted mf-check" title="Species is human (Homo sapiens). Records saved by the AI and by you are both listed."><input type="checkbox" id="mf-human" checked> Species: human only</label>
+    <label class="muted mf-check" title="Species is human (Homo sapiens). Records saved by the AI and by you are both listed."><input type="checkbox" id="mf-human"> Species: human only</label>
     <span class="muted rec-count" id="mf-count"></span>
     <button type="button" class="rec-btn primary" id="mf-build-all" title="Queue every paper the filter shows that is not built yet">Build all shown</button>
     <a class="rec-btn primary" href="/api/manifest/export?scope=approved&fmt=manifest" title="The 27 manifest columns, approved rows only">Download approved (manifest TSV)</a>
@@ -52,7 +52,7 @@
     <span id="mf-file-rows"></span><br>
     All candidates with evidence: <code>{{ candidates_file }}</code><br>
     Database: <code>{{ db_path }}</code> · reference manifest (read only, for naming and vocabulary):
-    <code>{{ reference or "not found — set LC2_QTL_MANIFEST" }}</code></p>
+    <code>{{ reference or "not found — copy it to reference/qtl_manifest.tsv or set LC2_QTL_MANIFEST" }}</code></p>
 </div>
 <script src="/static/js/manifest.js?v={{ asset_version() }}"></script>
 {% endblock %}

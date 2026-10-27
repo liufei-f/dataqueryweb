@@ -91,8 +91,8 @@ def test_a_parquet_table_is_downloaded_and_processed(tmp_path: Path, serve) -> N
 
     d = r["evidence"]["data"]
     assert d["status"] == "processed" and d["plan_source"] == "rule" and d["rows"] == 3
-    assert r["row"]["file_path"] == "chen_2025/eqtl.chr1_processed.tsv.gz"
-    assert (tmp_path / "data/chen_2025/eqtl.chr1.parquet").exists()  # the raw file is kept
+    assert r["row"]["file_path"] == "Chen_2025/eqtl.chr1_processed.tsv.gz"
+    assert (tmp_path / "data/Chen_2025/eqtl.chr1.parquet").exists()  # the raw file is kept
     out = pd.read_csv(tmp_path / "data" / r["row"]["file_path"], sep="\t", dtype=str)
     assert out[["chrom", "pos", "ref", "alt"]].values.tolist()[1] == ["chr1", "16841", "G", "T"]
     assert (r["row"]["chrom_col"], r["row"]["position_col"], r["row"]["pval_col"]) == ("chrom", "pos", "pval_nominal")
@@ -112,8 +112,8 @@ def test_a_loadable_text_file_is_used_as_it_is(tmp_path: Path, serve) -> None:
     [r] = manifest.assemble(RECORD, None, [c], FACTS, {}, rules.Target(level_1=["Blood"]))
     asyncio.run(fetch.fetch_rows([r], "Chen_2025", None, {}, fetch.Options(tmp_path)))
     assert r["evidence"]["data"]["status"] == "as_is"
-    assert r["row"]["file_path"] == "chen_2025/eqtl.tsv.gz"
-    assert not (tmp_path / "chen_2025/eqtl_processed.tsv.gz").exists()
+    assert r["row"]["file_path"] == "Chen_2025/eqtl.tsv.gz"
+    assert not (tmp_path / "Chen_2025/eqtl_processed.tsv.gz").exists()
 
 
 def test_the_size_limit_and_switching_off_downloads(tmp_path: Path, serve) -> None:

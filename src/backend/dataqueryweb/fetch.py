@@ -1,6 +1,6 @@
 """Download the files behind manifest rows and make them loadable.
 
-The raw files of each row worth loading go to ``data/<dataset>/<path in the repository>``.
+The raw files of each row worth loading go to ``data/<record code>/<path in the repository>``.
 When the importer (``load_gwas_qtl_catalog.py``: ``pandas.read_csv`` of one delimited text
 table with chrom, position, ref, alt, p-value and phenotype columns) can read them as they
 are, the row points at them. Otherwise a processed copy is written next to each file as
@@ -88,6 +88,12 @@ class Options:
 
 def folder_name(dataset: str) -> str:
     return re.sub(r"[^a-z0-9_\-]+", "_", dataset.lower()).strip("_") or "unnamed"
+
+
+def record_folder(record: dict[str, Any], dataset: str = "") -> str:
+    """A saved record's data folder: its record code (Sun_2026_skin), else the dataset name."""
+    code = str(record.get("record_code") or "")
+    return code if re.fullmatch(r"[A-Za-z0-9_\-]+", code) else folder_name(dataset)
 
 
 def safe_rel(path: str) -> str:
@@ -558,14 +564,14 @@ def _settle(r: dict[str, Any], issues_add: list[str] = (), issues_drop: set[str]
 
 
 async def fetch_rows(
-    rows: list[dict[str, Any]], dataset: str, judge: llm.Judge | None, usage: dict[str, int],
+    rows: list[dict[str, Any]], folder_label: str, judge: llm.Judge | None, usage: dict[str, int],
     opts: Options, *, skip: set[str] = frozenset(), key: Callable[[Candidate], str] = str,
     step: Callable[[str], None] = lambda _: None, cancel: threading.Event | None = None,
 ) -> str:
     """Download, inspect and if needed process each row's files; update the rows in place.
     Returns "provider · model" of the planning call, if one was made."""
     cancel = cancel or threading.Event()
-    folder = opts.root / folder_name(dataset)
+    folder = opts.root / folder_label  # the record's folder (record_folder)
     jobs: list[RowJob] = []
     for r in rows:
         c: Candidate = r["candidate"]
@@ -577,7 +583,7 @@ async def fetch_rows(
         job = RowJob(r, c)
         job.targets = [(f, folder / safe_rel(f.path or f.name)) for f in (c.files[:1] if c.member else c.files)]
         r["row"]["file_path"] = _manifest_glob(job, folder, False)
-        r["evidence"]["file_path"] = {"value": r["row"]["file_path"], "source": "rule: <dataset>/<path in the repository>",
+        r["evidence"]["file_path"] = {"value": r["row"]["file_path"], "source": "rule: <record code>/<path in the repository>",
                                       "quote": "", "verified": None, "note": "relative to the data folder (the importer's --data-root)"}
         jobs.append(job)
     if not opts.download:

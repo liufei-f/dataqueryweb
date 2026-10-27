@@ -61,6 +61,26 @@ def test_normalize_drops_invented_sources_and_keeps_answers() -> None:
     ]
 
 
+def test_a_link_labelled_twice_keeps_its_qtl_result_label() -> None:
+    # The model called one link a results browser and then raw data: the confidence counted
+    # the browser, so the label kept on the link must be the browser too (auto-save reads it).
+    raw = {"data_sources": [
+        {"id": "S1", "content": "qtl_results_browser", "note": "results browser"},
+        {"id": "S1", "content": "raw_or_individual_data", "note": "underlying data"},
+        {"id": "S2", "content": "other"},
+        {"id": "S2", "content": "qtl_summary_statistics", "note": "sumstats"},
+    ]}
+    out = llm.normalize(raw, {"S1": 0, "S2": 1})
+    assert [(x["index"], x["content"]) for x in out["data_sources"]] == [
+        (0, "qtl_results_browser"), (1, "qtl_summary_statistics")]
+    p = paper()
+    llm.apply(p, out)
+    assert {s.url: s.ai_pick for s in p.sources} == {
+        "https://github.com/x/y": "qtl_results_browser",
+        "https://zenodo.org/records/1": "qtl_summary_statistics",
+    }
+
+
 def test_apply_moves_picks_first() -> None:
     p = paper()
     llm.apply(

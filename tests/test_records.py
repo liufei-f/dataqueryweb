@@ -298,3 +298,20 @@ def test_papers_saved_before_checks_were_kept_still_skip_the_llm(tmp_path: Path,
     ai = TestClient(web.create_app(store)).get(
         "/api/inspect", params={"ref": "xyz", "ai": True}).json()["ai"]
     assert ai["skipped"] and ai["saved_by"] == ["human"]
+
+
+def test_every_record_gets_a_fixed_code(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    assert records.surname("R. P. Denault W") == "Denault"
+    assert records.surname("Höglund A") == "Hoglund" and records.surname("Nunes-Nesi A") == "NunesNesi"
+    assert records.topic({"qtl_context": "Peripheral/whole blood; inferred immune cell types"}) == "blood"
+    assert records.topic({"qtl_context": "Heart, kidney, and liver tissue"}) == "multitissue"
+    assert records.topic({"qtl_context": "48 GTEx tissues or cell types"}) == "multitissue"
+    assert records.topic({"qtl_context": "", "publication_title": "", "qtl_type": "pQTL; eQTL"}) == "pqtl"
+    store = records.RecordStore(tmp_path / "r.sqlite3")
+    base = {"download_url": "https://zenodo.org/records/1", "first_author": "Sun Y", "year": "2026",
+            "qtl_context": "bulk human skin tissue"}
+    a = store.save(base | {"doi": "10.1000/a"})
+    b = store.save(base | {"doi": "10.1000/b"})
+    assert (a["record_code"], b["record_code"]) == ("Sun_2026_skin", "Sun_2026_skin_2")
+    again = store.save(base | {"doi": "10.1000/a", "qtl_context": "liver", "download_url": "https://x.org/2"})
+    assert again["record_code"] == "Sun_2026_skin"  # a code never changes

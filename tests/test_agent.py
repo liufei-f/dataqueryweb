@@ -9,9 +9,10 @@ import threading
 from pathlib import Path
 
 import httpx
+import pandas as pd
 import pytest
 
-from dataqueryweb import agent, fetch, finder
+from dataqueryweb import agent, dbsnp, fetch, finder
 from dataqueryweb import manifest_rules as rules
 
 RAW = ("SNP\tgene\tbeta\tt-stat\tp-value\n"
@@ -31,12 +32,13 @@ with gzip.open("eqtl_processed.tsv.gz", "wt") as out:
     for df in pd.read_csv("eqtl.tsv.gz", sep="\\t", dtype=str, chunksize=100000):
         parts = df["SNP"].str.split(":", expand=True)
         df["chrom"], df["pos"], df["ref"], df["alt"] = parts[0], parts[1], parts[2], parts[3]
+        df["variant_id"] = "chr" + df["chrom"] + "_" + df["pos"] + "_" + df["ref"] + "_" + df["alt"]
         df.to_csv(out, sep="\\t", index=False, header=first)
         first = False
 print("done")
 """
 COLUMNS = {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt", "pval_col": "p-value",
-           "phenotype_id_col": "gene", "beta_col": "beta"}
+           "phenotype_id_col": "gene", "beta_col": "beta", "variant_id_col": "variant_id"}
 
 
 @pytest.fixture
@@ -66,6 +68,58 @@ def test_validate_reads_files_the_importer_way(tmp_path: Path) -> None:
     assert "mQTL is not a manifest QTL type" in " ".join(agent.validate_file(tmp_path, "d/raw.tsv.gz", "\\t", "mQTL", COLUMNS)["problems"])
 
 
+def test_validate_requires_digits_upper_case_and_underscore_variant_ids(tmp_path: Path) -> None:
+    def check(rows: list[str]) -> list[str]:
+        (tmp_path / "t.tsv").write_text("chrom\tpos\tref\talt\tvariant_id\tp-value\tgene\tbeta\n"
+                                       + "".join(r + "\t0.1\tENSG00000186092\t0.2\n" for r in rows))
+        return agent.validate_file(tmp_path, "t.tsv", "\\t", "eQTL", COLUMNS, "self")["problems"]
+
+    assert check(["1\t10177\tA\tC\tchr1_10177_A_C", "22\t5\tTG\tT\tchr22_5_TG_T"]) == []
+    assert "chrom_col 'chrom' must be digits only" in " ".join(check(["chr1\t10177\tA\tC\tchr1_10177_A_C"]))
+    assert "ref_col 'ref' must be upper-case" in " ".join(check(["1\t10177\ta\tC\t1_10177_a_C"]))
+    assert "position_col 'pos' must be digits only" in " ".join(check(["1\t1.0e4\tA\tC\t1_1.0e4_A_C"]))
+    for wrong in ("1_10177_A_C", "1:10177:A:C", "chr1:10177:A:C", "chr1_10177_A_C_b38", "rs123"):
+        assert "must be chr<chrom>_<pos>_<ref>_<alt>" in " ".join(check([f"1\t10177\tA\tC\t{wrong}"])), wrong
+    # A missing number is empty, never a placeholder word.
+    (tmp_path / "t.tsv").write_text("chrom\tpos\tref\talt\tvariant_id\tp-value\tgene\tbeta\n"
+                                   "1\t10177\tA\tC\tchr1_10177_A_C\t0.1\tENSG00000186092\tnot_available\n"
+                                   "1\t10178\tA\tC\tchr1_10178_A_C\t0.2\tENSG00000186092\t\n")
+    out = " ".join(agent.validate_file(tmp_path, "t.tsv", "\\t", "eQTL", COLUMNS, "self")["problems"])
+    assert "beta_col 'beta' must hold numbers (empty when missing); 1 of 2 rows hold text" in out
+    no_id = {k: v for k, v in COLUMNS.items() if k != "variant_id_col"}
+    assert "no column named for variant_id_col" in agent.validate_file(tmp_path, "t.tsv", "\\t", "eQTL", no_id)["problems"]
+
+
+def test_a_non_full_table_is_kept_and_marked(tmp_path: Path) -> None:
+    s = session(tmp_path)
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d/t.tsv").write_text("chrom\tpos\tref\talt\tvariant_id\tp-value\tgene\tbeta\n"
+                                     "1\t10177\tA\tC\tchr1_10177_A_C\t0.01\tENSG00000186092\t0.2\n")
+    assert s.validate("d/t.tsv", "\\t", "eQTL", COLUMNS, "self")["ok"]
+    row = {"dataset": "BrainSeq", "qtl_type": "eQTL", "biocontext": "DLPFC", "level_1_context": "Brain",
+           "file_path": "d/t.tsv", "delimiter": "\\t", **COLUMNS, "gene_id_mode": "self", "scope": "non_full"}
+    # A non-full row must say why it is not full: a reason, and numbers.
+    _, problems = agent.check_submission(s, {"rows": [row]})
+    assert any("non_full_reason" in p for p in problems) and any("with numbers" in p for p in problems)
+    _, problems = agent.check_submission(s, {"rows": [row | {"non_full_reason": "significant_phenotypes_only",
+                                                             "scope_note": "only the significant genes"}]})
+    assert any("with numbers" in p for p in problems)
+    note = "All cis variants of the 282 significant eGenes only; the paper tested 30,775 genes."
+    [r], problems = agent.check_submission(s, {"rows": [row | {"non_full_reason": "significant_phenotypes_only",
+                                                                "scope_note": note}]})
+    assert not [p for p in problems if "non_full" in p]
+    assert r["holds"] == "non_full" and "non_full_summary_statistics" in r["issues"] and r["status"] != "ready"
+    two = {"non_full_reason": "significant_phenotypes_only", "scope_note": note,
+           "source_url": "https://zenodo.org/records/1; https://github.com/x/y"}
+    _, problems = agent.check_submission(s, {"rows": [row | two]})
+    assert any("must come from one source" in p for p in problems)  # tables are never merged
+    h = r["evidence"]["holds"]
+    assert h["reason"] == "significant_phenotypes_only" and h["reason_label"].startswith("every tested variant")
+    assert h["note"] == f"Not full summary statistics — {h['reason_label']}. {note}"
+    [full], _ = agent.check_submission(s, {"rows": [row | {"scope": "full"}]})
+    assert full["holds"] == "all_pairs" and "non_full_summary_statistics" not in full["issues"]
+
+
 def test_run_python_refuses_network_and_deleting(tmp_path: Path) -> None:
     s = session(tmp_path)
     assert "refused" in s.run_python("x", "import urllib.request", "net")
@@ -84,6 +138,7 @@ class Script:
 
     async def chat_tools(self, messages, tools, usage, timeout):
         self.seen.append(messages[-1])
+        self.system = messages[0]["content"]
         usage["total_tokens"] += 100
         calls = self.turns.pop(0)
         return {"role": "assistant", "content": "", "tool_calls": [
@@ -91,10 +146,27 @@ class Script:
             for i, (n, a) in enumerate(calls)]}, "test · model"
 
 
+def fake_dbsnp(root: Path) -> None:
+    """A tabix-indexed dbSNP-like VCF under root/reference/dbsnp, as add_rsid expects."""
+    import pysam
+
+    vcf = dbsnp.vcf_path(root)
+    vcf.parent.mkdir(parents=True)
+    plain = vcf.with_name("dbsnp.vcf")
+    plain.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+                     "NC_000001.11\t10177\trs1\tA\tC,G\t.\t.\tRS=1\n"
+                     "NC_000001.11\t10352\trs2\tG\tT\t.\t.\tRS=2\n"  # the table has these alleles swapped
+                     "NC_000002.12\t5\trs3\tC\tT\t.\t.\tRS=3\n")
+    pysam.tabix_compress(str(plain), str(vcf))
+    pysam.tabix_index(str(vcf), preset="vcf")
+
+
 def test_the_model_downloads_processes_validates_and_submits(tmp_path: Path, served) -> None:
+    fake_dbsnp(tmp_path)
+    columns = COLUMNS | {"rsid_col": "rsid"}
     row = {"dataset": "BrainSeq", "qtl_type": "eQTL", "biocontext": "DLPFC", "level_1_context": "Brain",
            "level_2_context": "", "population": "EUR", "sample_size": "412", "file_path": "brainseq/eqtl_processed.tsv.gz",
-           "delimiter": "\\t", **COLUMNS, "gene_id_mode": "self", "url": "https://zenodo.org/records/1",
+           "delimiter": "\\t", **columns, "gene_id_mode": "self", "url": "https://zenodo.org/records/1",
            "source_url": "https://zenodo.org/records/1", "genome_build": "GRCh38",
            "evidence": {"biocontext": {"source": "paper", "quote": "mapped cis-eQTL in the dorsolateral prefrontal cortex"},
                         "sample_size": {"source": "paper", "quote": "We genotyped 412 donors of European ancestry"},
@@ -105,8 +177,9 @@ def test_the_model_downloads_processes_validates_and_submits(tmp_path: Path, ser
         [("read_paper", {"query": "donors"})],
         [("download", {"dataset": "BrainSeq", "urls": ["https://zenodo.org/f/eqtl.tsv.gz"]})],
         [("run_python", {"dataset": "BrainSeq", "code": SPLIT, "purpose": "split SNP into chrom/pos/ref/alt"})],
+        [("add_rsid", {"file_path": "brainseq/eqtl_processed.tsv.gz", "columns": COLUMNS})],
         [("validate", {"file_path": "brainseq/eqtl_processed.tsv.gz", "delimiter": "\\t", "qtl_type": "eQTL",
-                       "columns": COLUMNS, "gene_id_mode": "self"})],
+                       "columns": columns, "gene_id_mode": "self"})],
         [("submit", {"rows": [bad_quote], "summary": "one context"})],
         [("submit", {"rows": [row], "summary": "one context",
                      "skipped_tables": [{"path": "sig_eqtl.txt", "url": "https://zenodo.org/records/1",
@@ -116,17 +189,47 @@ def test_the_model_downloads_processes_validates_and_submits(tmp_path: Path, ser
     out = asyncio.run(agent.run(RECORD, judge, root=tmp_path, max_bytes=1e9, target=rules.Target(level_1=["Brain"]),
                                 paper=PAPER, step=lambda _: None, cancel=threading.Event(), usage=usage))
     assert "quote was not found" in judge.seen[-1]["content"]  # the first submit was sent back
+    assert "PROCEDURE (SKILL.md)" in judge.system and "Phase 7: Submit" in judge.system
     [r] = out["rows"]
     assert r["row"]["file_path"] == "brainseq/eqtl_processed.tsv.gz" and r["row"]["chrom_col"] == "chrom"
     assert r["evidence"]["data"]["status"] == "processed" and r["evidence"]["file_path"]["verified"]
     assert r["evidence"]["sample_size"]["verified"] and r["evidence"]["population"]["verified"]
     assert r["status"] == "ready", r["issues"]
     assert (tmp_path / "brainseq/eqtl_processed.tsv.gz").exists()
+    # rs ids from dbSNP: exact alleles, swapped alleles, and none for a variant dbSNP lacks.
+    ids = pd.read_csv(tmp_path / "brainseq/eqtl_processed.tsv.gz", sep="\t", dtype=str, keep_default_na=False)["rsid"]
+    assert ids.tolist() == ["rs1", "rs2", ""]
     assert any(i["holds"] == "skipped" for loc in out["reports"] for i in loc["inventory"])
     # A second paper asking for the same URL reuses the file.
     s = session(tmp_path)
     again = s.download("Other", urls=["https://zenodo.org/f/eqtl.tsv.gz"])
     assert "reused" in again["files"][0]["note"]
+
+
+def test_the_skill_drops_its_front_matter_and_names_every_tool(tmp_path: Path) -> None:
+    f = tmp_path / "SKILL.md"
+    f.write_text("---\nname: x\ndescription: y\n---\n\n# Steps\n1. read_paper\n")
+    assert agent.skill(f) == "PROCEDURE (SKILL.md)\n\n# Steps\n1. read_paper"
+    text = agent.skill()
+    assert "description:" not in text
+    assert all(t["name"] in text for t in agent.TOOLS)
+    with pytest.raises(FileNotFoundError, match="MANIFEST_SKILL"):
+        agent.skill(tmp_path / "missing.md")
+    assert all(f"`{c}`" in text for c in rules.MANIFEST_COLUMNS)  # every manifest column is described
+
+
+def test_the_first_message_says_what_the_reference_manifest_has(tmp_path: Path) -> None:
+    ref = tmp_path / "qtl_manifest.tsv"
+    ref.write_text("\t".join(rules.MANIFEST_COLUMNS) + "\n" + "\t".join(
+        {"dataset": "BrainSeq", "qtl_type": "eQTL", "biocontext": "DLPFC", "level_1_context": "Brain",
+         "publication": "https://doi.org/10.1000/brain"}.get(c, "") for c in rules.MANIFEST_COLUMNS) + "\n")
+    s = session(tmp_path)
+    s.record = RECORD | {"doi": "10.1000/brain"}
+    s.target = rules.load_target(ref)
+    text = agent.first_message(s, [])
+    assert "already there as dataset BrainSeq, with 1 row(s)" in text and "- eQTL DLPFC" in text
+    s.target = rules.Target()
+    assert "this paper is not in it yet" in agent.first_message(s, [])
 
 
 def test_older_gtex_releases_are_not_downloaded(tmp_path: Path, served) -> None:

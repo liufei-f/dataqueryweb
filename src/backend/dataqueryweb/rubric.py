@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-RUBRIC_VERSION = "2026-09-28"
+RUBRIC_VERSION = "2026-10-27"
 
 # What a picked location must hold to count as "a download location for QTL results".
 RESULT_CONTENT = ("qtl_summary_statistics", "qtl_results_browser", "supplementary_table")
@@ -77,7 +77,9 @@ QUESTIONS: list[tuple[str, str, str]] = [
 ]
 
 # (key, label, weight, how it is decided). Weights sum to 1.0; with the default auto-save
-# threshold of 0.90, a paper is auto-saved only when ALL five criteria are met.
+# threshold of 0.90, a paper is auto-saved when the first four criteria are met, whether or not
+# its full text could be read (a paper with new QTL data is not held back for a paywall or a
+# preprint server); missing any of the first four gives at most 0.85.
 CRITERIA: list[tuple[str, str, float, str]] = [
     (
         "mapped_qtls",
@@ -95,14 +97,14 @@ CRITERIA: list[tuple[str, str, float, str]] = [
     (
         "location_found",
         "Download location for QTL results identified",
-        0.15,
+        0.20,
         "at least one picked link holds QTL summary statistics, a results browser or a "
         "supplementary table (checked by the program)",
     ),
     (
         "full_text_read",
         "Judged from the full text",
-        0.15,
+        0.10,
         "the full text was read — PMC / Europe PMC, the publisher page, or AI web search "
         "(checked by the program)",
     ),

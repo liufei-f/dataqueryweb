@@ -215,7 +215,8 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         """Candidate manifest rows and per-location reports, with what explains them."""
         reference = rules.load_target().publications
         papers = {r["record_id"]: {**{k: r[k] for k in ("publication_title", "doi", "first_author", "year", "journal",
-                                                         "qtl_type", "qtl_context", "publication_url", "species", "saved_by")},
+                                                         "qtl_type", "qtl_context", "publication_url", "species", "saved_by",
+                                                         "record_code")},
                                    "n_locations": n_locations(r), "data_kind": data_kind(r),
                                    "already_exists": reference.get((r.get("doi") or "").strip().lower(), ""),
                                    "not_eligible": manifest.eligible(r)}

@@ -21,6 +21,7 @@
       <tr data-id="${r.record_id}"${r.saved_by === "auto" ? ' class="rec-is-auto"' : ""}>
         <td class="muted">${r.record_id}</td>
         <td>
+          ${r.record_code ? `<code class="rec-code" title="Record code; also the name of its data folder">${esc(r.record_code)}</code>` : ""}
           <a class="rec-title" href="${esc(safeUrl(pubUrl))}" target="_blank" rel="noopener">${esc(r.publication_title || r.doi)}</a>
           <div class="rec-sub">${esc([r.first_author && `${r.first_author} et al.`, r.journal, r.year].filter(Boolean).join(" · "))}</div>
           <div class="rec-sub">${ids}</div>

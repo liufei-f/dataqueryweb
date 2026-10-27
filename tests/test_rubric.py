@@ -16,11 +16,13 @@ def answers(mapped: str = "yes", reuse: str = "no", released: str = "yes") -> di
     )
 
 
-def test_weights_sum_to_one_and_threshold_needs_all_five() -> None:
+def test_weights_sum_to_one_and_threshold_needs_the_first_four() -> None:
     assert abs(sum(w for _, _, w, _ in rubric.CRITERIA) - 1.0) < 1e-9
-    # Every single missing criterion drops a yes-verdict below the 0.90 auto-save threshold.
-    smallest = min(w for _, _, w, _ in rubric.CRITERIA)
-    assert 1.0 - smallest < 0.90
+    # Missing any of the first four drops a yes-verdict below the 0.90 auto-save threshold;
+    # missing only the full text does not.
+    weights = {key: w for key, _, w, _ in rubric.CRITERIA}
+    assert all(1.0 - w < 0.90 for key, w in weights.items() if key != "full_text_read")
+    assert round(1.0 - weights["full_text_read"], 2) >= 0.90
 
 
 def test_all_met_scores_one() -> None:
@@ -30,8 +32,8 @@ def test_all_met_scores_one() -> None:
 
 
 def test_each_missing_criterion_costs_its_weight() -> None:
-    assert rubric.score(answers(), location_found=True, full_text_read=False)["confidence"] == 0.85
-    assert rubric.score(answers(), location_found=False, full_text_read=True)["confidence"] == 0.85
+    assert rubric.score(answers(), location_found=True, full_text_read=False)["confidence"] == 0.9
+    assert rubric.score(answers(), location_found=False, full_text_read=True)["confidence"] == 0.8
     assert (
         rubric.score(answers(released="unclear"), location_found=True, full_text_read=True)[
             "confidence"

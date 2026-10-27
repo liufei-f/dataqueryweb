@@ -327,21 +327,31 @@ def parse_json(text: str) -> dict[str, Any]:
     return dict(json.loads(text[start : end + 1]))
 
 
+def relabel(current: str, new: str) -> bool:
+    """Whether a link labelled ``current`` takes the label ``new``. The model sometimes labels
+    one link twice ("results browser", then "raw data"); a QTL-result label is never replaced
+    by one that is not, so the confidence and the auto-save see the same label."""
+    return not current or new in rubric.RESULT_CONTENT or current not in rubric.RESULT_CONTENT
+
+
 def normalize(raw: dict[str, Any], ids: dict[str, int]) -> dict[str, Any]:
-    """The model's answers and picks. Verdict and confidence are added by :func:`finish`."""
-    picks = []
+    """The model's answers and picks, one per candidate. Verdict and confidence are added by
+    :func:`finish`."""
+    picks: dict[int, dict[str, Any]] = {}
     for item in raw.get("data_sources") or []:
         if not isinstance(item, dict):
             continue
         sid = str(item.get("id", "")).strip().upper()
-        if sid in ids:  # drop anything that is not one of our candidates
-            picks.append(
-                {
-                    "index": ids[sid],
-                    "content": rubric.normalize_content(item.get("content")),
-                    "note": str(item.get("note") or "")[:300],
-                }
-            )
+        if sid not in ids:  # drop anything that is not one of our candidates
+            continue
+        pick = {
+            "index": ids[sid],
+            "content": rubric.normalize_content(item.get("content")),
+            "note": str(item.get("note") or "")[:300],
+        }
+        old = picks.get(pick["index"])
+        if old is None or relabel(old["content"], pick["content"]):
+            picks[pick["index"]] = pick
     return {
         "answers": rubric.parse_answers(raw.get("answers")),
         "qtl_types": [str(t) for t in (raw.get("qtl_types") or [])][:10],
@@ -349,7 +359,7 @@ def normalize(raw: dict[str, Any], ids: dict[str, int]) -> dict[str, Any]:
         "tissues_or_cells": str(raw.get("tissues_or_cells") or "")[:200],
         "reason": str(raw.get("reason") or "")[:400],
         "download_status": str(raw.get("download_status") or "not_found"),
-        "data_sources": picks,
+        "data_sources": list(picks.values()),
     }
 
 
@@ -700,7 +710,8 @@ class Judge:
                     qtl_context=True,
                 )
                 paper.sources.insert(0, source)
-            source.ai_pick, source.ai_note = content, note
+            if relabel(source.ai_pick, content):
+                source.ai_pick, source.ai_note = content, note
             kept.append(url)
 
         finish(

@@ -118,7 +118,7 @@
     </tbody>
   </table>
   <p>With the auto-save threshold of {{ (autosave.min_confidence * 100) | round | int }}%, a paper is auto-saved only when
-    <strong>all five criteria are met</strong> (missing any one gives at most 85). Under each verdict, the checklist shows which
+    <strong>the first four criteria are met</strong>, whether or not the full text was read (missing only the full text gives 90; missing any other gives at most 85). Under each verdict, the checklist shows which
     criteria were met; hover a criterion or open <em>Why this score</em> to see the answer and quote behind it.</p>
 
   <h2>5. Auto-save and review</h2>

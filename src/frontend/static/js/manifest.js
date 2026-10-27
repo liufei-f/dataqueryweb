@@ -174,13 +174,21 @@
     return note ? `<div class="rec-sub mf-why" title="${esc(note)}">${esc(note.slice(0, 90))}${note.length > 90 ? "…" : ""}</div>` : "";
   }
 
+  // A row kept although its table is not full summary statistics: say why, in plain words.
+  function nonFull(r) {
+    if (r.holds !== "non_full") return "";
+    const h = r.evidence.holds || {};
+    return `<div class="mf-non-full"><strong>Not full summary statistics:</strong> ${esc(h.reason_label || "reason not given")}
+      ${h.note ? `<div class="rec-sub">${esc(h.note.replace(/^Not full summary statistics — [^.]*\.\s*/, ""))}</div>` : ""}</div>`;
+  }
+
   function rowHtml(r) {
     const unverified = FACTS.filter(([k]) => r.evidence[k] && r.evidence[k].verified === false).length;
     return `<tr class="mf-row mf-${r.review}" data-id="${r.row_id}">
       <td><span class="badge mf-s-${r.status}">${STATUS[r.status] || r.status}</span>${statusWhy(r)}
         ${r.review !== "pending" ? `<div class="rec-sub mf-rev-${r.review}">${r.review}</div>` : ""}</td>
       <td>${esc(r.dataset)}<div class="rec-sub">${esc(r.qtl_type)}</div></td>
-      <td><strong>${esc(r.biocontext) || "—"}</strong><div class="rec-sub">${esc(r.level_1_context)}${r.level_2_context ? ` / ${esc(r.level_2_context)}` : ""}</div></td>
+      <td><strong>${esc(r.biocontext) || "—"}</strong><div class="rec-sub">${esc(r.level_1_context)}${r.level_2_context ? ` / ${esc(r.level_2_context)}` : ""}</div>${nonFull(r)}</td>
       <td>${esc(r.population) || "—"}</td><td>${esc(r.sample_size) || "—"}</td><td>${esc(r.genome_build) || "—"}</td>
       <td class="rec-url">${esc(r.source_path)}<div class="rec-sub">${r.n_files > 1 ? `${r.n_files} files · ` : ""}${size(r.file_size)}</div></td>
       <td>${dataBadge(r)}${dataWhy(r)}</td>
@@ -223,6 +231,7 @@
 
   // Why a built paper has no row, in plain words: per location, its own note or each file's reason.
   const HOLDS = { doc: "documentation", subset: "a subset of results, not every tested pair", not_qtl: "not a QTL table",
+    non_full: "not every tested pair (e.g. significant pairs only), kept because no full table is public",
     unknown_scope: "could not tell what it holds",
     other: "not a table file (by its name: e.g. a PDF, image, script, genotype or binary file), so it was not opened" };
   // Notes stored by earlier builds named command-line flags; say what to tick instead.
@@ -306,7 +315,7 @@
       ? `<button type="button" class="rec-btn ${toCheck && !openPapers.has(id) ? "primary" : ""} mf-open" data-record="${id}">${openPapers.has(id) ? "Close" : toCheck ? `Check (${toCheck})` : "Check"}</button>` : "";
     return `<div class="mf-paper-main">
         <a class="mf-paper-title" href="${esc(safeUrl(p.doi ? `https://doi.org/${p.doi}` : p.publication_url))}" target="_blank" rel="noopener">${esc(p.publication_title || `Record #${id}`)}</a>
-        <div class="dq-paper-meta">${kindTag(p)} #${id} · ${esc([p.first_author && `${p.first_author} et al.`, p.journal, p.year, p.qtl_type, p.species && `species: ${p.species}`,
+        <div class="dq-paper-meta">${kindTag(p)} #${id}${p.record_code ? ` · <code class="rec-code" title="Record code; also the name of its data folder">${esc(p.record_code)}</code>` : ""} · ${esc([p.first_author && `${p.first_author} et al.`, p.journal, p.year, p.qtl_type, p.species && `species: ${p.species}`,
           p.n_locations > 1 && `${p.n_locations} download locations`, p.saved_by === "auto" ? "saved by the AI" : "saved by you"].filter(Boolean).join(" · "))}</div>
         <div class="mf-paper-status">${status}</div>${lastOutcome(id)}
       </div><div class="mf-paper-btns">${build}${check}</div>`;
@@ -352,7 +361,8 @@
   }
 
   const buildAll = $("mf-build-all");
-  const toBuild = (ids) => ids.filter((id) => stateOf(id) === "unbuilt");
+  // Builds only take human records (manifest.eligible), so the others are never queued.
+  const toBuild = (ids) => ids.filter((id) => stateOf(id) === "unbuilt" && !data.records[id].not_eligible);
 
   function updateCount(ids) {
     const n = toBuild(ids).length;

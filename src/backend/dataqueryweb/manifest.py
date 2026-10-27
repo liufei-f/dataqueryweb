@@ -484,8 +484,8 @@ def assemble(
                                  "header_from": c.header_from, "note": c.note}
         else:
             evidence["table"] = {"columns": [], "rows": [], "note": c.note}
-        row["file_path"] = f"{fetch.folder_name(name)}/{fetch.safe_rel(c.glob)}"
-        evidence["file_path"] = ev(row["file_path"], "rule: <dataset>/<path in the repository>",
+        row["file_path"] = f"{fetch.record_folder(record, name)}/{fetch.safe_rel(c.glob)}"
+        evidence["file_path"] = ev(row["file_path"], "rule: <record code>/<path in the repository>",
                                    note="relative to the data folder; not downloaded")
 
         # Context.
@@ -937,7 +937,7 @@ async def build_record(
     if data is not None and rows:
         rid = record["record_id"]
         plan_model = await fetch.fetch_rows(
-            rows, rows[0]["row"]["dataset"], judge, usage, data, skip=store.kept(rid),
+            rows, fetch.record_folder(record, rows[0]["row"]["dataset"]), judge, usage, data, skip=store.kept(rid),
             key=lambda c: row_key(rid, c), step=step, cancel=cancel)
         model = model or plan_model
     step("saving")
@@ -1174,7 +1174,7 @@ def main() -> None:  # pragma: no cover
     r.add_argument("--all-species", action="store_true", help="do not restrict to human records")
     r.add_argument("--no-download", action="store_true", help="fill the rows only; leave the files where they are")
     r.add_argument("--max-gb", type=float, default=fetch.MAX_PAPER_GB, help="download at most this much per paper")
-    r.add_argument("--target", help="path to the reference qtl_manifest.tsv, read only (default: $LC2_QTL_MANIFEST)")
+    r.add_argument("--target", help="path to the reference qtl_manifest.tsv, read only (default: $LC2_QTL_MANIFEST, else reference/qtl_manifest.tsv)")
     e = sub.add_parser("export", help="write the candidate rows as TSV")
     e.add_argument("--out", required=True)
     e.add_argument("--scope", choices=("approved", "ready", "all"), default="all")

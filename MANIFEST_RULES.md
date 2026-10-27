@@ -22,12 +22,15 @@
 | `open_url` | 打开网页 / DOI，返回文字（`offset` 往下读，`find` 只看匹配段落）和全部链接 |
 | `list_files` | 列出仓库（Zenodo、figshare、GitHub、Hugging Face、OSF）或网页上的文件、大小、下载地址 |
 | `peek_file` | 不下载，读远程文件 / 压缩包成员 / xlsx / parquet 的表头和前几行 |
-| `download` | 下载到 `data/<dataset>/`，断点续传，受每篇上限和磁盘剩余空间限制；别的论文下过的同一 URL 直接复用（`data/.downloads.json`） |
+| `download` | 下载到 `data/<记录编号>/`，断点续传，受每篇上限和磁盘剩余空间限制；别的论文下过的同一 URL 直接复用（`data/.downloads.json`） |
 | `inspect_local` | 看已下载文件或压缩包成员的前几行、文件夹或压缩包的内容 |
 | `run_python` | LLM 写 Python 处理数据，生成 `<原名>_processed.tsv.gz`；在数据集文件夹里运行，无网络（`unshare -n`）、无 API key、有时间上限；出现联网、子进程、删除文件、读环境变量、绝对路径等写法的代码直接拒绝执行；脚本保存在 `data/.agent_scripts/<record_id>/` |
-| `validate` | 按导入脚本的方式（`pandas.read_csv`，manifest 的分隔符和列名）读文件前 2 万行，逐列检查数值、导入脚本过滤后保留的比例、gene id / caQTL peak id 格式 |
+| `add_rsid` | 给处理后的表（`<原名>_processed.tsv.gz`）补 rsID：用本地的 NCBI dbSNP（GRCh38，build 157，`data/reference/dbsnp/GCF_000001405.40.gz` 及其 tabix 索引，所有论文共用）按 chrom、pos、ref、alt 精确匹配，匹配不上时再试 ref/alt 互换；dbSNP 里没有的变异 rsID 留空，不猜、不借用相邻位置。表里已有的 rsID 保留。只适用于 GRCh38 坐标。LLM 不能自己下载 dbSNP 或其他参考数据 |
+| `validate` | 按导入脚本的方式（`pandas.read_csv`，manifest 的分隔符和列名）读文件前 2 万行，逐列检查数值；**格式必须每一行都对**：染色体和位置只能是数字（`1`，不能是 `chr1`），ref/alt 大写，variant id 写成 `chr<chrom>_<pos>_<ref>_<alt>` 用下划线连接、带 `chr` 前缀（`chr1_12345_A_G`）且和这四列一致，`variant_id_col` 必填；`rsid_col` 必填，值只能是 `rs<数字>` 或空；还检查导入脚本过滤后保留的比例、gene id / caQTL peak id 格式 |
 | `note_location` | 记录某个数据位置的结论（需要人工、打不开、不是数据……） |
 | `submit` / `give_up` | 提交行；程序检查：`file_path` 必须通过 `validate` 且列名一致、QTL 类型在 manifest 范围内、引用逐字出现在 LLM 实际看过的文本里、context 词表、标签格式、同一 context 不重复。有问题退回给 LLM 改，最多 3 轮 |
+
+LLM 的工作顺序写在 skill 文件 [`skills/build-manifest/SKILL.md`](skills/build-manifest/SKILL.md) 里：读论文 → 清点数据位置 → 选表（下载前先 peek）→（已有链接里没有完整 summary statistics 时）回原文找完整结果：数据/代码可用性声明、accession、出版商页面、预印本与正式版、仓库的新版本和 README → 下载 → 处理 → 验证 → 提交，每一阶段有完成条件，提交前有逐项检查清单；开头还写明了三个 manifest 文件的作用（参考 manifest 只读，`manifest/qtl_manifest_candidates.tsv` 和 `manifest/qtl_manifest.tsv` 由程序写）和 27 列各自怎么填。LLM 的第一条消息会告诉它这篇论文在参考 manifest 里是否已有、已有哪些 qtl_type + biocontext。每次 build 都会把它（去掉开头的 front matter）附在系统提示末尾；改流程只需改这个文件，不用改代码。`MANIFEST_SKILL` 可指向另一份文件。
 
 上限：每篇 80 次工具调用（`MANIFEST_AGENT_STEPS`）、400 万 token（`MANIFEST_AGENT_TOKENS`），单个脚本最长 6 小时（`MANIFEST_RUN_MAX_SECONDS`）。用完后要求 LLM 立即提交已通过验证的行。行的证据里保存 LLM 的总结、运行过的脚本和每次工具调用，在 Check 面板的 “AI work” 里看。
 
@@ -42,32 +45,32 @@
 | 3 读论文 | `finder.py` | 重新读论文全文（Europe PMC / 出版商页面） | 否 |
 | 4 问 LLM | `manifest.py` | 每篇论文一次调用（表多时每 30 张一次，失败重试一次）：context、样本量、祖源、基因组版本、数据集名，每项附原文引用 | 是 |
 | 5 核对与组装 | `manifest.py` | 引用必须能在给 LLM 的文本里找到才算证据；按规则给出状态 | 否 |
-| 6 下载 | `fetch.py` | 把每行的原始文件下载到 `data/<dataset>/<仓库内路径>`，断点续传，受每篇大小上限和磁盘剩余空间限制 | 否 |
+| 6 下载 | `fetch.py` | 把每行的原始文件下载到 `data/<记录编号>/<仓库内路径>`，断点续传，受每篇大小上限和磁盘剩余空间限制 | 否 |
 | 7 识别与处理 | `fetch.py` | 用下载后的真实前几行重新识别列；导入脚本能直接读就用原文件，否则由 LLM 从固定操作中选方案，代码执行并逐列检查，写出 `<原名>_processed.tsv.gz` | 是（只选方案） |
 
 LLM 只回答文件本身说不出来的事实，以及“这张表要怎么处理”（只能从固定操作里选）。列名、文件范围、路径、状态由固定规则决定；处理结果一律经过代码的数值检查。
 
 ## 3. 27 列各自怎么填
 
-| 列 | 来源 | 规则 |
-|---|---|---|
-| `dataset` | 参考 manifest → LLM → 规则 | 该论文 DOI 已在参考 manifest 里：沿用那里的名字。否则用论文或仓库点名的资源名（需引用核实）。都没有：`<第一作者姓>_<年份>`，与 eQTL Catalogue 的 `Alasoo_2018` 写法一致 |
-| `source_project_id` | 规则 | 等于 `dataset`（单篇论文即一个项目） |
-| `use_in_lc2` | 规则 | 一律 `FALSE`，由人决定是否启用 |
-| `qtl_type` | 路径 → LLM → 记录 | 路径里写了 `eQTL/sQTL/caQTL/pQTL/mQTL` 就用它；否则用 LLM 的判断；否则用记录里唯一的类型 |
-| `biocontext` | LLM + 规则 | 数据集内标识这个 context 的标签。优先用文件自带的标签（兄弟文件间变化的那段），否则 `level_2_context`，否则组织名。只含 QTL 类型或 `summary/statistics/results` 之类字样的标签不算 context，回退到 level 2 / level 1 |
-| `level_1_context` | LLM，词表受限 | 大类组织。词表取自参考 manifest 现有的值（Blood、Brain、Neural、Adipose、Muscle、Skin、Pancreas、Placenta、Cartilage、Synovium 及 GTEx 组织名）。全血、PBMC、各类免疫细胞、血浆、LCL 都归 Blood。用了词表外的值会标 `new_level_1_context` |
-| `level_2_context` | LLM | 细胞类型、亚区或"细胞+条件"，下划线连接（`CD14_Mono`、`macrophage_IFNg`）；bulk 组织没有更细一层时留空 |
-| `population` | LLM | `EUR/EAS/AFR/AMR/SAS`，多祖源队列用 `ALL`；文本没写就留空并标 `population_missing` |
-| `sample_size` | 见 §6 | 进入该 context QTL mapping 的基因分型个体数（不是细胞数、不是 QC 前样本数、不是 GWAS 队列） |
-| `file_path` | 下载结果 | 相对于数据目录的路径（导入时用 `--data-root <数据目录>`）：`<dataset 小写>/<仓库内路径>`，处理过的指向 `<原名>_processed.tsv.gz`，按染色体拆分的写成 `chr*`。没下载成功时是将来的位置，并带对应 issue |
-| `delimiter` | 文件 | 从前几行判断：`\t`、`,`、`;` 或空格；处理过的文件一律 `\t` |
-| `chrom_col` … `phenotype_id_col` | 文件表头 | 见 §4 |
-| `gene_id` | 规则 | 一律留空（与现有 manifest 一致） |
-| `gene_id_mode` | 文件取样值 | eQTL/sQTL/pQTL：取样值全是 `ENSG…` → `self`；最后一个 `:` 段是 `ENSG…` → `phenotype_last_segment`；都不是 → 标 `phenotype_id_not_ensembl`。caQTL 留空，但要求 peak id 是 `chr_start_end` |
-| `median_tpm` | 文件表头 | 有 `median_tpm` 列就填列名，否则留空 |
-| `url` | 仓库 | 下载位置的落地页 |
-| `publication` | 记录 | `https://doi.org/<DOI>` |
+| 列 | 含义 | 来源 | 规则 |
+|---|---|---|---|
+| `dataset` | 这一行属于哪个数据集合；LocusCompare 按 dataset + qtl_type 分组，一组共用一个 population | 参考 manifest → LLM → 规则 | 该论文 DOI 已在参考 manifest 里：沿用那里的名字。否则用论文或仓库点名的资源名（需引用核实）。都没有：`<第一作者姓>_<年份>`，与 eQTL Catalogue 的 `Alasoo_2018` 写法一致 |
+| `source_project_id` | 数据集里的具体研究（如 eQTL-Catalogue 里的 INTERVAL）；与 dataset、qtl_type、biocontext 一起唯一确定一张表，重新导入会更新那张表 | 规则 | 等于 `dataset`（单篇论文即一个项目） |
+| `use_in_lc2` | LocusCompare 2 是否对用户显示这张表 | 规则 | 一律 `FALSE`，由人决定是否启用 |
+| `qtl_type` | 检验的分子表型：eQTL 表达、sQTL 剪接、caQTL 染色质可及性、pQTL 蛋白 | 路径 → LLM → 记录 | 路径里写了 `eQTL/sQTL/caQTL/pQTL/mQTL` 就用它；否则用 LLM 的判断；否则用记录里唯一的类型 |
+| `biocontext` | 这张表的 context 名称，在同一 dataset + source_project_id + qtl_type 下唯一 | LLM + 规则 | 数据集内标识这个 context 的标签。优先用文件自带的标签（兄弟文件间变化的那段），否则 `level_2_context`，否则组织名。只含 QTL 类型或 `summary/statistics/results` 之类字样的标签不算 context，回退到 level 2 / level 1 |
+| `level_1_context` | 大类组织，用于浏览和筛选；导入脚本要求必填 | LLM，词表受限 | 大类组织。词表取自参考 manifest 现有的值（Blood、Brain、Neural、Adipose、Muscle、Skin、Pancreas、Placenta、Cartilage、Synovium 及 GTEx 组织名）。全血、PBMC、各类免疫细胞、血浆、LCL 都归 Blood。用了词表外的值会标 `new_level_1_context` |
+| `level_2_context` | level 1 之下更细的 context（细胞类型、亚区、细胞 + 条件） | LLM | 细胞类型、亚区或"细胞+条件"，下划线连接（`CD14_Mono`、`macrophage_IFNg`）；bulk 组织没有更细一层时留空 |
+| `population` | 样本的遗传祖源 | LLM | `EUR/EAS/AFR/AMR/SAS`，多祖源队列用 `ALL`；文本没写就留空并标 `population_missing` |
+| `sample_size` | 进入这个 context QTL mapping 的基因分型个体数 | 见 §6 | 进入该 context QTL mapping 的基因分型个体数（不是细胞数、不是 QC 前样本数、不是 GWAS 队列） |
+| `file_path` | 导入脚本读取的文件；`chr*` 通配一次读入同一 context 的全部染色体文件 | 下载结果 | 相对于数据目录的路径（导入时用 `--data-root <数据目录>`）：`<记录编号>/<仓库内路径>`，处理过的指向 `<原名>_processed.tsv.gz`，按染色体拆分的写成 `chr*`。没下载成功时是将来的位置，并带对应 issue |
+| `delimiter` | 列分隔符，传给 `pandas.read_csv` | 文件 | 从前几行判断：`\t`、`,`、`;` 或空格；处理过的文件一律 `\t` |
+| `chrom_col` … `phenotype_id_col` | 文件里各个角色所在列的**列名**（不是值）：染色体、位置、ref、alt、效应量、标准误、名义 p 值、rsID、MAF、variant id、表型 id。必需：chrom、position、ref、alt、pval、phenotype_id；可选列留空时 beta/se/maf 记为 0 | 文件表头 | 见 §4 |
+| `gene_id` | 导入脚本不读（基因由 phenotype_id 推出） | 规则 | 一律留空（与现有 manifest 一致） |
+| `gene_id_mode` | 导入脚本如何从 phenotype_id 得到 Ensembl 基因：`self` 本身就是基因；`phenotype_last_segment` 取最后一个 `:` 段 | 文件取样值 | eQTL/sQTL/pQTL：取样值全是 `ENSG…` → `self`；最后一个 `:` 段是 `ENSG…` → `phenotype_last_segment`；都不是 → 标 `phenotype_id_not_ensembl`。caQTL 留空，但要求 peak id 是 `chr_start_end` |
+| `median_tpm` | 文件里每个基因中位表达量（TPM）那一列的列名 | 文件表头 | 有 `median_tpm` 列就填列名，否则留空 |
+| `url` | 人去哪里找这份数据（数据落地页） | 仓库 | 下载位置的落地页 |
+| `publication` | 数据出自哪篇论文 | 记录 | `https://doi.org/<DOI>` |
 
 另外保存但不属于 manifest 的字段：`genome_build`、`status`、`issues`、源文件 URL、证据。
 
@@ -152,7 +155,9 @@ LLM 的每个值都要带一句原文引用。程序拿引用去比对**当时�
 
 **下载哪些行**：状态不是 `not_loadable`、不是子集、QTL 类型在 eQTL/sQTL/caQTL/pQTL 之内的行。已审核或改过的行重跑时不动。
 
-**存放**：`data/<dataset 小写>/<文件在仓库里的路径>`，不同数据集在不同文件夹。zip/tar 内的成员处理后放在 `data/<dataset>/<压缩包名>/`。
+**存放**：`data/<记录编号>/<文件在仓库里的路径>`，每条 Saved record 一个文件夹。zip/tar 内的成员处理后放在 `data/<记录编号>/<压缩包名>/`。
+
+**记录编号**（`record_code`）：每条 Saved record 保存时自动生成、之后不再改变，格式 `<第一作者姓>_<年份>_<一个词>`，例如 `Sun_2026_skin`。姓氏只保留 ASCII 字母（`Höglund` → `Hoglund`，`Nunes-Nesi` → `NunesNesi`）；那个词是 context 里最先出现的组织或细胞类型（`blood`、`pbmc`、`brain`、`liver`…，词表见 `records.TOPICS`），涉及三类以上组织或写明多组织时为 `multitissue`，都没有时用 QTL 类型（`pqtl`）。重名的依次加 `_2`、`_3`。Saved records 和 Manifest 页面都显示编号，导出的 TSV/CSV 里是 `record_code` 列。
 
 **大小**：每篇论文默认最多 50 GB（页面上可改，或 `--max-gb`、`MANIFEST_MAX_GB`），并始终给磁盘留 20 GB；超出的行标 `data_too_large`，不下载。已存在且大小一致的文件不重复下载，中断的从 `.part` 续传。
 
@@ -218,7 +223,7 @@ dataqueryweb-manifest export --out approved.tsv --scope approved --format manife
 
 **网页 `/manifest`（推荐）**：
 
-- 页面列出全部 Saved records，一篇一行（默认只显示人类记录，每次显示 100 篇，可搜索，可筛选“未建 / 已建 / 有待查行 / 有已批准行”）。
+- 页面列出全部 Saved records，一篇一行（默认显示所有物种，勾选 “Species: human only” 只看人类记录；Build 只处理人类记录；每次显示 100 篇，可搜索，可筛选“未建 / 已建 / 有待查行 / 有已批准行”）。
 - 每篇右边的 **Build manifest**：为这篇填 manifest 行，并下载、处理数据。在服务器后台一篇接一篇进行；同时点了多篇会排队，关掉页面也会继续。建过的显示 **Built**、各状态行数、数据情况和检查进度，按钮变成 **Rebuild**。
 - 页面上方的设置对之后点的 Build 生效：是否下载并处理数据及每篇上限（GB）、是否打开补充材料表格、是否跳过 AI。
 - 运行时顶部有一条状态栏，显示正在建哪篇、哪一步、还有几篇排队；**Stop** 丢弃正在建的那篇并清空队列。
@@ -226,12 +231,12 @@ dataqueryweb-manifest export --out approved.tsv --scope approved --format manife
 - **输出文件**（本仓库 `manifest/` 目录，每次运行、修改、Approve / Reject 后自动重写，数据库是唯一来源，不要手改这两个文件）：
   - `manifest/qtl_manifest.tsv`：已 Approve 的行，27 列，格式与 LocusCompare 的 manifest 相同。
   - `manifest/qtl_manifest_candidates.tsv`：全部候选行，附状态、issue、源文件和证据摘要。
-- `lc2_newfeature_backend/scripts/qtl_manifest.tsv` 只作**参考**（沿用已有的 dataset 名和 level_1 词表），从不写入。
+- 参考 manifest 是本仓库的 `reference/qtl_manifest.tsv`，从 LocusCompare 的 `lc2_newfeature_backend/scripts/qtl_manifest.tsv` 复制过来（2026-10-27，对应那边的提交 `2b7cf70`），只作**参考**（沿用已有的 dataset 名和 level_1 词表），从不写入。程序不读写本仓库以外的文件；LocusCompare 的 manifest 更新后，手动再复制一次。
 - 右上两个下载按钮（内容与上面两个文件相同）：已 Approve 的行（27 列，可直接追加到 `qtl_manifest.tsv`）；全部行连同状态和证据。
 
 上面的命令行与网页做的是同一件事，适合不开浏览器时用。
 
-环境变量：`DATAQUERY_DATA_DIR`（数据目录，默认本仓库 `data/`）、`MANIFEST_MAX_GB`（每篇默认下载上限，50）、`DATAQUERY_MANIFEST_DIR`（输出目录，默认本仓库 `manifest/`）、`LC2_QTL_MANIFEST`（参考 manifest 路径，只读，默认找同级目录的 `lc2_newfeature_backend/scripts/qtl_manifest.tsv`）、`MANIFEST_MAX_PROBES`、`MANIFEST_TEXT_CHARS`（给 LLM 的论文文本上限，默认 24000 字符）、`GITHUB_TOKEN`（GitHub 列文件限流时用）。
+环境变量：`DATAQUERY_DATA_DIR`（数据目录，默认本仓库 `data/`）、`MANIFEST_MAX_GB`（每篇默认下载上限，50）、`DATAQUERY_MANIFEST_DIR`（输出目录，默认本仓库 `manifest/`）、`LC2_QTL_MANIFEST`（参考 manifest 路径，只读，默认本仓库 `reference/qtl_manifest.tsv`）、`MANIFEST_MAX_PROBES`、`MANIFEST_TEXT_CHARS`（给 LLM 的论文文本上限，默认 24000 字符）、`GITHUB_TOKEN`（GitHub 列文件限流时用）。
 
 默认只处理物种为 human 的记录；`--all-species` 取消这个限制。
 
