@@ -47,7 +47,7 @@ from urllib.parse import urljoin
 import httpx
 import pandas as pd
 
-from dataqueryweb import dbsnp, fetch, finder, llm, probe, records
+from dataqueryweb import dbsnp, fetch, finder, liftover, llm, probe, records
 from dataqueryweb import manifest_rules as rules
 
 MAX_STEPS = int(os.environ.get("MANIFEST_AGENT_STEPS") or 80)  # tool calls per paper
@@ -106,6 +106,8 @@ pandas.read_csv(path, sep=delimiter, compression="infer", dtype=str) and needs t
 named in the row: chrom_col, position_col, ref_col, alt_col, variant_id_col, pval_col \
 (nominal p-value, not FDR/q/permutation), phenotype_id_col, and rsid_col (rs ids, empty where \
 dbSNP has none; fill it with add_rsid). Optional: beta_col, se_col, maf_col.
+- Coordinates must be GRCh38. A GRCh37/hg19 table is converted with liftover (after \
+processing, before add_rsid); never submit GRCh37 coordinates.
 - REQUIRED VALUE FORMATS, in every row: chromosome digits only (1, not chr1; drop X/Y/MT \
 rows), position digits only, ref and alt upper-case A/C/G/T/N, and a variant id written \
 chr<chrom>_<pos>_<ref>_<alt> joined by underscores (chr1_12345_A_G — with the chr prefix, \
@@ -149,8 +151,8 @@ covers whole blood, PBMC, immune cells, plasma, LCLs). level_2_context: cell typ
 sub-region or cell type + condition (CD14_Mono, macrophage_IFNg); "" for a bulk tissue.
 - population: EUR, EAS, AFR, AMR, SAS, or ALL (multi-ancestry). sample_size: genotyped \
 donors in THIS context's QTL mapping (not cells, not samples before QC).
-- genome_build: GRCh38 or GRCh37 of the file's coordinates (state GRCh37 if so — it will be \
-flagged for liftover).
+- genome_build: GRCh38 or GRCh37 of the source file's coordinates, with a quote. Every row \
+is delivered on GRCh38: a GRCh37 table is converted with the liftover tool before add_rsid.
 - url: the landing page of the data. publication: https://doi.org/<doi>.
 
 EVIDENCE: for biocontext, sample_size, population and genome_build give {{"source": \
@@ -234,6 +236,16 @@ TOOLS: list[dict[str, Any]] = [
          "columns": {"type": "object", "description": "chrom_col, position_col, ref_col, alt_col of the table"},
          "rsid_col": {"type": "string", "description": "column to fill (default rsid)"}},
                     "required": ["file_path", "columns"]}},
+    {"name": "liftover", "description": "Convert a processed GRCh37/hg19 table (<name>_processed.tsv.gz; "
+     "globs allowed) to GRCh38 in place with UCSC's hg19ToHg38 chain: chrom and position are converted, alleles "
+     "complemented where the variant lands on the minus strand, the variant id rebuilt, and variants with no "
+     "GRCh38 position on the same chromosome dropped. The GRCh37 chrom and position are kept as chrom_grch37 "
+     "and pos_grch37. Run it once per file, before add_rsid; then validate again.",
+     "parameters": {"type": "object", "properties": {
+         "file_path": {"type": "string"},
+         "columns": {"type": "object", "description": "chrom_col, position_col, ref_col, alt_col and "
+                     "variant_id_col of the table"}},
+                    "required": ["file_path", "columns"]}},
     {"name": "note_location", "description": "Record what a data location is: status one of listed, "
      "downloaded, manual (a person must act: login, application, browser-only), error, not_data, duplicate.",
      "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "status": {"type": "string"},
@@ -277,6 +289,8 @@ class Session:
     used_bytes: float = 0.0
     folder_by_dataset: dict[str, Path] = field(default_factory=dict)
     rsid_lookup: dbsnp.Lookup | None = None
+    lifter: liftover.Lifter | None = None
+    lifted: dict[str, dict[str, Any]] = field(default_factory=dict)  # processed file → liftover counts
     result: dict[str, Any] | None = None
     submit_rounds: int = 0
 
@@ -636,6 +650,34 @@ class Session:
         self.validated.pop(file_path.strip(), None)  # the file changed
         return out
 
+    def liftover(self, file_path: str, columns: dict[str, str]) -> dict[str, Any]:
+        """Convert processed GRCh37 tables to GRCh38 in place (UCSC hg19ToHg38 chain)."""
+        chain = liftover.chain_path(self.root)
+        if not chain.exists():
+            return {"error": f"the liftover chain file is not in place ({chain}); say so in note"}
+        files = expand(self.root, file_path)
+        if not files:
+            return {"error": f"no file matches {file_path} under the data folder"}
+        if any("_processed" not in f.name or not f.name.endswith(".tsv.gz") for f in files):
+            return {"error": "liftover writes into processed tables only (<name>_processed.tsv.gz); process the file first"}
+        need = ("chrom_col", "position_col", "ref_col", "alt_col")
+        if missing := [k for k in need if not columns.get(k)]:
+            return {"error": f"name the columns: {', '.join(missing)}"}
+        if self.lifter is None:
+            self.lifter = liftover.Lifter(chain)
+        out: dict[str, Any] = {"files": len(files), "rows": 0, "lifted": 0, "dropped": 0, "minus_strand": 0}
+        for f in files:
+            res = liftover.lift(f, self.lifter, columns, step=lambda m, f=f: self.step(f"AI: liftover {f.name}: {m}"))
+            if "error" in res:
+                return res
+            self.lifted[str(f.relative_to(self.root))] = res
+            for k in ("rows", "lifted", "dropped", "minus_strand"):
+                out[k] += res[k]
+        out |= {"share": round(out["lifted"] / out["rows"], 4) if out["rows"] else 0.0,
+                "next": "add_rsid, then validate again; submit with genome_build GRCh38"}
+        self.validated.pop(file_path.strip(), None)  # the file changed
+        return out
+
     def note_location(self, url: str, status: str, note: str) -> dict[str, Any]:
         self.location(url, status=status if status in ("listed", "direct", "downloaded", "manual", "error",
                                                          "not_data", "duplicate") else "listed", note=note[:400])
@@ -952,15 +994,24 @@ def check_submission(s: Session, sub: dict[str, Any]) -> tuple[list[dict[str, An
 
         build = str(raw.get("genome_build") or "").strip()
         build = {"hg38": "GRCh38", "hg19": "GRCh37"}.get(build.lower(), build)
-        seen = rules.build_from_text(row["file_path"] + " " + " ".join((v or {}).get("header", [])))
+        lifted = [s.lifted[f] for f in (v or {}).get("files") or [] if f in s.lifted]
+        seen = "" if lifted else rules.build_from_text(row["file_path"] + " " + " ".join((v or {}).get("header", [])))
         gb = checked("genome_build", build, needed=not seen)
-        if seen:
+        if lifted:
+            n, kept = sum(x["rows"] for x in lifted), sum(x["lifted"] for x in lifted)
+            gb.update(value="GRCh38", note=f"lifted over from GRCh37 (UCSC hg19ToHg38 chain): {kept:,} of {n:,} "
+                      f"variants kept, {n - kept:,} without a GRCh38 position dropped; GRCh37 coordinates kept "
+                      "in chrom_grch37 / pos_grch37")
+            build = "GRCh38"
+        elif seen:
             build = seen
             gb.update(value=seen, verified=True, source="file path or header")
         elif build not in ("GRCh38", "GRCh37") or not gb["verified"]:
             issues.append("genome_build_unknown")
         if build == "GRCh37":
             issues.append("needs_liftover")
+            problems.append(f"{tag}: the coordinates are GRCh37; call liftover on {row['file_path']!r}, then "
+                            "add_rsid and validate again")
 
         mode = row["gene_id_mode"]
         if row["qtl_type"] in rules.GENE_QTL_TYPES and mode not in ("self", "phenotype_last_segment"):
@@ -1210,7 +1261,8 @@ async def dispatch(s: Session, name: str, args: dict[str, Any]) -> dict[str, Any
         return {"accepted": True}
     fn = {"read_paper": s.read_paper, "open_url": s.open_url, "list_files": s.list_files, "peek_file": s.peek_file,
           "download": s.download, "inspect_local": s.inspect_local, "run_python": s.run_python,
-          "validate": s.validate, "add_rsid": s.add_rsid, "note_location": s.note_location}.get(name)
+          "validate": s.validate, "liftover": s.liftover, "add_rsid": s.add_rsid,
+          "note_location": s.note_location}.get(name)
     if fn is None:
         return {"error": f"no tool {name!r}"}
     s.step(f"AI: {name} {short(args)[:100]}")

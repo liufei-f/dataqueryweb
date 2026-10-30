@@ -106,6 +106,15 @@ curl -C - -O https://ftp.ncbi.nih.gov/snp/latest_release/VCF/GCF_000001405.40.gz
 The build's `add_rsid` tool (`dbsnp.py`) matches chrom, position, ref and alt (alleles also tried
 swapped) through the tabix index; a variant dbSNP does not hold keeps an empty rs id.
 
+GRCh37/hg19 tables are converted to GRCh38 before that by the build's `liftover` tool
+(`liftover.py`, pyliftover) with UCSC's chain file, kept at
+`data/reference/liftover/hg19ToHg38.over.chain.gz` (or `$LIFTOVER_CHAIN`):
+
+```bash
+mkdir -p data/reference/liftover && cd data/reference/liftover
+curl -O https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz
+```
+
 The result is kept in this repository: `manifest/qtl_manifest.tsv` (approved rows, the 27 manifest
 columns) and `manifest/qtl_manifest_candidates.tsv` (every row with status and evidence), both rewritten
 from the database on every change. LocusCompare's manifest is used as a reference for dataset names and

@@ -25,6 +25,7 @@
 | `download` | 下载到 `data/<记录编号>/`，断点续传，受每篇上限和磁盘剩余空间限制；别的论文下过的同一 URL 直接复用（`data/.downloads.json`） |
 | `inspect_local` | 看已下载文件或压缩包成员的前几行、文件夹或压缩包的内容 |
 | `run_python` | LLM 写 Python 处理数据，生成 `<原名>_processed.tsv.gz`；在数据集文件夹里运行，无网络（`unshare -n`）、无 API key、有时间上限；出现联网、子进程、删除文件、读环境变量、绝对路径等写法的代码直接拒绝执行；脚本保存在 `data/.agent_scripts/<record_id>/` |
+| `liftover` | 把 GRCh37/hg19 的处理后表格（`<原名>_processed.tsv.gz`）原地转成 GRCh38：用 UCSC 的 `hg19ToHg38.over.chain.gz`（`data/reference/liftover/`，所有论文共用）逐个转换位置；落到负链的变异 ref/alt 取互补碱基；重建 `variant_id`；原来的 GRCh37 坐标保存在 `chrom_grch37`、`pos_grch37` 两列；转不过去或转到别的染色体的变异删掉。每个文件只能转一次，必须在 `add_rsid` 之前。提交时 genome_build 记为 GRCh38，证据里写明从 GRCh37 转换、保留了多少变异。GRCh37 的行没转换就提交会被退回 |
 | `add_rsid` | 给处理后的表（`<原名>_processed.tsv.gz`）补 rsID：用本地的 NCBI dbSNP（GRCh38，build 157，`data/reference/dbsnp/GCF_000001405.40.gz` 及其 tabix 索引，所有论文共用）按 chrom、pos、ref、alt 精确匹配，匹配不上时再试 ref/alt 互换；dbSNP 里没有的变异 rsID 留空，不猜、不借用相邻位置。表里已有的 rsID 保留。只适用于 GRCh38 坐标。LLM 不能自己下载 dbSNP 或其他参考数据 |
 | `validate` | 按导入脚本的方式（`pandas.read_csv`，manifest 的分隔符和列名）读文件前 2 万行，逐列检查数值；**格式必须每一行都对**：染色体和位置只能是数字（`1`，不能是 `chr1`），ref/alt 大写，variant id 写成 `chr<chrom>_<pos>_<ref>_<alt>` 用下划线连接、带 `chr` 前缀（`chr1_12345_A_G`）且和这四列一致，`variant_id_col` 必填；`rsid_col` 必填，值只能是 `rs<数字>` 或空；还检查导入脚本过滤后保留的比例、gene id / caQTL peak id 格式 |
 | `note_location` | 记录某个数据位置的结论（需要人工、打不开、不是数据……） |
@@ -242,7 +243,8 @@ dataqueryweb-manifest export --out approved.tsv --scope approved --format manife
 
 ## 9. 已知局限
 
-- 不做 liftover（GRCh37 → GRCh38）、不补 peak 坐标、不把 UniProt 等编号换成 Ensembl：这些行下载处理后仍是 `needs_processing` 或 `needs_review`。
+- LLM build 会把 GRCh37 转成 GRCh38（`liftover`）；不用 LLM 的 build（`--no-llm`）不转，仍标 `needs_liftover`。
+- 不补 peak 坐标、不把 UniProt 等编号换成 Ensembl：这些行下载处理后仍是 `needs_processing` 或 `needs_review`。
 - 不处理 xlsx 表格文件（补充材料默认也不下载）。
 - 大数据集下载很慢、很占空间：TenK10K 一篇约 1.2 TB，Zenodo 实测约 3 MB/s。超过上限的行要在磁盘够大的机器上提高上限再跑。
 - 下载和处理在网页服务的进程里进行；服务重启会中断，重跑时已下载完的文件不再下载，`.part` 会续传。

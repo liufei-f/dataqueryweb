@@ -1,7 +1,7 @@
 ---
 name: build-manifest
 description: The fixed procedure the manifest agent (src/backend/dataqueryweb/agent.py) follows to turn one saved record into LocusCompare qtl_manifest rows — read the paper, inventory every data location, choose the full summary-statistics tables, download, process, validate, submit. agent.py puts this file into the system prompt of every build; edit it here to change how the LLM works.
-version: 2026-10-27
+version: 2026-10-28
 ---
 
 # Build manifest: one paper → manifest rows
@@ -349,6 +349,29 @@ for src in sorted(glob.glob("eqtl/chr*.txt.gz")):
 **Check:** inspect_local on one processed file shows `chrom` like `1`, `pos` digits,
 upper-case `ref`/`alt` and `variant_id` like `chr1_12345_A_G`.
 
+## Phase 5a: GRCh37 → GRCh38 (liftover)
+
+Every row is delivered on GRCh38. Establish the build of each table's coordinates first: a
+build named in the file name or header (`hg19`, `b37`, `GRCh37`), the README, or the paper's
+methods (search `GRCh37|hg19|GRCh38|hg38|imputation|reference panel`). When the build is
+GRCh37/hg19, call liftover on the processed table:
+
+- `file_path`: the processed table (`<name>_processed.tsv.gz`; a `chr*` glob for split files)
+- `columns`: its `chrom_col`, `position_col`, `ref_col`, `alt_col`, `variant_id_col`
+
+liftover converts each position with UCSC's hg19ToHg38 chain (local copy), complements the
+alleles of variants that land on the minus strand, rebuilds `variant_id` on GRCh38, keeps the
+GRCh37 coordinates as `chrom_grch37` / `pos_grch37`, and drops variants with no GRCh38
+position on the same chromosome. Run it once per file (a second run is refused), before
+add_rsid. Never convert coordinates in your own Python and never download a chain file.
+
+Submit the row with `genome_build: GRCh38` and the quote that names the source build
+(GRCh37); report the share kept (`lifted` / `rows`) in the row's note. When the build cannot
+be established, do not lift over; say so in the note.
+
+**Check:** inspect_local shows `pos` changed, `chrom_grch37` / `pos_grch37` holding the old
+coordinates, and `variant_id` matching the new `pos`.
+
 ## Phase 5b: Fill the rs ids (add_rsid)
 
 Every submitted table carries an rs id column. When the processed table has none, or some of
@@ -361,9 +384,8 @@ its rs ids are empty, call add_rsid on it:
 add_rsid looks each variant up in the local copy of NCBI dbSNP for GRCh38 (build 157) by
 chromosome, position, ref and alt, also trying the alleles swapped. A variant dbSNP does not
 hold keeps an empty rs id: never invent one, never copy one from a nearby position. It works
-on GRCh38 coordinates only; for a GRCh37 table leave the rs ids as the file has them and say
-so in the note. Never download dbSNP or any other reference yourself. If add_rsid answers
-that the reference is not in place, leave the column out and say so in the note.
+on GRCh38 coordinates only, so a GRCh37 table goes through liftover (phase 5a) first. Never
+download dbSNP or any other reference yourself. If add_rsid answers that the reference is not in place, leave the column out and say so in the note.
 
 Report the share it found (`with_rsid` / `rows`) in the row's note.
 
@@ -405,7 +427,8 @@ One row per (qtl_type, context). Before calling submit, check every row against 
       `publication` is https://doi.org/<doi>
 - [ ] every table found but not used is in skipped_tables with its reason
 - [ ] `summary` says in two or three sentences what was loaded, what was skipped and what a
-      person must still do (manual locations, liftover, non-Ensembl ids)
+      person must still do (manual locations, non-Ensembl ids)
+- [ ] every row is on GRCh38: a GRCh37 table went through liftover
 
 If submit returns problems, fix only those and submit again (at most 3 rounds).
 

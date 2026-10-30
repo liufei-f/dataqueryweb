@@ -279,3 +279,34 @@ def test_a_run_waits_for_the_usage_limit_and_resumes(tmp_path: Path, monkeypatch
     batch = manifest.Batch([{"record_id": 1, "publication_title": "A"}, {"record_id": 2, "publication_title": "B"}], store)
     asyncio.run(batch.run())
     assert calls == [1, 1, 2] and FakeJudge.pings == 2 and batch.state == "done" and batch.done == 2
+
+
+def fake_chain(root: Path) -> None:
+    """A UCSC-style chain under root/reference/liftover: chr1 shifted by +1000, chr2 onto the minus strand."""
+    from dataqueryweb import liftover
+
+    chain = liftover.chain_path(root)
+    chain.parent.mkdir(parents=True)
+    with gzip.open(chain, "wt") as f:
+        f.write("chain 1000 chr1 249250621 + 10000 20000 chr1 248956422 + 11000 21000 1\n10000\n\n"
+                "chain 1000 chr2 243199373 + 0 1000 chr2 242193529 - 500 1500 2\n1000\n\n")
+
+
+def test_liftover_moves_grch37_tables_to_grch38(tmp_path: Path) -> None:
+    fake_chain(tmp_path)
+    table = tmp_path / "x/eqtl_processed.tsv.gz"
+    table.parent.mkdir()
+    pd.DataFrame({"chrom": ["1", "2", "3"], "pos": ["10177", "5", "100"], "ref": ["A", "C", "G"],
+                  "alt": ["C", "T", "A"], "variant_id": ["chr1_10177_A_C", "chr2_5_C_T", "chr3_100_G_A"],
+                  "pvalue": ["0.1", "0.2", "0.3"]}).to_csv(table, sep="\t", index=False)
+    s = session(tmp_path)
+    cols = {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt", "variant_id_col": "variant_id"}
+    out = s.liftover("x/eqtl_processed.tsv.gz", cols)
+    assert (out["rows"], out["lifted"], out["dropped"], out["minus_strand"]) == (3, 2, 1, 1)
+    df = pd.read_csv(table, sep="\t", dtype=str)
+    assert df["pos"].tolist()[0] == "11177" and df["variant_id"].tolist()[0] == "chr1_11177_A_C"
+    assert df[["ref", "alt"]].values.tolist()[1] == ["G", "A"]  # minus strand: complemented
+    assert df["variant_id"].tolist()[1] == f"chr2_{df['pos'][1]}_G_A"
+    assert df[["chrom_grch37", "pos_grch37"]].values.tolist() == [["1", "10177"], ["2", "5"]]
+    assert "x/eqtl_processed.tsv.gz" in s.lifted
+    assert "lifted over before" in s.liftover("x/eqtl_processed.tsv.gz", cols)["error"]
