@@ -4,19 +4,23 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}DataQuery{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:opsz,wght@6..144,1..1000&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" />
   <link rel="stylesheet" href="/static/css/base.css?v={{ asset_version() }}" />
   {% block head %}{% endblock %}
 </head>
 <body>
   <header class="site-header">
-    <div class="brand">
+    <a class="brand" href="/" aria-label="DataQuery home">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
         <circle cx="10.5" cy="10.5" r="7" stroke="currentColor" stroke-width="1.5"></circle>
         <circle cx="10.5" cy="10.5" r="2.2" fill="currentColor"></circle>
         <line x1="15.6" y1="15.6" x2="21" y2="21" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></line>
       </svg>
       <span>Data<span class="accent">Query</span></span>
-    </div>
+    </a>
     <nav class="site-nav">
       <a href="/" class="{{ 'active' if active == 'search' else '' }}">Find QTL data</a>
       <a href="/records" class="{{ 'active' if active == 'records' else '' }}">Saved records</a>
@@ -24,7 +28,7 @@
       <a href="/checked" class="{{ 'active' if active == 'checked' else '' }}">AI-checked papers</a>
       <a href="/about" class="{{ 'active' if active == 'about' else '' }}">How it works</a>
     </nav>
-    <span class="version">v{{ version }}</span>
+    <span class="version">v1</span>
   </header>
 
   <div class="page">
@@ -32,7 +36,10 @@
   </div>
 
   <footer class="site-footer">
-    DataQuery v{{ version }} &middot; literature via Europe PMC &middot; companion to LocusView
+    <div class="site-footer-inner">
+      <span class="site-footer-brand">Data<span>Query</span></span>
+      <span>v1</span>
+    </div>
   </footer>
 </body>
 </html>

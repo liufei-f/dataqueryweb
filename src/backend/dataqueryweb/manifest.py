@@ -640,6 +640,16 @@ CREATE TABLE IF NOT EXISTS manifest_runs (
     note TEXT NOT NULL DEFAULT '',
     at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS manifest_build_chat (
+    message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_id INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS manifest_build_chat_record
+    ON manifest_build_chat (record_id, message_id);
 """
 REVIEWS = ("pending", "approved", "rejected")
 # Extra columns of the review export, after the manifest's own 27.
@@ -708,6 +718,40 @@ class ManifestStore:
                 yield db
         finally:
             db.close()
+
+    def chat_messages(self, record_id: int) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT role, content, model, created_at FROM manifest_build_chat "
+                "WHERE record_id = ? ORDER BY message_id",
+                [record_id],
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def save_chat_message(self, record_id: int, role: str, content: str, model: str = "") -> None:
+        if role not in ("user", "assistant"):
+            raise ValueError("role must be user or assistant")
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO manifest_build_chat (record_id, role, content, model, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [record_id, role, content, model, datetime.now(UTC).isoformat(timespec="seconds")],
+            )
+
+    def build_chat_context(self, record_id: int, max_chars: int = 30000) -> list[dict[str, str]]:
+        """The recent curator/LLM discussion to seed the next build; retain whole messages."""
+        messages = self.chat_messages(record_id)
+        kept: list[dict[str, str]] = []
+        used = 0
+        for message in reversed(messages):
+            content = str(message["content"])
+            if kept and used + len(content) > max_chars:
+                break
+            if not kept and len(content) > max_chars:
+                content = content[-max_chars:]
+            kept.append({"role": message["role"], "content": content})
+            used += len(content)
+        return list(reversed(kept))
 
     def save_run(
         self, record_id: int, rows: list[dict[str, Any]], reports: list[dict[str, Any]],
@@ -965,8 +1009,18 @@ async def build_with_agent(
 ) -> dict[str, Any]:
     """The LLM investigates, downloads, processes and fills the rows itself (agent.py)."""
     rid = record["record_id"]
+    record = dict(record)
+    record["_build_chat"] = store.build_chat_context(rid)
+    record["_previous_run"] = store.runs().get(rid, {})
     step("reading the paper")
     paper = await read_paper(record)
+    # Bibliographic metadata belongs to the saved paper, not individual manifest rows.
+    if paper and paper.journal and not record.get("journal"):
+        saved = records.RecordStore(store.path)
+        with saved._connect() as db:
+            db.execute("UPDATE records SET journal = ? WHERE record_id = ? AND COALESCE(journal, '') = ''",
+                       [paper.journal, rid])
+        record["journal"] = paper.journal
     previous = []
     for r in store.rows(rid):
         d = r["evidence"].get("data") or {}
@@ -984,6 +1038,9 @@ async def build_with_agent(
     step("saving")
     note = out["note"] or ("" if rows else f"no row: {out['summary'][:300]}")
     store.save_run(rid, rows, out["reports"], model=out["model"], tokens=usage["total_tokens"], run_note=note)
+    if out.get("audit_path"):
+        with Path(out["audit_path"]).open("a", encoding="utf-8") as audit_file:
+            audit_file.write(f"\n## Manifest saved\n\nRecord: {rid}; manifest rows: {len(rows)}; tokens: {usage['total_tokens']}.\n")
     statuses: dict[str, int] = {}
     data_states: dict[str, int] = {}
     for r in rows:
@@ -1150,6 +1207,76 @@ class Batch:
                 self.log.append({"record_id": current["record_id"], "ok": True,
                                  "text": f"#{current['record_id']}: the LLM answers again; resuming"})
                 return
+
+
+_SerialBatch = Batch
+
+
+class Batch(_SerialBatch):
+    """Bounded parallel papers; each paper retains its own judge and progress."""
+
+    concurrency = 2
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._next = 0
+        self._children: list[_SerialBatch] = []
+
+    def add(self, todo: list[dict[str, Any]]) -> int:
+        have = {r["record_id"] for r in self.todo}
+        new = []
+        for record in todo:
+            if record["record_id"] not in have:
+                new.append(record)
+                have.add(record["record_id"])
+        self.todo.extend(new)
+        return len(new)
+
+    def queued(self) -> list[int]:
+        return [r["record_id"] for r in self.todo[self._next:]] if self.running else []
+
+    def snapshot(self) -> dict[str, Any]:
+        self.done = sum(c.done for c in self._children)
+        self.failed = sum(c.failed for c in self._children)
+        self.rows = sum(c.rows for c in self._children)
+        self.tokens = sum(c.tokens for c in self._children)
+        self.log = [entry for c in self._children for entry in c.log]
+        active = [c.current for c in self._children if c.running and c.current]
+        self.current = active[0] if active else None
+        return {**super().snapshot(), "active": active, "concurrency": self.concurrency}
+
+    async def run(self, echo: Callable[[str, bool], None] | None = None) -> None:
+        async def worker() -> None:
+            while not self.cancel.is_set():
+                if self._next >= len(self.todo):
+                    # Keep an idle slot alive while another paper is running, so a
+                    # later Build click can immediately use the second slot.
+                    if any(child.running for child in self._children):
+                        await asyncio.sleep(0.25)
+                        continue
+                    break
+                record = self.todo[self._next]
+                self._next += 1
+                child = _SerialBatch([record], self.store, no_llm=self.no_llm,
+                                     include_supplements=self.include_supplements,
+                                     target=self.target, data=self.data, record_store=self.record_store)
+                child.cancel = self.cancel
+                self._children.append(child)
+                await child.run(echo)
+
+        workers = [asyncio.create_task(worker()) for _ in range(self.concurrency)]
+        try:
+            await asyncio.gather(*workers)
+            self.state = "done"
+        except asyncio.CancelledError:
+            self.cancel.set()
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            self.state = "stopped"
+        finally:
+            self.finished = datetime.now().astimezone().isoformat(timespec="seconds")
+            self.snapshot()
 
 
 async def run(args: argparse.Namespace) -> int:

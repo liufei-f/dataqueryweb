@@ -6,6 +6,11 @@
   let data = { rows: [], locations: [], records: {}, built: [], issues: {}, columns: [], role_columns: [] };
   const open = new Set(); // rows whose evidence is shown
   const reviewDrafts = new Map();
+  const chatMessages = new Map();
+  const chatDrafts = new Map();
+  const chatLoaded = new Set();
+  const chatLoading = new Set();
+  let chatAvailable = null;
   const openPapers = new Set(); // papers whose rows are shown
   let job = null; // the server's build queue, polled while it runs
 
@@ -120,21 +125,30 @@
   }
 
   function detail(r) {
-    const issues = r.issues.map((i) => `<li><code>${esc(i)}</code> — ${esc(data.issues[i] || "")}</li>`).join("");
-    const files = r.file_urls.slice(0, 4).map((u) => `<a class="rec-url" href="${esc(safeUrl(u))}" target="_blank" rel="noopener">${esc(u)}</a>`).join("<br>");
+    const d = r.evidence.data || {};
+    const processed = d.status === "processed";
+    const table = d.preview?.columns?.length ? d.preview : r.evidence.table || {};
+    const previewLabel = processed ? "Processed file — first 5 rows" : "Downloaded file — first 5 rows";
+    const aliases = {biocontext: "context", level_1_context: "context", level_2_context: "context"};
+    const fields = data.columns.map(field => {
+      const e = r.evidence[field] || r.evidence[aliases[field]] || {};
+      const mapping = (data.role_columns || []).includes(field);
+      const reason = [e.note, e.quote && `Evidence: ${e.quote}`, e.source && `Source: ${e.source}`].filter(Boolean).join(" · ")
+        || (mapping && r[field] ? `Read column ${r[field]} from the validated output file.`
+          : r[field] === "" || r[field] == null ? "Not provided. Verify whether this field is required."
+          : "No field-specific reason recorded; verify against the paper and file.");
+      return `<tr><th scope="row">${esc(field)}</th><td><input class="dq-input" data-field="${esc(field)}" aria-label="${esc(field)}" value="${esc(r[field])}"></td><td>${esc(reason)}</td></tr>`;
+    }).join("");
     return `<tr class="mf-detail" data-id="${r.row_id}"><td colspan="10">
-      <div class="mf-grid">
-        <div><h3>Evidence</h3>${evidenceTable(r)}
-          ${r.llm_note ? `<p class="rec-sub">AI note: ${esc(r.llm_note)}</p>` : ""}
-          <h3>Issues</h3>${issues ? `<ul class="mf-issues">${issues}</ul>` : '<p class="muted">None.</p>'}</div>
-        <div><h3>Columns</h3>${columnTable(r)}</div>
-      </div>
-      <h3>Data</h3>${dataSection(r)}
-      ${agentSection(r)}
-      <h3>Source file <span class="rec-sub">${esc(r.source_path)} · ${r.n_files} file${r.n_files > 1 ? "s" : ""}${r.file_size ? ` · ${size(r.file_size)}` : ""}</span></h3>
-      ${preview(r)}<p>${files}${r.file_urls.length > 4 ? `<span class="rec-sub"> … ${r.file_urls.length - 4} more</span>` : ""}</p>
-      <h3>Correct and decide</h3>
-      <div class="mf-edit">${EDITABLE.map((f) => `<label>${f}<input class="dq-input" data-field="${f}" value="${esc(r[f])}"></label>`).join("")}</div>
+      <h3>${previewLabel}</h3>
+      <p class="rec-sub">${esc(r.file_path || r.source_path)}</p>
+      ${table.columns?.length ? sampleTable(table) : '<p class="muted">No saved file preview available.</p>'}
+      ${(table.rows || []).length < 5 ? '<p class="rec-sub">This build saved fewer than 5 preview rows. A new build will retain up to 5.</p>' : ""}
+      ${processed ? '<p class="rec-sub">This preview is from the converted output. A separate original-file preview was not retained by this build.</p>' : ""}
+      <h3>Correct and decide — manifest values</h3>
+      <div class="table-wrap"><table class="mf-ev"><thead><tr><th>Manifest column</th><th>Value to export</th><th>Note / reason</th></tr></thead><tbody>${fields}</tbody></table></div>
+      ${r.llm_note ? `<p class="rec-sub"><strong>Build note:</strong> ${esc(r.llm_note)}</p>` : ""}
+      ${r.issues.length ? `<p class="rec-sub"><strong>Checks to resolve:</strong> ${r.issues.map(i => esc(data.issues[i] || i)).join("; ")}</p>` : ""}
       <div class="mf-actions">
         <textarea class="rec-note mf-note" placeholder="Reviewer note…">${esc(r.reviewer_note)}</textarea>
         <button type="button" class="rec-btn" data-act="save">Save changes</button>
@@ -213,6 +227,55 @@
       ${inv ? `<table class="mf-ev"><thead><tr><th>File</th><th></th><th>Size</th><th>Holds</th><th>Why</th></tr></thead><tbody>${inv}</tbody></table>` : '<p class="muted">Nothing was listed here.</p>'}</details>`;
   }
 
+  function buildChatHtml(id) {
+    if (chatAvailable === false) return "";
+    const messages = chatMessages.get(id) || [];
+    const transcript = messages.map((m) => "<article class=\"mf-chat-message mf-chat-" + esc(m.role) + "\"><strong>" +
+      (m.role === "user" ? "You" : "AI") + (m.model ? " · " + esc(m.model) : "") + "</strong><div>" +
+      esc(m.content) + "</div></article>").join("");
+    const draft = chatDrafts.get(id) || "";
+    return "<section class=\"mf-build-chat\" data-chat-panel=\"" + id + "\"><h3>Build conversation</h3>" +
+      "<p class=\"rec-sub\">Paste a registration email, README text, URL, or local-file detail. The AI can discuss it here; " +
+      "this conversation is saved and included the next time you build this paper.</p>" +
+      "<div class=\"mf-chat-history\" aria-live=\"polite\">" + (transcript || "<p class=\"muted\">No messages yet.</p>") + "</div>" +
+      "<label class=\"mf-chat-label\" for=\"mf-chat-input-" + id + "\">Message to the build AI</label>" +
+      "<textarea id=\"mf-chat-input-" + id + "\" class=\"dq-input mf-chat-input\" data-chat-input=\"" + id + "\" rows=\"5\" " +
+      "placeholder=\"Paste the relevant email or documentation here.\">" + esc(draft) + "</textarea>" +
+      "<div class=\"mf-chat-actions\"><button type=\"button\" class=\"rec-btn mf-chat-send\" data-chat-send=\"" + id + "\" " +
+      (chatLoading.has(id) ? "disabled" : "") + ">" + (chatLoading.has(id) ? "Waiting for AI…" : "Send to AI") + "</button>" +
+      "<button type=\"button\" class=\"rec-btn primary mf-chat-build\" data-chat-build=\"" + id + "\" " +
+      (messages.some((m) => m.role === "user") ? "" : "disabled") + ">Continue build with this context</button></div>" +
+      "<p class=\"rec-sub\">Continuing starts a build for this paper only. The build agent will verify the provided details " +
+      "and reuse files already in its data folder.</p></section>";
+  }
+
+  document.addEventListener("focusin", e => {
+    const input = e.target.closest("[data-chat-input]");
+    if (!input) return;
+    const id = +input.dataset.chatInput;
+    if (chatLoaded.has(id) || chatLoading.has(id)) return;
+    loadChat(id).then(() => {
+      const replacement = document.getElementById(`mf-chat-input-${id}`);
+      replacement?.focus({preventScroll: true});
+      if (replacement) replacement.setSelectionRange(replacement.value.length, replacement.value.length);
+    });
+  });
+
+  async function loadChat(id) {
+    if (chatLoaded.has(id) || chatLoading.has(id)) return;
+    chatLoading.add(id);
+    try {
+      const response = await fetch("/api/manifest/" + id + "/chat");
+      const result = await response.json();
+      if (response.status === 404) { chatAvailable = false; return; }
+      if (!response.ok) throw new Error(result.detail || "Could not load conversation");
+      chatAvailable = true;
+      chatMessages.set(id, result.messages || []);
+      chatLoaded.add(id);
+    } catch (error) { console.error(error); }
+    finally { chatLoading.delete(id); refreshPaper(id); }
+  }
+
   // ---- papers: one line each, with Build manifest and Check ----
   const $ = (id) => document.getElementById(id);
   const show = $("mf-show"), human = $("mf-human"), runbar = $("mf-runbar"), runStatus = $("mf-run-status"), stopBtn = $("mf-stop");
@@ -227,7 +290,7 @@
     if ((data.records[id] || {}).qtl_review === "not_qtl") return "excluded";
     if ((data.records[id] || {}).already_exists && !isBuilt(id)) return "exists";
     if (job && job.state === "running") {
-      if (job.current && job.current.record_id === id) return "building";
+      if ((job.active || [job.current]).some(c => c && c.record_id === id)) return "building";
       if ((job.queue || []).includes(id)) return "queued";
     }
     return isBuilt(id) ? "built" : "unbuilt";
@@ -326,7 +389,8 @@
 
   function dataResult(id) {
     const state = followUp(id), st = stateOf(id), run = (data.runs || {})[id] || {};
-    if (!state.good.length && ["building", "queued"].includes(st)) state.label = "Pending";
+    if (!state.good.length && st === "queued") state.label = "Queued — build not started";
+    else if (!state.good.length && st === "building") state.label = "Building — result not yet available";
     else if (!state.good.length && run.outcome === "stopped") state.label = "Stopped";
     else if (!state.good.length && run.outcome === "usage_limit") state.label = "Waiting for AI quota";
     else if (!state.good.length && st === "exists") state.label = "In reference manifest";
@@ -337,19 +401,35 @@
     return state;
   }
 
+  function humanBottlenecks(state) {
+    const actions = {
+      request: "Open the access page, submit the application, then paste the access instructions into the conversation.",
+      browser: "Open the source page in your browser, download the required files, and provide their server paths in the conversation.",
+      limit: "Review the reported file size and download limit before approving a larger download or providing the files.",
+    };
+    return state.reasons.filter(r => ManifestStatus.human.has(r.kind)).map(r => {
+      const urls = unique([r.what, ...(String(r.why || "").match(/https?:\/\/[^\s<>"']+/g) || [])]
+        .map(u => String(u || "").replace(/[),.;\]]+$/, ""))).filter(u => safeUrl(u) !== "#" && /^https?:\/\//i.test(u));
+      return `<div class="rec-sub mf-why"><strong>Needs you — Bottleneck:</strong> ${esc(r.why)}
+        <div><strong>Your next step:</strong> ${esc(actions[r.kind])}</div>
+        ${urls.map(u => `<div><a href="${esc(safeUrl(u))}" target="_blank" rel="noopener">${esc(u)}</a></div>`).join("")}
+        ${!urls.length && r.kind === "request" ? '<div>Access request URL was not recorded; it still needs verification.</div>' : ""}</div>`;
+    }).join("");
+  }
+
   function resultOf(id) {
     const state = dataResult(id);
     const cls = state.complete ? "mf-d-ok" : ["network", "software"].includes(state.kinds[0]) ? "mf-d-bad" : "mf-d-warn";
     return `<span class="badge ${cls}">${esc(state.label)}</span>
       ${state.good.length ? `<div class="rec-sub">${state.good.length}/${state.rows.length} rows downloaded or processed</div>` : ""}
       ${state.partial ? '<div class="rec-sub">Partial statistics only; full data not ready</div>' : ""}
-      ${needsBadge(id, state.label)}`;
+      ${needsBadge(id, state.label)}${humanBottlenecks(state)}`;
   }
 
   const columnFilters = {};
   const COLUMNS = [
     ["index", "Paper index"], ["paper", "Paper / URL"], ["journal", "Journal"], ["data_url", "Data URL"],
-    ["qtl", "QTL type(s)"], ["context", "Context"], ["build", "Build status"], ["result", "Data result / success"],
+    ["qtl", "QTL type(s)"], ["context", "Context"], ["sample_size", "Sample size"], ["build", "Build status"], ["result", "Data result / success"],
     ["files", "Files / rows"], ["review", "Review"], ["human", "Human decision"], ["date", "Last build"], ["actions", "Actions"],
   ];
   function dataUrls(id) {
@@ -374,6 +454,7 @@
       data_url: dataUrls(id).join(" "),
       qtl: [p.qtl_type, ...rows.map((r) => r.qtl_type)].join(" "),
       context: [p.qtl_context, ...rows.map((r) => [r.biocontext, r.level_1_context, r.level_2_context].join(" "))].join(" "),
+      sample_size: rows.map(r => [r.sample_size, r.biocontext].filter(Boolean).join(" ")).join(" "),
       files: `${rows.filter((r) => r.evidence.data?.status === "processed").length} processed ${rows.filter((r) => r.evidence.data?.status === "as_is").length} downloaded ${rows.length} candidate rows ` + rows.map((r) => r.file_path).join(" "),
       date: run?.at ? `${run.at} ${new Date(run.at).toLocaleString()}` : "",
     };
@@ -407,6 +488,13 @@
     return `<input type="search" class="dq-input mf-column-filter" ${attrs} value="${esc(columnFilters[key] || "")}" placeholder="${key === "date" ? "e.g. 2026-11-02" : "Filter…"}">`;
   }
 
+  function sampleSizeHtml(rows) {
+    const values = unique(rows.filter(r => r.sample_size !== null && r.sample_size !== undefined && String(r.sample_size).trim() !== "").map(r => `${r.sample_size}${r.biocontext ? ` (${r.biocontext})` : ""}`));
+    if (!values.length) return '<span class="muted">Unknown</span>';
+    const render = items => items.map(value => `<div>${esc(value)}</div>`).join("");
+    return render(values.slice(0, 3)) + (values.length > 3 ? `<details><summary>${values.length - 3} more contexts</summary>${render(values.slice(3))}</details>` : "");
+  }
+
   function headHtml(id) {
     const p = data.records[id] || {}, st = stateOf(id), rows = rowsOf(id), run = (data.runs || {})[id];
     const busy = st === "building" || st === "queued";
@@ -430,10 +518,15 @@
       <td>${esc(p.journal || p.preprint_server) || "—"}</td>
       <td class="mf-url-cell">${urlList || '<span class="muted">No data URL recorded</span>'}</td>
       <td>${esc(types) || "—"}</td><td class="mf-context-cell">${esc(contexts.slice(0, 3).join("; ")) || "—"}${contexts.length > 3 ? `<details><summary>${contexts.length - 3} more contexts</summary>${esc(contexts.slice(3).join("; "))}</details>` : ""}</td>
-      <td><strong>${esc(status)}</strong><div class="rec-sub">AI build: ${esc(aiStatus(id))}</div>${busy && job.current?.record_id === id ? `<div class="rec-sub">${esc(job.current.step || "starting")}</div>` : ""}${lastOutcome(id)}</td>
+      <td>${sampleSizeHtml(rows)}</td>
+      <td><strong>${esc(status)}</strong><div class="rec-sub">AI build: ${esc(aiStatus(id))}</div>${busy && (job.active || [job.current]).some(c => c?.record_id === id) ? `<div class="rec-sub">${esc((job.active || [job.current]).find(c => c?.record_id === id)?.step || "starting")}</div>` : ""}${lastOutcome(id)}</td>
       <td>${resultOf(id)}</td>
-      <td>${processed} processed<br>${downloaded} downloaded<div class="rec-sub">${rows.length} candidate rows</div></td>
-      <td>${rows.filter((r) => r.review === "approved").length} approved<div class="rec-sub">${toCheck} to review</div>${notReadyWhy(rows)}</td>
+      <td><span title="Unique registered source files present on the server; excludes generated outputs and unregistered manually copied files">Downloaded: ${data.downloaded_files?.[id] ?? "—"}</span><br>
+        <span title="Manifest rows ready to use without conversion">No need to process: ${downloaded}</span><br>
+        <span title="Manifest rows still requiring conversion, including failed processing attempts">Need to process: ${rows.filter(r => !["processed", "as_is"].includes(r.evidence.data?.status) && (r.status === "needs_processing" || r.evidence.data?.status === "processing_failed" || (r.issues || []).some(i => (data.processing || []).includes(i)))).length}</span><br>
+        <span title="Manifest rows whose conversion has completed">Processed: ${processed}</span>
+        <div class="rec-sub" title="Planned manifest data entries; a row can represent multiple files">Manifest rows: ${rows.length}</div></td>
+      <td>${rows.filter((r) => r.review === "approved").length} approved<div class="rec-sub">${toCheck} to review</div>${rows.length ? `<button type="button" class="rec-btn mf-review-rows" data-record="${id}">Review rows</button><div class="rec-sub">Check evidence, then Approve / Reject each row</div>` : '<div class="rec-sub">No manifest rows to review</div>'}${notReadyWhy(rows)}</td>
       <td class="mf-human-decision"><label class="rec-sub" for="mf-human-review-${id}">Curator classification</label>
         <select id="mf-human-review-${id}" class="dq-input mf-qtl-review" data-record="${id}">
           ${[["", "Not reviewed"], ["qtl", "QTL data"], ["not_qtl", "Not QTL data"], ["needs_recheck", "Needs recheck"]].map(([value, label]) => `<option value="${value}" ${reviewDraft.value === value ? "selected" : ""}>${label}</option>`).join("")}</select>
@@ -460,7 +553,7 @@
         <span class="rec-sub">Network and tool failures do not establish an access application requirement. Review the cause before retrying.</span></div>`
       : state.good.length ? '<p class="rec-sub">Data downloaded and processed. Review candidate rows below; failed alternate URLs remain in source history.</p>'
       : `<div class="mf-norows mf-nothing"><strong>No usable data found.</strong> Inspect source reports below.</div>`;
-    return `<div class="mf-paper-body">${curatorSection}${requestSection}${why}${locs.map((l) => locationHtml(l, !rows.length)).join("")}
+    return `<div class="mf-paper-body"><p><a class="rec-btn" href="/api/manifest/${id}/logs" target="_blank" rel="noopener">View / download build logs (.md)</a></p>${buildChatHtml(id)}${curatorSection}${requestSection}${why}${locs.map((l) => locationHtml(l, !rows.length)).join("")}
       ${rows.length ? `<div class="table-wrap"><table class="rec-table"><thead><tr><th>Status</th><th>Dataset</th><th>Context</th><th>Pop.</th><th>N</th><th>Build</th><th>File</th><th>Data</th><th>Issues</th><th></th></tr></thead>
         <tbody>${rows.map(rowHtml).join("")}</tbody></table></div>` : ""}</div>`;
   }
@@ -506,6 +599,70 @@
     $("mf-file-rows").textContent = mf ? `· ${plural(mf.rows, "row")}` : "";
   }
 
+  // Column widths the user dragged on the overview header, as % of the table, kept in this browser.
+  // The table always spans exactly the page width: dragging a column edge moves width between
+  // that column and its right-hand neighbour, so the total stays 100%.
+  const WIDTHS_KEY = "dq.manifest.columnWidthsPct";
+  const MIN_COL_PX = 48;
+  let columnWidths = {};
+  try { columnWidths = JSON.parse(localStorage.getItem(WIDTHS_KEY) || "{}") || {}; } catch { columnWidths = {}; }
+  try { localStorage.removeItem("dq.manifest.columnWidths"); } catch { /* old px widths, no longer used */ }
+  function saveColumnWidths() {
+    try { localStorage.setItem(WIDTHS_KEY, JSON.stringify(columnWidths)); } catch { /* storage unavailable */ }
+  }
+  function applyColumnWidths() {
+    const table = body.querySelector?.(".mf-overview");
+    if (!table) return;
+    const cols = table.querySelectorAll("colgroup col");
+    COLUMNS.forEach(([key], i) => {
+      const pct = columnWidths[key];
+      if (cols[i]) cols[i].style.width = pct ? `${pct}%` : "";
+    });
+  }
+  let resizing = null;
+  body.addEventListener("pointerdown", (e) => {
+    const handle = e.target.closest?.(".mf-col-resize");
+    if (!handle) return;
+    const key = handle.dataset.resize;
+    const i = COLUMNS.findIndex(([k]) => k === key);
+    if (i < 0 || i === COLUMNS.length - 1) return;
+    e.preventDefault();
+    const table = handle.closest("table");
+    const tableWidth = table.getBoundingClientRect().width;
+    // Snapshot every column as a percentage so dragging one pair leaves the rest in place.
+    const ths = [...table.querySelectorAll("thead tr:first-child th[data-col]")];
+    ths.forEach((th) => { columnWidths[th.dataset.col] = +(th.getBoundingClientRect().width / tableWidth * 100).toFixed(3); });
+    const next = COLUMNS[i + 1][0];
+    resizing = { key, next, startX: e.clientX, tableWidth, left: columnWidths[key], right: columnWidths[next] };
+    handle.setPointerCapture?.(e.pointerId);
+    document.body.classList.add("mf-col-resizing");
+    applyColumnWidths();
+  });
+  body.addEventListener("pointermove", (e) => {
+    if (!resizing) return;
+    const { key, next, startX, tableWidth, left, right } = resizing;
+    const minPct = MIN_COL_PX / tableWidth * 100;
+    const pair = left + right;
+    const newLeft = Math.min(pair - minPct, Math.max(minPct, left + (e.clientX - startX) / tableWidth * 100));
+    columnWidths[key] = +newLeft.toFixed(3);
+    columnWidths[next] = +(pair - newLeft).toFixed(3);
+    applyColumnWidths();
+  });
+  const endResize = () => {
+    if (!resizing) return;
+    resizing = null;
+    document.body.classList.remove("mf-col-resizing");
+    saveColumnWidths();
+  };
+  body.addEventListener("pointerup", endResize);
+  body.addEventListener("pointercancel", endResize);
+  body.addEventListener("dblclick", (e) => {
+    if (!e.target.closest?.(".mf-col-resize")) return;
+    columnWidths = {};
+    saveColumnWidths();
+    applyColumnWidths();
+  });
+
   function render() {
     const active = document.activeElement;
     const activeKey = active?.dataset?.columnFilter;
@@ -513,11 +670,12 @@
     const scroll = body.querySelector?.(".mf-overview-wrap")?.scrollLeft || 0;
     const ids = shownIds();
     updateCount(ids);
-    body.innerHTML = `<div class="table-wrap mf-overview-wrap"><table class="rec-table mf-overview" role="table" aria-label="Manifest papers"><colgroup>${COLUMNS.map(([key]) => `<col class="mf-col-${key}">`).join("")}</colgroup><caption class="muted">One row per paper. Column filters combine with each other and the filters above.</caption><thead><tr>
-      ${COLUMNS.map(([, label]) => `<th scope="col">${label}</th>`).join("")}
+    body.innerHTML = `<p class="muted mf-overview-note">One row per paper. Column filters combine with each other and the filters above.</p><div class="table-wrap mf-overview-wrap"><table class="rec-table mf-overview" role="table" aria-label="Manifest papers"><colgroup>${COLUMNS.map(([key]) => `<col class="mf-col-${key}">`).join("")}</colgroup><thead><tr>
+      ${COLUMNS.map(([key, label]) => `<th scope="col" data-col="${key}">${label}<span class="mf-col-resize" data-resize="${key}" title="Drag to resize · double-click to reset all columns" aria-hidden="true"></span></th>`).join("")}
       </tr><tr class="mf-column-filters">${COLUMNS.map(([key, label]) => `<th data-label="${esc(label)}">${columnFilterHtml(key, label)}</th>`).join("")}</tr></thead>
       ${ids.length ? ids.slice(0, limit).map(paperHtml).join("") : `<tbody><tr><td colspan="${COLUMNS.length}" class="rec-empty">No paper matches. Adjust or clear the filters above.</td></tr></tbody>`}</table></div>`
       + (ids.length > limit ? `<button type="button" class="rec-btn mf-more">Show ${Math.min(PAGE, ids.length - limit)} more (${ids.length - limit} not shown)</button>` : "");
+    applyColumnWidths();
     const wrap = body.querySelector?.(".mf-overview-wrap");
     if (wrap) wrap.scrollLeft = scroll;
     if (activeKey) {
@@ -578,8 +736,8 @@
     updateCount(shownIds());
     runbar.hidden = !running && !(job && END[job.state]);
     if (running) {
-      const c = job.current;
-      runStatus.textContent = `Building #${c ? c.record_id : "…"} ${c ? c.title.slice(0, 80) : ""}${c && c.step ? ` — ${c.step}` : ""}`
+      const active = job.active || (job.current ? [job.current] : []);
+      runStatus.textContent = active.map(c => `#${c.record_id} ${c.title.slice(0, 55)} — ${c.step || "starting"}`).join(" · ")
         + (job.queue.length ? ` · ${plural(job.queue.length, "paper")} queued` : "");
     } else if (job && END[job.state]) {
       runStatus.textContent = END[job.state];
@@ -618,6 +776,8 @@
   });
 
   body.addEventListener("input", (e) => {
+    const chatInput = e.target.closest(".mf-chat-input");
+    if (chatInput) { chatDrafts.set(+chatInput.dataset.chatInput, chatInput.value); return; }
     const edit = e.target.closest(".mf-qtl-review, .mf-qtl-review-note");
     if (edit) {
       const id = +edit.dataset.record, row = edit.closest(".mf-paper-head");
@@ -647,20 +807,56 @@
     } catch (err) { alert(err.message); button.disabled = false; }
   }
 
-  body.addEventListener("click", (e) => {
+  body.addEventListener("click", async (e) => {
     const reviewButton = e.target.closest(".mf-save-qtl-review");
     if (reviewButton) { saveQtlReview(reviewButton); return; }
+    const chatSend = e.target.closest(".mf-chat-send");
+    if (chatSend) {
+      const id = +chatSend.dataset.chatSend;
+      const input = body.querySelector(`[data-chat-input="${id}"]`);
+      const message = (input?.value || "").trim();
+      if (!message) { input?.focus(); return; }
+      chatLoading.add(id); chatDrafts.set(id, message); refreshPaper(id);
+      try {
+        const response = await fetch(`/api/manifest/${id}/chat`, {method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({message})});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Could not send message");
+        chatMessages.set(id, result.messages || []); chatLoaded.add(id); chatDrafts.delete(id);
+      } catch (error) { alert(error.message); }
+      finally { chatLoading.delete(id); refreshPaper(id); }
+      return;
+    }
+    const chatBuild = e.target.closest(".mf-chat-build");
+    if (chatBuild) {
+      const id = +chatBuild.dataset.chatBuild;
+      if (!confirm(`Continue the build for #${id} using the saved conversation? This may download and process data.`)) return;
+      chatBuild.disabled = true; await build([id]); return;
+    }
     if (e.target.closest(".mf-clear-columns")) {
       Object.keys(columnFilters).forEach((key) => delete columnFilters[key]);
       limit = PAGE; render(); return;
     }
     const b = e.target.closest(".mf-build");
     if (b) { b.disabled = true; build([+b.dataset.record]); return; }
+    const reviewRows = e.target.closest(".mf-review-rows");
+    if (reviewRows) {
+      const id = +reviewRows.dataset.record;
+      const rows = rowsOf(id);
+      const first = rows.find(r => r.review === "pending") || rows[0];
+      openPapers.add(id);
+      if (first) open.add(first.row_id);
+      refreshPaper(id);
+      if (first) body.querySelector(`.mf-paper[data-record="${id}"] .mf-detail[data-id="${first.row_id}"]`)?.scrollIntoView({behavior: "smooth", block: "start"});
+      loadChat(id);
+      return;
+    }
     const o = e.target.closest(".mf-open");
     if (o) {
       const id = +o.dataset.record;
       if (openPapers.has(id)) openPapers.delete(id); else openPapers.add(id);
       refreshPaper(id);
+      if (openPapers.has(id)) loadChat(id);
       return;
     }
     if (e.target.closest(".mf-more")) { limit += PAGE; render(); return; }

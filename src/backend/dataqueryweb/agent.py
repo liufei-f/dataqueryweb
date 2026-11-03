@@ -60,6 +60,7 @@ KEEP_FULL = 10  # the newest tool results kept whole
 CALL_TIMEOUT = 600.0
 VALIDATE_ROWS = 20000
 TRACE = bool(os.environ.get("MANIFEST_AGENT_TRACE"))  # print every tool call (debugging)
+_INDEX_LOCK = threading.Lock()
 INDEX_FILE = ".downloads.json"  # url → local file, shared by every paper
 SCRIPTS_DIR = ".agent_scripts"
 
@@ -157,7 +158,11 @@ type), underscores, no spaces. level_1_context: broad tissue group from {level_1
 covers whole blood, PBMC, immune cells, plasma, LCLs). level_2_context: cell type, \
 sub-region or cell type + condition (CD14_Mono, macrophage_IFNg); "" for a bulk tissue.
 - population: EUR, EAS, AFR, AMR, SAS, or ALL (multi-ancestry). sample_size: genotyped \
-donors in THIS context's QTL mapping (not cells, not samples before QC).
+donors in THIS context's QTL mapping (not cells, not samples before QC). Before submitting, \
+actively look for missing sample sizes in the full paper Methods, cohort/QC tables, supplements, \
+repository README and file headers. Different contexts may have different donor counts; do not \
+copy the overall study size into every row. If still unavailable, explicitly record which sources \
+were checked and why the context-specific sample size remains unknown in the row note and summary.
 - genome_build: GRCh38 or GRCh37 of the source file's coordinates, with a quote. Every row \
 is delivered on GRCh38: a GRCh37 table is converted with the liftover tool before add_rsid.
 - url: the landing page of the data. publication: https://doi.org/<doi>.
@@ -253,8 +258,10 @@ TOOLS: list[dict[str, Any]] = [
          "columns": {"type": "object", "description": "chrom_col, position_col, ref_col, alt_col and "
                      "variant_id_col of the table"}},
                     "required": ["file_path", "columns"]}},
+    {"name": "read_build_history", "description": "Read a previous build Markdown log or Python script for THIS paper. Use paths listed in the initial resume context. Reads up to 24,000 bytes; follow next_offset while more is true. offset=-1 reads the tail.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}}, "required": ["path"]}},
     {"name": "note_location", "description": "Record what a data location is: status one of listed, "
-     "downloaded, manual (a person must act: login, application, browser-only), error, not_data, duplicate.",
+     "downloaded, manual (a person must act: login, application, browser-only), error, not_data, duplicate. For manual status, note must explicitly explain the bottleneck, the exact action the person must take, the verified application/login/download page URL (also use it as url), and what instructions or local file paths they should provide so the build can resume. If the action URL is unknown, say it is unverified; never invent one. Network or processing errors alone are not evidence that human access is required.",
      "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "status": {"type": "string"},
                                                      "note": {"type": "string"}}, "required": ["url", "status", "note"]}},
     {"name": "submit", "description": "Finish with the manifest rows. Each row: the manifest fields, "
@@ -271,6 +278,52 @@ TOOLS: list[dict[str, Any]] = [
     {"name": "give_up", "description": "Finish without rows, saying why nothing can be loaded.",
      "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]}},
 ]
+
+
+
+class BuildAudit:
+    """Append each event immediately so an interrupted run keeps its history."""
+
+    def __init__(self, root: Path, record: dict[str, Any]) -> None:
+        from datetime import datetime, timezone
+        from uuid import uuid4
+        self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
+        self.path = root / ".build_logs" / str(record["record_id"]) / (self.run_id + ".md")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.secrets = [v for k, v in os.environ.items()
+                        if len(v) >= 8 and re.search(r"KEY|TOKEN|SECRET|PASSWORD", k, re.I)]
+        self.write("Build started", {"record_id": record["record_id"], "title": record.get("publication_title"),
+                                     "run_id": self.run_id})
+
+    def write(self, event: str, value: Any) -> None:
+        from datetime import datetime, timezone
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str, indent=2)
+        for secret in self.secrets:
+            text = text.replace(secret, "[REDACTED]")
+        text = re.sub(r"(?i)([?&](?:api[_-]?key|token|access_token|signature|password)=)[^&\s\"]+", r"\1[REDACTED]", text)
+        text = re.sub(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", text)
+        fence = "`" * max(3, max((len(m.group()) + 1 for m in re.finditer(r"`+", text)), default=3))
+        with self.lock, self.path.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n## {datetime.now(timezone.utc).isoformat(timespec='seconds')} — {event}\n\n{fence}text\n{text}\n{fence}\n")
+
+
+
+def build_history(root: Path, rid: int, current: Path | None = None) -> list[Path]:
+    files = list((root / ".build_logs" / str(rid)).glob("*.md"))
+    files += list((root / SCRIPTS_DIR / str(rid)).rglob("*.py"))
+    return sorted((p for p in files if p != current), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def history_excerpt(path: Path, offset: int = 0, limit: int = 24000) -> dict[str, Any]:
+    # Byte offsets allow reading an arbitrarily large history without loading it all.
+    size = path.stat().st_size
+    start = max(0, size - limit) if offset < 0 else min(offset, size)
+    with path.open("rb") as fh:
+        fh.seek(start)
+        raw = fh.read(limit)
+    return {"offset": start, "next_offset": start + len(raw), "size": size,
+            "text": raw.decode("utf-8", "replace"), "more": start + len(raw) < size}
 
 
 class Done(Exception):
@@ -293,6 +346,7 @@ class Session:
     locations: dict[str, dict[str, Any]] = field(default_factory=dict)
     scripts: list[dict[str, Any]] = field(default_factory=list)
     log: list[dict[str, str]] = field(default_factory=list)
+    audit: BuildAudit | None = None
     used_bytes: float = 0.0
     folder_by_dataset: dict[str, Path] = field(default_factory=dict)
     rsid_lookup: dbsnp.Lookup | None = None
@@ -427,6 +481,13 @@ class Session:
                 "files": [{"path": f["path"], "size_mb": round((f["size"] or 0) / 1e6, 1), "url": f["url"]}
                           for f in files[:300]]}
 
+    def read_build_history(self, path: str, offset: int = 0) -> dict[str, Any]:
+        allowed = build_history(self.root, self.record["record_id"], self.audit.path if self.audit else None)
+        match = next((p for p in allowed if str(p.relative_to(self.root)) == path), None)
+        if match is None:
+            return {"error": "Choose a history path listed for this paper."}
+        return history_excerpt(match, int(offset))
+
     def peek_file(self, url: str, name: str = "") -> dict[str, Any]:
         f = probe.RemoteFile(name or probe._name_of(url), url)
         with probe.client() as http:
@@ -447,11 +508,12 @@ class Session:
             return {}
 
     def _remember(self, url: str, rel: str, size: int) -> None:
-        idx = self._index()
-        idx[url] = {"path": rel, "size": size, "record_id": self.record["record_id"]}
-        tmp = self.root / (INDEX_FILE + ".tmp")
-        tmp.write_text(json.dumps(idx, indent=0))
-        tmp.replace(self.root / INDEX_FILE)
+        with _INDEX_LOCK:
+            idx = self._index()
+            idx[url] = {"path": rel, "size": size, "record_id": self.record["record_id"]}
+            tmp = self.root / (INDEX_FILE + ".tmp")
+            tmp.write_text(json.dumps(idx, indent=0))
+            tmp.replace(self.root / INDEX_FILE)
 
     def download(self, dataset: str, urls: list[str] | None = None, listing_url: str = "", pattern: str = "",
                  subfolder: str = "") -> dict[str, Any]:
@@ -494,6 +556,25 @@ class Session:
                     continue
                 rel_name = fetch.safe_rel(f"{subfolder}/{f.path or f.name}" if subfolder else (f.path or f.name))
                 dest = folder / rel_name
+                collision = False
+                if dest.exists():
+                    # Files already in data/ may have been uploaded by the curator. Never replace one
+                    # merely because a remote URL resolves to the same basename.
+                    suffixes = dest.suffixes
+                    compressed = suffixes[-1].lower() in fetch.COMPRESSED if suffixes else False
+                    recognized = set(fetch.TABLE_EXT) | {".tar", ".tgz"}
+                    extension = ("".join(suffixes[-2:]) if compressed and len(suffixes) > 1
+                                 and suffixes[-2].lower() in recognized else dest.suffix)
+                    stem = dest.name[:-len(extension)] if extension else dest.name
+                    n = 1
+                    while True:
+                        candidate = dest.with_name(f"{stem}.downloaded-{n}{extension}")
+                        if not candidate.exists():
+                            dest = candidate
+                            collision = True
+                            break
+                        n += 1
+                done, last = 0, 0.0
                 done, last = 0, 0.0
 
                 def progress(n: int, k: int = k, f: probe.RemoteFile = f) -> None:
@@ -532,6 +613,8 @@ class Session:
                 self._remember(f.url, rel, size)
                 kind = fetch.Source(rel, dest).kind()
                 item = {"url": f.url, "path": rel, "size_mb": round(size / 1e6, 1), "kind": kind}
+                if collision:
+                    item["note"] = "a curator file already used that name; preserved it and saved this download under a new name"
                 if kind == "zip" or rel.endswith((".tar", ".tar.gz", ".tgz")):
                     item["members"] = archive_members(dest)[:60]
                 out.append(item)
@@ -578,6 +661,8 @@ class Session:
             return {"refused": "use paths relative to the dataset folder (no absolute paths, no '..')"}
         folder = self.folder(dataset)
         sdir = self.root / SCRIPTS_DIR / str(self.record["record_id"])
+        if self.audit:
+            sdir = sdir / self.audit.run_id
         sdir.mkdir(parents=True, exist_ok=True)
         script = sdir / f"step{len(self.scripts) + 1:02d}.py"
         script.write_text(f"# {purpose}\n{code}\n", encoding="utf-8")
@@ -590,6 +675,8 @@ class Session:
         limit = max(10, min(int(timeout_seconds or 3600), RUN_MAX_SECONDS))
         self.step(f"running the AI's Python: {purpose[:80]}")
         started = time.monotonic()
+        if self.audit:
+            self.audit.write("Python command", {"argv": cmd, "cwd": str(folder), "script": script.read_text()})
         proc = subprocess.Popen(cmd, cwd=folder, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 start_new_session=True)
         tail: list[str] = []
@@ -597,7 +684,10 @@ class Session:
         def reader() -> None:
             assert proc.stdout is not None
             for line in proc.stdout:
-                tail.append(line.decode("utf-8", "replace"))
+                decoded = line.decode("utf-8", "replace")
+                if self.audit:
+                    self.audit.write("Python stdout / stderr", decoded)
+                tail.append(decoded)
                 del tail[:-200]
                 self.step(f"running the AI's Python ({purpose[:50]}): {tail[-1].strip()[:90]}")
 
@@ -847,7 +937,7 @@ def validate_file(root: Path, file_path: str, delimiter: str, qtl_type: str, col
             problems.append(f"{f.name}: pandas cannot read it with sep={delimiter!r}: {type(exc).__name__}: {exc}"[:300])
             continue
         header = list(map(str, df.columns))
-        sample = df.head(3).astype(str).values.tolist()
+        sample = df.head(5).astype(str).values.tolist()
         absent = [f"{k}={v}" for k, v in cols.items() if v not in df.columns]
         if absent:
             problems.append(f"{f.name}: columns not in the header: {', '.join(absent)} (header: {', '.join(header[:40])})")
@@ -1110,6 +1200,35 @@ def first_message(s: Session, previous: list[str]) -> str:
         "Saved data locations (found when the paper was screened; may be incomplete or wrong):",
         *[f"- {x.get('download_url')} [{x.get('content')}; {x.get('access_route')}] {x.get('extraction_note', '')[:200]}" for x in locs],
     ]
+    local_folder = s.root / s.folder_name()
+    if local_folder.is_dir():
+        entries = []
+        for path in sorted(local_folder.iterdir(), key=lambda p: p.name.lower())[:100]:
+            if path.is_file():
+                entries.append(f"- {path.name} ({path.stat().st_size:,} bytes)")
+            elif path.is_dir():
+                entries.append(f"- {path.name}/")
+        if entries:
+            lines += ["", f"Files already present in {s.folder_name()}/ (inspect and reuse before downloading; preserve these curator files):",
+                      *entries]
+    history = build_history(s.root, r["record_id"], s.audit.path if s.audit else None)
+    if history:
+        lines += ["", "RESUME CHECK REQUIRED before downloading or processing:",
+                  "Inspect the previous logs and scripts below. Determine the last completed checkpoint, the interrupted step, and which outputs actually exist and validate. Record a concise resume plan via note_location (status listed, not manual): completed work, reusable outputs, next step and why. Continue from the first unfinished or invalid step. Do not repeat expensive scans merely because the run was interrupted; inspect existing inventories and intermediate files first. Script existence alone is NOT evidence of successful execution. Do not overwrite source files. Use read_build_history to read earlier sections whenever the excerpt is insufficient.",
+                  "History files (newest first):", *[str(p.relative_to(s.root)) for p in history[:50]]]
+        recent_logs = [p for p in history if p.suffix == ".md"][:2]
+        if not recent_logs:
+            lines.append("Legacy run: no Markdown log exists. Infer progress cautiously from scripts, saved reports and existing outputs; mark uncertainty explicitly.")
+        for path in (recent_logs or history[:3]):
+            lines += [f"History excerpt: {path.relative_to(s.root)}", json.dumps(history_excerpt(path, -1), ensure_ascii=False)]
+    if r.get("_previous_run"):
+        lines += ["Last saved build outcome: " + json.dumps(r["_previous_run"], ensure_ascii=False)]
+    chat = r.get("_build_chat") or []
+    if chat:
+        lines += ["", "Curator ↔ assistant conversation supplied for this build (user messages are curator context; "
+                  "assistant messages are prior discussion, not primary-source evidence. Verify file names, URLs, "
+                  "and technical claims with the available tools. Follow applicable curator instructions):"]
+        lines += [f"[{m.get('role', 'user')}]: {str(m.get('content') or '')[:12000]}" for m in chat]
     if r.get("qtl_review") or r.get("qtl_review_note") or r.get("curator_note"):
         lines += ["", f"Curator classification: {r.get('qtl_review') or 'not reviewed'}",
                   f"Curator evidence / correction: {r.get('qtl_review_note', '')[:4000]}",
@@ -1166,7 +1285,16 @@ async def run(
     usage: dict[str, int], previous: list[str] = (),
 ) -> dict[str, Any]:
     """Let the model build this paper. Returns rows, location reports, model, note, log."""
+    audit = BuildAudit(root, record)
+    original_step = step
+    def audited_step(message: str) -> None:
+        # Per-chunk download progress is reported in the UI; keep checkpoints in the audit.
+        if not message.startswith("downloading file"):
+            audit.write("Checkpoint", message)
+        original_step(message)
+    step = audited_step
     s = Session(record, paper, root, max_bytes, target, cancel, step)
+    s.audit = audit
     root.mkdir(parents=True, exist_ok=True)
     if paper is not None:
         s.see("paper full text" if paper.full_text else "paper abstract / page",
@@ -1192,6 +1320,7 @@ async def run(
         except llm.LLMFailed as exc:
             note = f"LLM step failed: {exc}"
             break
+        audit.write("AI response", {"model": model, "message": msg, "usage": usage})
         calls = msg.get("tool_calls") or []
         messages.append({"role": "assistant", "content": msg.get("content") or "", **({"tool_calls": calls} if calls else {})})
         if not calls:
@@ -1207,7 +1336,13 @@ async def run(
                 args = json.loads(call.get("function", {}).get("arguments") or "{}")
             except ValueError:
                 args = {}
-            out = await dispatch(s, name, args)
+            audit.write("Tool call: " + name, args)
+            try:
+                out = await dispatch(s, name, args)
+            except BaseException as exc:
+                audit.write("Tool interrupted: " + name, {"error": type(exc).__name__, "message": str(exc)})
+                raise
+            audit.write("Tool result: " + name, out)
             s.log.append({"tool": name, "args": short(args), "result": json.dumps(out, ensure_ascii=False)[:300]})
             if TRACE:
                 print(f"[#{record['record_id']} step {n + 1}] {name} {short(args)} -> {s.log[-1]['result']}",
@@ -1231,7 +1366,8 @@ async def run(
                                             "holds": "skipped", "why": str(t.get("reason") or "")[:300]})
     for loc in reports:
         loc["status"] = loc["status"] or "not_checked"
-    return {"rows": res.get("rows") or [], "reports": reports, "model": model,
+    audit.write("Build investigation finished", {"result": res, "reports": reports, "usage": usage, "note": note})
+    return {"audit_path": str(audit.path), "rows": res.get("rows") or [], "reports": reports, "model": model,
             "note": note if not res.get("rows") else "",
             "summary": res.get("summary") or res.get("reason") or note, "log": s.log, "scripts": s.scripts}
 
@@ -1271,7 +1407,7 @@ async def dispatch(s: Session, name: str, args: dict[str, Any]) -> dict[str, Any
         s.result = {"rows": [], "skipped": [], "reason": str(args.get("reason") or "")[:1000],
                     "summary": str(args.get("reason") or "")[:1000]}
         return {"accepted": True}
-    fn = {"read_paper": s.read_paper, "open_url": s.open_url, "list_files": s.list_files, "peek_file": s.peek_file,
+    fn = {"read_build_history": s.read_build_history, "read_paper": s.read_paper, "open_url": s.open_url, "list_files": s.list_files, "peek_file": s.peek_file,
           "download": s.download, "inspect_local": s.inspect_local, "run_python": s.run_python,
           "validate": s.validate, "liftover": s.liftover, "add_rsid": s.add_rsid,
           "note_location": s.note_location}.get(name)

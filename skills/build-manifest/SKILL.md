@@ -12,6 +12,67 @@ until it holds. The step budget is about 80 tool calls; a typical paper needs 20
 allocation: phases 1–2 ≤ 15 calls, phase 3 ≤ 15, phase 3b (only when needed) ≤ 15, phases 4–6
 the rest, and always keep 3 calls for phase 7.
 
+## Phase 0: Resume, provenance and curator context
+
+Before repeating a build, inspect the previous run outcome, existing local files and the
+history paths supplied in the initial message. Use `read_build_history(path, offset)` to read
+previous Markdown logs and Python scripts; follow `next_offset` when `more` is true. A tail
+excerpt may omit earlier successful work, so read relevant preceding sections before deciding
+to repeat a costly step.
+
+- Identify the last completed checkpoint, the interrupted or failed operation, and the next
+  unfinished step. A saved script proves what was attempted, not that it finished successfully.
+- Check reusable outputs, their expected sizes, headers, context and validation results. Inspect
+  existing inventories and variant maps before repeating full scans of large compressed archives.
+  Revalidate an output whose completeness or compatibility is uncertain; do not infer completion
+  solely from its filename. Missing or invalid intermediates may require rerunning their producer.
+- Record the resume plan using `note_location` with status `listed`: completed work, reusable
+  files, uncertainties, the next step and why it is needed. Resume from that step; revisit earlier
+  phases only where evidence is missing, contradicted or invalidated.
+- For legacy runs without Markdown logs, inspect saved reports, Python scripts and actual files.
+  Explicitly distinguish inferred progress from confirmed successful execution.
+- Preserve existing source data and valid outputs. Reuse registered downloads and resumable partial
+  downloads through the download tool. Do not overwrite curator uploads or delete files to restart.
+- Treat the paper's saved conversation as curator context. Read supplied access emails, README
+  text and local paths; verify their relevance to this paper, release and QTL type. In particular,
+  FinnGen R13 GWAS manifests are not automatically the single-nucleus multiome QTL data release.
+  Follow the relevant multiome resource rather than downloading unrelated GWAS results.
+
+**Check:** a restart has an evidence-based resume plan before expensive download or processing.
+
+### Build Markdown audit
+
+The host records each new run in `data/.build_logs/<record_id>/<run_id>.md`, incrementally.
+It logs tool arguments and results, Python source and invocation, stdout/stderr, validation and
+submission results, and checkpoints. Use available tools for all operations so they enter this
+history. For any supported command execution, retain the actual command, working directory,
+exit status and result; do not describe an unexecuted Bash command as completed work. Python
+scripts have separate run-specific paths and must remain traceable from the Markdown.
+
+State substantive decisions and reasons in tool notes or the final summary, including source
+selection, variant-map joins, conversion requirements, failed checks and recovery. Do not include
+API keys, passwords, authorization headers or signed access credentials in notes or commands.
+Record a safe landing-page URL instead. Logging does not require copying entire source datasets
+into Markdown: keep full data files on the server, with references and inspection results in the log.
+The UI preview retains up to five rows; never truncate the actual source or processed dataset to
+five rows. Direct streaming from an archive is valid and does not require extracting all members.
+
+### Human bottlenecks and missing metadata
+
+Use `manual` only when a concrete human action is established. Each such location note must say:
+what blocks progress, the evidence, the exact action required, the verified application/login/download
+page URL, and what instructions or server file paths the curator should supply to resume. If the
+URL is unknown, explicitly say it is unverified; do not invent one. Network failures, conversion
+errors and unsupported QTL types alone do not establish a need for a human access application.
+
+For missing sample sizes, check full-text Methods, cohort/QC and supplementary tables, repository
+README files and data headers. Report genotyped donors used in each context's QTL mapping, not
+cells or the overall cohort copied across contexts. Preserve unknown values and explain the sources
+checked when no supported count is found. A build should resolve missing journal metadata through
+the paper-reading path when available; do not infer a journal or donor count from an unrelated release.
+For manifest fields, retain field-specific source quotes and transformation reasons so the reviewer
+can see both the proposed value and its justification.
+
 ## The manifest files
 
 | File | Role | What you do with it |

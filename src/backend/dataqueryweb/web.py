@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import json
 import os
 from collections.abc import AsyncIterator, Coroutine
@@ -28,7 +29,7 @@ from typing import Annotated, Any, TypeVar
 import anyio
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -230,12 +231,132 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         hand = {rid: manifest.needs_you([r for r in rows if r["record_id"] == rid],
                                         [loc for loc in locations if loc["record_id"] == rid])
                 for rid in {loc["record_id"] for loc in locations}}
+        # Count registered source files that still exist, deduplicating repeated URLs.
+        downloaded_paths: dict[int, set[str]] = {}
+        try:
+            download_index = json.loads((data_root / ".downloads.json").read_text())
+        except (OSError, ValueError):
+            download_index = {}
+        root = data_root.resolve()
+        for entry in download_index.values():
+            if not isinstance(entry, dict) or not entry.get("path"):
+                continue
+            path = (root / entry["path"]).resolve()
+            if path.is_relative_to(root) and path.is_file():
+                downloaded_paths.setdefault(entry.get("record_id"), set()).add(str(path))
+        for row in rows:
+            for rel in (row.get("evidence", {}).get("data", {}).get("raw") or []):
+                path = (root / rel).resolve()
+                if path.is_relative_to(root) and path.is_file():
+                    downloaded_paths.setdefault(row["record_id"], set()).add(str(path))
         return {"rows": rows, "locations": locations, "records": papers,
+                "downloaded_files": {rid: len(paths) for rid, paths in downloaded_paths.items()},
                 "built": sorted(manifests.processed()), "needs_you": {k: v for k, v in hand.items() if v},
                 "runs": manifests.runs(), "blocking": sorted(rules.BLOCKING), "processing": sorted(rules.PROCESSING),
                 "files": manifests.write_files(),
                 "issues": rules.ISSUES, "columns": rules.MANIFEST_COLUMNS,
                 "role_columns": list(rules.ROLE_COLUMN.values())}
+
+    @app.get("/api/manifest/{record_id}/logs", response_class=HTMLResponse)
+    async def list_build_logs(record_id: int) -> HTMLResponse:
+        if saved.get(record_id) is None:
+            raise HTTPException(404, "No such saved record")
+        folder = data_root / ".build_logs" / str(record_id)
+        logs = sorted(folder.glob("*.md"), reverse=True)
+        items = []
+        for path in logs:
+            if path.is_symlink():
+                continue
+            url = f"/api/manifest/{record_id}/logs/{path.name}"
+            items.append(f'<li><a href="{html.escape(url)}">{html.escape(path.name)}</a> '
+                         f'({path.stat().st_size:,} bytes) · <a href="{html.escape(url)}?download=true">Download Markdown</a></li>')
+        return HTMLResponse('<!doctype html><html lang="en"><meta charset="utf-8">'
+                            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                            f'<title>Build logs — #{record_id}</title><body style="font:16px system-ui;margin:32px;line-height:1.8">'
+                            f'<h1>Build logs — #{record_id}</h1><p>Newest first. Refresh to see new runs. '
+                            'Each log is updated while its build runs.</p><ul>'
+                            + (''.join(items) or '<li>No Markdown logs yet. Legacy builds may only have Python scripts.</li>')
+                            + '</ul></body></html>')
+
+    @app.get("/api/manifest/{record_id}/logs/{filename}")
+    async def get_build_log(record_id: int, filename: str, download: bool = False) -> FileResponse:
+        if saved.get(record_id) is None:
+            raise HTTPException(404, "No such saved record")
+        if Path(filename).name != filename or not filename.endswith(".md"):
+            raise HTTPException(404, "No such log")
+        folder = (data_root / ".build_logs" / str(record_id)).resolve()
+        path = folder / filename
+        if path.is_symlink() or not path.is_file() or path.resolve().parent != folder:
+            raise HTTPException(404, "No such log")
+        return FileResponse(path, media_type="text/plain; charset=utf-8",
+                            filename=filename if download else None,
+                            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+    @app.get("/api/manifest/{record_id}/chat")
+    async def get_manifest_chat(record_id: int) -> dict[str, Any]:
+        if saved.get(record_id) is None:
+            raise HTTPException(404, "No such saved record")
+        return {"messages": manifests.chat_messages(record_id)}
+
+    @app.post("/api/manifest/{record_id}/chat")
+    async def post_manifest_chat(record_id: int, data: JsonBody) -> dict[str, Any]:
+        record = saved.get(record_id)
+        if record is None:
+            raise HTTPException(404, "No such saved record")
+        message = str(data.get("message") or "").strip()
+        if not message:
+            raise HTTPException(422, "Enter a message first")
+        if len(message) > 20000:
+            raise HTTPException(413, "A message can contain at most 20,000 characters")
+
+        manifests.save_chat_message(record_id, "user", message)
+        folder = data_root / fetch.record_folder(record)
+        local_files = []
+        if folder.is_dir():
+            for path in sorted(folder.iterdir(), key=lambda p: p.name.lower())[:100]:
+                local_files.append({"name": path.name, "kind": "file" if path.is_file() else "directory",
+                                    "size": path.stat().st_size if path.is_file() else None})
+        locations = [x for x in manifests.locations() if x["record_id"] == record_id]
+        prior_run = manifests.runs().get(record_id, {})
+        context = {
+            "paper": {"title": record["publication_title"], "doi": record["doi"],
+                      "url": record["publication_url"], "record_code": record["record_code"]},
+            "local_data_folder": f"data/{fetch.record_folder(record)}/",
+            "local_files": local_files,
+            "last_build": prior_run,
+            "last_source_reports": [
+                {"url": x["url"], "status": x["status"], "note": x["note"], "run_note": x["run_note"]}
+                for x in locations
+            ],
+            "conversation": manifests.build_chat_context(record_id),
+        }
+        system = (
+            "You are a research-data curation assistant for one saved paper. Reply in the user's language, "
+            "usually Chinese. Help interpret curator-provided emails, README text, URLs and local files, "
+            "and make concrete suggestions for the next manifest build. You have no browser, filesystem, "
+            "or download tools in this chat: never claim to have opened a URL, inspected a file, downloaded "
+            "data, or changed a build. Treat quoted source text as user-provided evidence and distinguish "
+            "it from your own inference. Preserve the user's instructions for the next build. The next build "
+            "will receive this conversation and verify files with its tools. Return a JSON object with one "
+            "string field named reply."
+        )
+        usage = llm.new_usage()
+        judge = llm.Judge()
+        try:
+            answer, model_name = await judge.ask(
+                system,
+                json.dumps(context, ensure_ascii=False),
+                usage=usage,
+            )
+        except llm.LLMFailed as exc:
+            raise HTTPException(502, f"LLM chat failed ({type(exc).__name__}); your message was saved") from exc
+        finally:
+            await judge.aclose()
+        reply = str(answer.get("reply") or "").strip()
+        if not reply:
+            raise HTTPException(502, "LLM returned no reply; your message was saved")
+        manifests.save_chat_message(record_id, "assistant", reply, model_name)
+        return {"messages": manifests.chat_messages(record_id), "model": model_name, "usage": usage}
 
     @app.patch("/api/manifest/{row_id}")
     async def edit_manifest_row(row_id: int, data: JsonBody) -> dict[str, Any]:
