@@ -1,7 +1,8 @@
 ---
 name: build-manifest
 description: The fixed procedure the manifest agent (src/backend/dataqueryweb/agent.py) follows to turn one saved record into LocusCompare qtl_manifest rows — read the paper, inventory every data location, choose the full summary-statistics tables, download, process, validate, submit. agent.py puts this file into the system prompt of every build; edit it here to change how the LLM works.
-version: 2026-10-28
+metadata:
+  version: "2026-11-03"
 ---
 
 # Build manifest: one paper → manifest rows
@@ -93,6 +94,182 @@ keeps only single-base ref/alt on autosomes.
 Besides the 27 columns each row carries `source_url`, `genome_build`, `evidence` and `note`
 (see submit).
 
+## Curated failure checks (apply during the phases below)
+
+These checks come from the curator workbook `processed&needsyou.xlsx`, Sheet1, rows 2–61
+(reviewed 2026-11-02). Treat its diagnoses and proposed fixes as leads to verify against
+actual sources, not evidence to quote. They change future builds, not existing records.
+
+### Separate software names, phenotype types and downloadable outputs (#634)
+
+A string ending in QTL is not by itself a QTL-type definition. Determine its role from the
+Methods, software availability, repository README and actual result-file columns:
+
+- Record separately the **software / method**, **tested molecular phenotype**, and
+  **available association table**. TensorQTL, SAIGE-QTL and sc-pcQTL are software names;
+  never assign a manifest QTL type by stripping their prefixes or matching title tokens.
+- Inspect each phenotype definition: gene expression, splicing, chromatin accessibility,
+  protein abundance, or another measured/derived trait. A paper introducing software may
+  also release new real-cohort QTL results; do not reject it simply for being a methods paper.
+- Distinguish new real-data associations, reanalysed reference data, simulated/example
+  inputs, cluster counts, enrichment, fine-mapping and colocalisation tables. A software
+  name or a repository containing "summary results" proves neither presence nor absence
+  of a usable nominal variant–phenotype association release. Inventory the actual files.
+- For sc-pcQTL (10.64898/2026.08.18.745314), **sc-pcQTL is the framework** and the authors
+  also use **pcQTL for principal-component phenotypes of gene clusters**. These are distinct
+  statements, both of which can be true. Do not infer ordinary single-gene eQTL rows from
+  cluster-PC results, or reject all eQTL-labelled analyses without inspecting them.
+  The author repositories are https://github.com/ZhouLabGenetics/sc-pcQTL and
+  https://github.com/ZhouLabGenetics/sc-pcQTL_code; the older joookerz URL may be stale.
+  The source article is https://www.biorxiv.org/content/10.64898/2026.08.18.745314v1.full.
+  If that page is blocked, state it; do not say you read the full text. The official bioRxiv
+  API and the authors' site can support the abstract/method identity, not missing full text.
+- Inspection of Zenodo 21222687's supplementary archive on 2026-11-03 found cell-type cluster
+  counts, enrichment, SuSiE graph/signal groups, loading/effect summaries, sensitivity and
+  S-LDSC outputs. eQTL labels inside a colocalisation table are not themselves full eQTL
+  associations. Explain missing nominal tables on their content, not on the software name.
+  Recheck for a later release before relying on this historical inventory.
+- Keep these outcomes separate: **not a QTL association table**, **genuine QTL results of a
+  phenotype the current importer does not support**, and **access/content not yet verified**.
+  An unsupported type is not proof of "not QTL". Do not write a human curation decision on
+  the curator's behalf or silently replace it with an AI verdict. When a human has marked
+  a record `not_qtl`, do not rebuild it unless that decision is explicitly cleared.
+
+### Use documented, study-provided variant maps when association rows need them (#637)
+
+- A companion file is not automatically an unrelated annotation resource. On GEO and similar
+  repositories, read the landing page's supplementary-file descriptions and the study's
+  `README.txt` / `README.md` before classifying an association table as unusable. Follow the
+  README's stated relationship between files and look for a study-specific SNP/variant map
+  (for example `GSE227136_ILD_eQTL_SNPinfo.tsv.gz`) when association files contain rsIDs or
+  lack chromosome, position, or the non-effect/effect allele pair.
+- Inspect the map header, representative rows, stated genome build, key uniqueness, and allele
+  definitions. Join it only to enrich association rows from the **same study and release**, by
+  the exact documented variant key (usually rsID); never join association rows to other
+  association results, mix studies/releases, or infer mappings from a filename alone. Keep
+  every original association row and its nominal p-value, phenotype, and effect estimate intact.
+- Verify map coverage and resolve each key unambiguously before processing. If rsIDs are
+  duplicated, use documented allele information to disambiguate; if a key remains ambiguous
+  or unmatched, do not guess or silently multiply/drop rows. Report coverage and unresolved
+  counts. Confirm the map's coordinate build and preserve it in evidence; liftover only after
+  a valid coordinate-and-allele mapping is established.
+- Determine which allele the association's effect estimate refers to from the README or method
+  documentation (for example, `assessed_allele`). In this manifest, `alt` is the effect allele
+  and `ref` is the other/non-effect allele; do not assume the map's `ref`/`alt` names already
+  use that convention. Check the assessed allele is exactly one of the mapped pair, assign
+  effect direction accordingly, and validate the output. If this cannot be established, leave
+  the allele fields unresolved instead of manufacturing them.
+- A documented same-study variant map may be downloaded and used as a narrowly scoped companion
+  input even though it is not itself an association table. Do not download generic external
+  annotation databases or reference resources for this purpose. Never submit the map as a QTL
+  row.
+- Treat large companion maps as real inputs with a memory plan. Check their compressed size
+  against the per-paper download budget, then stream/chunk the map and association tables or
+  build a bounded on-disk key index; do not load a near-GB compressed map or multi-GB tables
+  fully into RAM on this 3-GB server. Preserve the original downloads and report the number and
+  fraction of association rows that mapped.
+- For Natri et al. (2024), the previous build inspected GEO's public supplementary directory
+  but stopped at the LIMIX files' missing second allele. Before making that conclusion again,
+  inspect `GSE227136_README.txt` and `GSE227136_ILD_eQTL_SNPinfo.tsv.gz`, then test the
+  documented rsID/allele mapping against each LIMIX context. The prior "annotation prohibited"
+  conclusion was too broad; do not repeat it. Verify the map's actual columns and compatibility
+  instead of assuming every row can be resolved. GEO lists the README at 2.2 KB and SNPinfo
+  map at about 928.5 MB compressed; inspect the README and actual header rather than skipping
+  the map or downloading unrelated raw-expression files.
+
+### Recover missing facts from the correct release (#84, #123, #130, #165, #168, #262, #467)
+
+- Before leaving sample size, ancestry or genome build missing, follow the repository's
+  publication link, any "Now published in" link, and the publisher / Europe PMC full-text
+  route already identified for this paper. Read Methods and the relevant tables, captions,
+  supplementary cohort descriptions and Data/Population/Sample description sections.
+  An abstract or a matching keyword is not a substitute for reading the section.
+- For each file group, establish the release / phase, publication DOI and coordinate build
+  together. Check the linked project's README, release notes and processing scripts when
+  the paper omits the build. BrainSeq Phase 1 preprint and a later hg38 release are not
+  interchangeable; a current repository README does not establish an older file's build.
+  A companion paper may support the build only when its methods demonstrably describe
+  this same release and analysis. Record that connection and quote the source actually read.
+- Take sample size from the context's QTL mapping after QC (including Table 1 and supplementary
+  sample tables), not the study total or a single arbitrary association row. If sample size
+  varies by variant, report that variation and the documented mapping cohort size; do not
+  invent a single count. Re-open a table as text with peek_file / inspect_local so the exact
+  supporting row is visible before quoting it.
+- Identify ancestry from explicit cohort descriptions or reported ancestry results. A PCA
+  reference panel containing CEU/FIN/GBR/IBS/TSI does not alone establish the study donors'
+  ancestry. If using a named cohort's description, verify that it applies to these donors.
+- Use the existing context vocabulary first. Preserve actual brain regions, cell types and
+  conditions from the file and paper; do not collapse cortex, caudate and cerebellum into
+  one generic brain context. If no broad label fits (e.g. iPSC), retain the accurate label
+  and flag vocabulary review instead of inventing membership in an unrelated tissue.
+
+### Inventory and access: distinguish the actual obstacle (#619, #616, #612, #609, #596, #591)
+
+- A connection reset, truncated archive, unexpected EOF or timeout is a transport failure,
+  not evidence of controlled access. For transient failures, allow at most two retries
+  after the first attempt within the remaining call budget; inspect existing local files
+  and retry only missing or incomplete inputs using the normal download tools. Do not
+  delete valid data, repeatedly rebuild the whole paper, or submit partial archives as
+  complete releases. If still broken, note_location `error` with the URL and exact failure.
+- For HTTP 403 / client challenges, use one retry and the linked published version, PMC /
+  Europe PMC mirror, repository API or documented download route. A blocked bioRxiv v1
+  page does not mean that the underlying study requires an access application.
+- When a portal has no file links, inspect its linked data collections, project pages and
+  documented file/download endpoints within phase 2's link-depth and call budgets. A landing
+  page (including HGSVC2) is not the complete inventory. Do not guess private endpoints.
+- For GEO, inspect the public supplementary directory and descriptions. Series Matrix,
+  gene-by-individual expression matrices and raw counts are not QTL association statistics;
+  download them only if their actual contents are the required association table. A filename
+  containing "eQTL_Mapping" is insufficient.
+- Read the GEO README before deciding whether a companion file is unrelated. If an association
+  file references rsIDs or lacks coordinate/allele columns, look for a README-documented,
+  same-study variant map (see the curated #637 procedure), inspect it, and test the mapping
+  before skipping the association data.
+- Keep these explanations distinct in note_location and the final summary: (1) confirmed
+  application / author request, quoting its instructions; (2) manual browser/session download
+  (e.g. Dryad), which need not require an application; (3) network or publisher blocking;
+  (4) raw/source data, annotation, GWAS or other non-QTL output; (5) no download route found,
+  access requirements unconfirmed. Use `manual` for a genuine person/browser action and
+  `not_data` for unrelated material. Do not describe an empty JS page as an empty data file.
+
+### Select, normalize and validate without changing what the data mean
+
+- PDF/DOCX papers and documentation may supply evidence and links, but are not delimited
+  QTL inputs. An XLSX/ZIP/TSV file is only a candidate: inspect its columns and contents.
+  "Most significant variant per tested gene", "same as ... with annotation", fine-mapping,
+  colocalisation, enrichment and other downstream analyses are not full nominal statistics
+  (#140, #262). Prefer the full association table; apply phase 3b's explicit non_full fallback
+  only to eligible association tables. Do not relabel subsets as full or delete local files.
+- For AF/EAF columns (#123, #130), first verify that each value is a per-variant frequency
+  for a biallelic variant, in [0, 1], not an allele count or percentage. Then derive a new
+  `maf = min(af, 1-af)` column, preserving the source frequency. Missing stays empty; invalid
+  values are reported. Point maf_col to the derived column, not the original AF/EAF column.
+  Do not apply this formula to multiallelic or undocumented frequencies.
+- For chromosome shards of the same analysis (#467), normalize siblings and submit one row
+  with an exact chr-file glob per QTL type/context, not one row per chromosome. Do not mix
+  different releases, analyses or methods into a single table. For multiple methods of the
+  same context (#165), select the paper's primary analysis and explain alternatives in
+  skipped_tables; distinguish genuine subregions/conditions in biocontext without inventing
+  tissue labels just to silence duplicate_biocontext.
+- Separate gene-, exon-, transcript-, splicing- and APA-level results (#165, #467). ENSE,
+  ENST, splice coordinates and gene symbols are not ENSG gene ids. Use only a documented
+  gene mapping already supplied in the permitted study inputs; keep original ids and
+  report unmapped/ambiguous cases, without guessed or one-to-many expansions. Respect the
+  runtime's ban on downloading external gene annotation or joining unrelated tables. If
+  mapping requires such resources, describe the missing resource for a person to resolve.
+- isoQTL and apaQTL are not currently supported manifest types: do not relabel them eQTL or
+  sQTL merely to pass validation. Record them in skipped_tables with "unsupported QTL type;
+  importer support required". A skill change alone cannot add importer support.
+- Complete recoverable processing before submitting: unpack/read archive members, convert
+  supported spreadsheets to text, split packed variant ids, derive nominal p where justified,
+  and liftover confirmed GRCh37 tables using phases 5–6. A proposed conversion is not a
+  processed result: require the actual local output and passing validation.
+
+In the final summary, group repeated missing/unverified facts by field and explain the
+cause once, while retaining the program's issue codes. Distinguish build completion, local
+files that passed validation, partial statistics and full data still needing manual access.
+Do not claim to have fixed UI issue duplication or expanded supported QTL types.
+
 ## Phase 1: Read the paper (read_paper)
 
 Run these searches, one read_paper call each, and note what you find:
@@ -131,7 +308,7 @@ figshare, OSF, Hugging Face, FTP) → lab pages and portals → GitHub → GEO a
   - `listed`: files found
   - `manual`: a person must act (login, data access application, browser-only portal,
     Synapse, Google Drive, Dropbox, "on request")
-  - `error`: unreachable after one retry
+  - `error`: unreachable after the bounded retries described in the curated failure checks
   - `not_data`: a paper, a code repository without results, an annotation resource
   - `duplicate`: the same files as another location
 
@@ -296,8 +473,12 @@ column, and all values already in these formats. Most files are not (GTEx writes
   an autosome (the importer drops those anyway), and print how many were dropped
 - a missing value stays empty: never write placeholder words (`not_available`, `none`, `-`,
   `.`) into a cell; validate refuses text in p-value, effect, standard error and MAF columns
-- read only the input table (and its sibling files); never join in rows or columns from
-  another table
+- read the association input and, only when needed, a README-documented same-study/same-release
+  variant map keyed by a documented identifier; use a validated, allele-resolved lookup to add
+  variant metadata without changing association rows. Never join association rows from
+  different files or analyses, or use an undocumented or external map
+- process large companion maps and association files in bounded chunks; avoid holding the full
+  compressed or expanded files in memory
 - loop over the files of the group in one script; print one line per file written
 
 Recipes (adapt the column names):

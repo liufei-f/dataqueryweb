@@ -5,6 +5,7 @@
   const count = document.getElementById("mf-count");
   let data = { rows: [], locations: [], records: {}, built: [], issues: {}, columns: [], role_columns: [] };
   const open = new Set(); // rows whose evidence is shown
+  const reviewDrafts = new Map();
   const openPapers = new Set(); // papers whose rows are shown
   let job = null; // the server's build queue, polled while it runs
 
@@ -60,15 +61,19 @@
     return `${missing}<table class="mf-ev"><thead><tr><th>Manifest column</th><th>Header in the file</th><th>Why</th></tr></thead><tbody>${rows}${extra}</tbody></table>`;
   }
 
+  function sampleTable(table) {
+    const samples = (table.rows || []).slice(0, 5);
+    return `<div class="table-wrap"><table class="mf-preview"><thead><tr><th>Column</th>${samples.map((_, i) => `<th>Sample ${i + 1}</th>`).join("")}</tr></thead>
+      <tbody>${(table.columns || []).map((column, i) => `<tr><th scope="row">${esc(column)}</th>${samples.map((row) => `<td>${esc(row[i])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+  }
+
   function preview(r) {
     const t = r.evidence.table || {};
     if (!(t.columns || []).length) return `<p class="muted">Header not read${t.note ? `: ${esc(t.note)}` : ""}.</p>`;
     const notes = [t.header_from && `header taken from ${t.header_from}`, t.has_header === false && "the file itself has no header row",
       t.fmt && t.fmt !== "text" && t.fmt, t.n_rows && `${t.n_rows.toLocaleString()} rows`, t.note].filter(Boolean).map(esc).join(" · ");
     return `${t.preamble ? `<p class="rec-sub">Title lines: ${esc(t.preamble)}</p>` : ""}${notes ? `<p class="rec-sub">${notes}</p>` : ""}
-      <div class="table-wrap"><table class="mf-preview"><thead><tr>${t.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead>
-      <tbody>${(t.rows || []).map((row) => `<tr>${row.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`).join("")
-        || `<tr><td colspan="${t.columns.length}" class="muted">No rows sampled.</td></tr>`}</tbody></table></div>`;
+      ${sampleTable(t)}`;
   }
 
   const DATA = { processed: ["Processed", "mf-d-ok"], as_is: ["Downloaded", "mf-d-ok"], too_large: ["Too large", "mf-d-warn"],
@@ -96,9 +101,7 @@
     const checks = d.checks ? `<table class="mf-ev"><thead><tr><th>Importer needs</th><th>Column</th><th>Values that look right</th><th>Example</th></tr></thead><tbody>${
       Object.entries(d.checks).filter(([k, c]) => k !== "file" && c && c.column !== undefined).map(([role, c]) => `<tr><th>${esc(role)}</th><td><code>${esc(c.column)}</code></td>
         <td class="${c.checked && c.pass === c.checked ? "mf-ok" : "mf-bad"}">${c.problem ? esc(c.problem) : `${c.pass.toLocaleString()} / ${c.checked.toLocaleString()}`}</td><td><code>${esc(c.example)}</code></td></tr>`).join("")}</tbody></table>` : "";
-    const pv = d.preview && d.preview.columns ? `<p class="rec-sub">First rows of ${d.status === "processed" ? "the processed file" : "the file"}:</p>
-      <div class="table-wrap"><table class="mf-preview"><thead><tr>${d.preview.columns.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead>
-      <tbody>${d.preview.rows.map((row) => `<tr>${row.map((c) => `<td>${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>` : "";
+    const pv = d.preview && d.preview.columns ? `<p class="rec-sub">Sample values from ${d.status === "processed" ? "the processed file" : "the file"}:</p>${sampleTable(d.preview)}` : "";
     return `<p>${dataBadge(r)} ${r.file_path && ["processed", "as_is"].includes(d.status) ? `<code>${esc(r.file_path)}</code>` : ""}</p>
       ${facts.length ? `<table class="mf-ev mf-data"><tbody>${facts.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join("")}</tbody></table>` : ""}
       ${checks}${pv}`;
@@ -221,6 +224,7 @@
   const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
   function stateOf(id) { // exists | building | queued | built | unbuilt
+    if ((data.records[id] || {}).qtl_review === "not_qtl") return "excluded";
     if ((data.records[id] || {}).already_exists && !isBuilt(id)) return "exists";
     if (job && job.state === "running") {
       if (job.current && job.current.record_id === id) return "building";
@@ -249,13 +253,25 @@
     return out;
   }
 
-  const needsYou = (id) => (data.needs_you || {})[id] || [];
+  function followUp(id) {
+    const state = ManifestStatus.evaluate({ rows: rowsOf(id), locations: data.locations.filter((l) => l.record_id === id),
+      legacyNeeds: (data.needs_you || {})[id] || [], run: (data.runs || {})[id] || {}, built: isBuilt(id) });
+    if ((data.records[id] || {}).qtl_review === "not_qtl") {
+      state.label = "Human decision: not QTL data";
+      state.kinds = []; state.reasons = []; state.human = false; state.complete = false;
+    }
+    if ((data.records[id] || {}).qtl_review === "needs_recheck") {
+      state.label = "Needs recheck";
+      state.kinds = []; state.reasons = []; state.human = false; state.complete = false;
+    }
+    return state;
+  }
 
-  function needsBadge(id) {
-    const hand = needsYou(id);
-    if (!hand.length) return "";
-    return `<span class="badge mf-b-hand" title="${esc(hand.map((h) => `${h.what}: ${h.why}`).join("\n"))}">Needs you</span>
-      <span class="rec-sub">${esc(hand[0].why.slice(0, 140))}${hand.length > 1 ? ` (+${hand.length - 1} more)` : ""}</span>`;
+  const needsYou = (id) => followUp(id).reasons.filter((r) => ManifestStatus.human.has(r.kind));
+
+  function needsBadge(id, exceptLabel = "") {
+    const state = followUp(id);
+    return state.kinds.filter((kind) => ManifestStatus.labels[kind] !== exceptLabel).map((kind) => `<span class="badge ${["network", "software"].includes(kind) ? "mf-d-bad" : "mf-d-warn"}" title="${esc(state.reasons.filter((r) => r.kind === kind).map((r) => r.why).join("\n"))}">${esc(ManifestStatus.labels[kind])}</span>`).join(" ");
   }
 
   function builtSummary(id) {
@@ -299,57 +315,172 @@
     const k = KIND[p.data_kind]; return k ? `<span class="mf-kind ${k[1]}">${k[0]}</span>` : "";
   };
 
+  const unique = (values) => [...new Set(values.filter(Boolean))];
+  const locsOf = (id) => data.locations.filter((l) => l.record_id === id);
+  function aiStatus(id) {
+    const rows = rowsOf(id), locs = locsOf(id);
+    if (rows.some((r) => r.model || (r.evidence || {}).agent) || locs.some((l) => l.model || l.tokens > 0)) return "Yes";
+    if (locs.some((l) => /LLM step skipped|AI step skipped/.test([l.note, l.run_note].join(" ")))) return "No (AI skipped)";
+    return isBuilt(id) || (data.runs || {})[id] ? "Unknown (legacy build)" : "No";
+  }
+
+  function dataResult(id) {
+    const state = followUp(id), st = stateOf(id), run = (data.runs || {})[id] || {};
+    if (!state.good.length && ["building", "queued"].includes(st)) state.label = "Pending";
+    else if (!state.good.length && run.outcome === "stopped") state.label = "Stopped";
+    else if (!state.good.length && run.outcome === "usage_limit") state.label = "Waiting for AI quota";
+    else if (!state.good.length && st === "exists") state.label = "In reference manifest";
+    if ((data.records[id] || {}).qtl_review === "not_qtl") {
+      state.label = "Human decision: not QTL data";
+      state.kinds = []; state.reasons = []; state.human = false; state.complete = false;
+    }
+    return state;
+  }
+
+  function resultOf(id) {
+    const state = dataResult(id);
+    const cls = state.complete ? "mf-d-ok" : ["network", "software"].includes(state.kinds[0]) ? "mf-d-bad" : "mf-d-warn";
+    return `<span class="badge ${cls}">${esc(state.label)}</span>
+      ${state.good.length ? `<div class="rec-sub">${state.good.length}/${state.rows.length} rows downloaded or processed</div>` : ""}
+      ${state.partial ? '<div class="rec-sub">Partial statistics only; full data not ready</div>' : ""}
+      ${needsBadge(id, state.label)}`;
+  }
+
+  const columnFilters = {};
+  const COLUMNS = [
+    ["index", "Paper index"], ["paper", "Paper / URL"], ["journal", "Journal"], ["data_url", "Data URL"],
+    ["qtl", "QTL type(s)"], ["context", "Context"], ["build", "Build status"], ["result", "Data result / success"],
+    ["files", "Files / rows"], ["review", "Review"], ["human", "Human decision"], ["date", "Last build"], ["actions", "Actions"],
+  ];
+  function dataUrls(id) {
+    const p = data.records[id] || {};
+    return unique([...(p.download_url || "").split(/;\s*/), ...locsOf(id).map((l) => l.url), ...rowsOf(id).map((r) => r.source_url)])
+      .filter((u) => safeUrl(u) !== "#");
+  }
+  function buildStatusOf(id) {
+    const st = stateOf(id), run = (data.runs || {})[id];
+    return st === "excluded" ? "Excluded by human" : st === "building" ? `Building${job.no_llm ? " (AI skipped)" : " with AI"}…`
+      : st === "queued" ? "Queued" : run?.outcome === "failed" ? "Build failed"
+      : run?.outcome === "stopped" ? "Build stopped" : run?.outcome === "usage_limit" ? "Waiting for AI quota"
+      : isBuilt(id) || run ? "Build completed" : "Not built";
+  }
+  function matchesColumns(id) {
+    const p = data.records[id], rows = rowsOf(id), run = (data.runs || {})[id];
+    const text = {
+      index: `#${id} ${p.record_code || ""}`,
+      paper: [p.publication_title, p.first_author, p.year, p.journal, p.publication_url, p.doi].join(" "),
+      journal: p.journal || p.preprint_server || "",
+      paper_url: [p.publication_url, p.doi, p.doi && `https://doi.org/${p.doi}`].join(" "),
+      data_url: dataUrls(id).join(" "),
+      qtl: [p.qtl_type, ...rows.map((r) => r.qtl_type)].join(" "),
+      context: [p.qtl_context, ...rows.map((r) => [r.biocontext, r.level_1_context, r.level_2_context].join(" "))].join(" "),
+      files: `${rows.filter((r) => r.evidence.data?.status === "processed").length} processed ${rows.filter((r) => r.evidence.data?.status === "as_is").length} downloaded ${rows.length} candidate rows ` + rows.map((r) => r.file_path).join(" "),
+      date: run?.at ? `${run.at} ${new Date(run.at).toLocaleString()}` : "",
+    };
+    return Object.entries(columnFilters).every(([key, value]) => {
+      if (!value.trim()) return true;
+      if (key === "build") {
+        if (value === "ai_yes") return aiStatus(id) === "Yes";
+        if (value === "ai_no") return aiStatus(id).startsWith("No");
+        if (value === "ai_unknown") return aiStatus(id).startsWith("Unknown");
+        return buildStatusOf(id) === value;
+      }
+      if (key === "result") return value.startsWith("reason:") ? followUp(id).kinds.includes(value.slice(7)) : dataResult(id).label === value;
+      if (key === "human") return (p.qtl_review || "") === (value === "unreviewed" ? "" : value);
+      if (key === "review") return value === "none" ? !rows.length : rows.some((r) => r.review === value);
+      return String(text[key] || "").toLowerCase().includes(value.trim().toLowerCase());
+    });
+  }
+  function columnFilterHtml(key, label) {
+    if (key === "actions") return '<button type="button" class="rec-btn mf-clear-columns">Clear filters</button>';
+    const options = key === "build" ? [
+      ["ai_yes", "AI build: Yes"], ["ai_no", "AI build: No"], ["ai_unknown", "AI build: Unknown"],
+      ...["Excluded by human", "Not built", "Build completed", "Building with AI…", "Building (AI skipped)…", "Queued", "Build failed", "Build stopped", "Waiting for AI quota"].map((s) => [s, s]),
+    ] : key === "result" ? [
+      ...["Needs recheck", "Human decision: not QTL data", "Processed — review pending", "Downloaded / processed", "Partial success", "Build failed", "Pending", "Stopped", "Waiting for AI quota", "No usable data found", "In reference manifest", "Not attempted"].map((s) => [s, s]),
+      ...ManifestStatus.priority.map((kind) => [`reason:${kind}`, ManifestStatus.labels[kind]]),
+    ]
+      : key === "human" ? [["unreviewed", "Not reviewed"], ["qtl", "QTL data"], ["not_qtl", "Not QTL data"], ["needs_recheck", "Needs recheck"]]
+      : key === "review" ? [["pending", "To review"], ["approved", "Has approved rows"], ["rejected", "Has rejected rows"], ["none", "No candidate rows"]] : null;
+    const attrs = `data-column-filter="${key}" aria-label="Filter ${esc(label)}"`;
+    if (options) return `<select class="dq-input mf-column-filter" ${attrs}><option value="">All</option>${options.map(([v, t]) => `<option value="${esc(v)}" ${columnFilters[key] === v ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>`;
+    return `<input type="search" class="dq-input mf-column-filter" ${attrs} value="${esc(columnFilters[key] || "")}" placeholder="${key === "date" ? "e.g. 2026-11-02" : "Filter…"}">`;
+  }
+
   function headHtml(id) {
-    const p = data.records[id] || {}, st = stateOf(id), rows = rowsOf(id);
-    const toCheck = rows.filter((r) => r.review === "pending").length;
-    const status = st === "building" ? `<span class="badge mf-b-run">Building…</span> <span class="rec-sub">${esc(job.current.step || "starting")}</span>`
-      : st === "queued" ? `<span class="badge mf-b-queue">Queued</span> <span class="rec-sub">${job.queue.indexOf(id) + 1} in line</span>`
-      : st === "built" ? `<span class="badge mf-b-done">Built</span> ${builtSummary(id)}`
-      : st === "exists" ? `<span class="badge mf-b-exists">Already exists</span> <span class="rec-sub">in the reference manifest as
-          <strong>${esc(p.already_exists)}</strong> — skipped, nothing to build or download</span>`
-      : `<span class="muted">Not built</span>${p.not_eligible ? `<span class="rec-sub"> · ${esc(p.not_eligible)}</span>` : ""}`;
+    const p = data.records[id] || {}, st = stateOf(id), rows = rowsOf(id), run = (data.runs || {})[id];
     const busy = st === "building" || st === "queued";
-    const build = st === "exists" ? "" : `<button type="button" class="rec-btn ${st === "built" ? "" : "primary"} mf-build" data-record="${id}" ${busy ? "disabled" : ""}
-      title="${st === "built" ? "Build again; approved, rejected and edited rows are kept" : "List the files, read the paper, fill the manifest rows and download the data"}">${st === "built" ? "Rebuild" : "Build manifest"}</button>`;
-    const check = st === "built" || (busy && isBuilt(id))
-      ? `<button type="button" class="rec-btn ${toCheck && !openPapers.has(id) ? "primary" : ""} mf-open" data-record="${id}">${openPapers.has(id) ? "Close" : toCheck ? `Check (${toCheck})` : "Check"}</button>` : "";
-    return `<div class="mf-paper-main">
-        <a class="mf-paper-title" href="${esc(safeUrl(p.doi ? `https://doi.org/${p.doi}` : p.publication_url))}" target="_blank" rel="noopener">${esc(p.publication_title || `Record #${id}`)}</a>
-        <div class="dq-paper-meta">${kindTag(p)} #${id}${p.record_code ? ` · <code class="rec-code" title="Record code; also the name of its data folder">${esc(p.record_code)}</code>` : ""} · ${esc([p.first_author && `${p.first_author} et al.`, p.journal, p.year, p.qtl_type, p.species && `species: ${p.species}`,
-          p.n_locations > 1 && `${p.n_locations} download locations`, p.saved_by === "auto" ? "saved by the AI" : "saved by you"].filter(Boolean).join(" · "))}</div>
-        <div class="mf-paper-status">${status}</div>${lastOutcome(id)}
-      </div><div class="mf-paper-btns">${build}${check}</div>`;
+    const attempted = isBuilt(id) || !!run;
+    const toCheck = rows.filter((r) => r.review === "pending").length;
+    const status = buildStatusOf(id);
+    const build = st === "excluded" ? '<span class="rec-sub">Excluded from future builds</span>' : st === "exists" ? "" : `<button type="button" class="rec-btn mf-build" data-record="${id}" ${busy ? "disabled" : ""}>${attempted ? "Rebuild" : "Build manifest"}</button>`;
+    const check = attempted || p.curator_note || p.qtl_review ? `<button type="button" class="rec-btn mf-open" data-record="${id}" aria-expanded="${openPapers.has(id)}">${openPapers.has(id) ? "Close" : "Details"}${toCheck ? ` (${toCheck})` : ""}</button>` : "";
+    const urls = dataUrls(id);
+    const link = (u) => `<a href="${esc(safeUrl(u))}" target="_blank" rel="noopener">${esc(u)}</a>`;
+    const urlList = urls.slice(0, 2).map(link).join("<br>") + (urls.length > 2 ? `<details><summary>${urls.length - 2} more URLs</summary>${urls.slice(2).map(link).join("<br>")}</details>` : "");
+    const types = unique([p.qtl_type, ...rows.map((r) => r.qtl_type)]).join("; ");
+    const contexts = unique([p.qtl_context, ...rows.map((r) => r.biocontext)]);
+    const processed = rows.filter((r) => r.evidence.data?.status === "processed").length;
+    const downloaded = rows.filter((r) => r.evidence.data?.status === "as_is").length;
+    const paperUrl = p.publication_url || (p.doi ? `https://doi.org/${p.doi}` : "");
+    const reviewDraft = reviewDrafts.get(id) || { value: p.qtl_review || "", note: p.qtl_review_note || "" };
+    let cellIndex = 0;
+    return `<td><strong>#${id}</strong>${p.record_code ? `<div class="rec-sub">${esc(p.record_code)}</div>` : ""}</td>
+      <td class="mf-paper-cell"><strong>${paperUrl ? `<a class="mf-paper-title" href="${esc(safeUrl(paperUrl))}" target="_blank" rel="noopener">${esc(p.publication_title || `Record #${id}`)}</a>` : esc(p.publication_title || `Record #${id}`)}</strong><div class="rec-sub">${esc([p.first_author, p.year].filter(Boolean).join(" · "))}</div>${paperUrl ? `<div class="rec-sub mf-url-cell">${link(paperUrl)}</div>` : ""}</td>
+      <td>${esc(p.journal || p.preprint_server) || "—"}</td>
+      <td class="mf-url-cell">${urlList || '<span class="muted">No data URL recorded</span>'}</td>
+      <td>${esc(types) || "—"}</td><td class="mf-context-cell">${esc(contexts.slice(0, 3).join("; ")) || "—"}${contexts.length > 3 ? `<details><summary>${contexts.length - 3} more contexts</summary>${esc(contexts.slice(3).join("; "))}</details>` : ""}</td>
+      <td><strong>${esc(status)}</strong><div class="rec-sub">AI build: ${esc(aiStatus(id))}</div>${busy && job.current?.record_id === id ? `<div class="rec-sub">${esc(job.current.step || "starting")}</div>` : ""}${lastOutcome(id)}</td>
+      <td>${resultOf(id)}</td>
+      <td>${processed} processed<br>${downloaded} downloaded<div class="rec-sub">${rows.length} candidate rows</div></td>
+      <td>${rows.filter((r) => r.review === "approved").length} approved<div class="rec-sub">${toCheck} to review</div>${notReadyWhy(rows)}</td>
+      <td class="mf-human-decision"><label class="rec-sub" for="mf-human-review-${id}">Curator classification</label>
+        <select id="mf-human-review-${id}" class="dq-input mf-qtl-review" data-record="${id}">
+          ${[["", "Not reviewed"], ["qtl", "QTL data"], ["not_qtl", "Not QTL data"], ["needs_recheck", "Needs recheck"]].map(([value, label]) => `<option value="${value}" ${reviewDraft.value === value ? "selected" : ""}>${label}</option>`).join("")}</select>
+        <textarea class="dq-input mf-qtl-review-note" data-record="${id}" aria-label="Review reason for paper ${id}" placeholder="Reason / evidence URL…">${esc(reviewDraft.note)}</textarea>
+        <button type="button" class="rec-btn mf-save-qtl-review" data-record="${id}">Save decision</button>
+        <div class="rec-sub">${p.qtl_reviewed_at ? `Saved ${esc(new Date(p.qtl_reviewed_at).toLocaleString())}` : ""}</div></td>
+      <td>${run?.at ? esc(new Date(run.at).toLocaleString()) : "—"}</td>
+      <td><div class="mf-paper-btns">${build}${check}</div></td>`.replace(/<td(?=\s|>)/g, () => `<td data-label="${esc(COLUMNS[cellIndex++][1])}"`);
   }
 
   function bodyHtml(id) {
     const rows = rowsOf(id), locs = data.locations.filter((l) => l.record_id === id);
-    const hand = needsYou(id);
-    const items = (list) => `<ul>${list.map(([what, reason]) => `<li><code>${esc(what)}</code> — ${esc(reason)}</li>`).join("")}</ul>`;
-    const why = hand.length
-      ? `<div class="mf-norows"><strong>Needs you.</strong> ${rows.length ? "Some data could not be fetched automatically:" : "No manifest row was made, because:"}
-          ${items(hand.map((h) => [h.what, h.why]))}
-          <span class="rec-sub">Open or download these by hand (or raise the size limit), then press Rebuild.</span></div>`
-      : rows.length ? ""
-      : `<div class="mf-norows mf-nothing"><strong>No manifest row:</strong> nothing at the download locations can become one.
-          ${items(noRowReasons(id).length ? noRowReasons(id) : [["—", "no download location was recorded"]])}</div>`;
-    return `<div class="mf-paper-body">${why}${locs.map((l) => locationHtml(l, !rows.length)).join("")}
+    const state = followUp(id);
+    const p = data.records[id] || {};
+    const requests = state.reasons.filter((r) => r.kind === "request");
+    const requestUrls = ManifestStatus.requestLinks(state.reasons, p.publication_url || (p.doi ? `https://doi.org/${p.doi}` : ""));
+    const curatorSection = p.curator_note ? `<section class="mf-curator-note"><h3>Curator notes / recheck evidence</h3><p>${esc(p.curator_note)}</p></section>` : "";
+    const requestSection = requests.length ? `<section class="mf-request-links"><h3>Access request — pages and instructions</h3>
+      <p>Open the recorded application page or author-request instructions:</p>
+      ${requestUrls.length ? `<ul>${requestUrls.map((r) => `<li><a class="rec-url" href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${esc(r.url)}</a>${r.fallback ? '<div class="rec-sub">No separate application URL recorded. Check this paper’s Data availability statement for author contact instructions.</div>' : ""}</li>`).join("")}</ul>` : '<p>No application URL was recorded. The report calls for contacting the authors; verify their contact details in the paper.</p>'}
+      <ul>${requests.map((r) => `<li>${esc(r.why)}</li>`).join("")}</ul></section>` : "";
+    const why = state.reasons.length
+      ? `<div class="mf-norows"><strong>Follow-up by cause</strong><ul>${state.reasons.map((r) => `<li><strong>${esc(ManifestStatus.labels[r.kind])}</strong>: <code>${esc(r.what)}</code> — ${esc(r.why)}</li>`).join("")}</ul>
+        <span class="rec-sub">Network and tool failures do not establish an access application requirement. Review the cause before retrying.</span></div>`
+      : state.good.length ? '<p class="rec-sub">Data downloaded and processed. Review candidate rows below; failed alternate URLs remain in source history.</p>'
+      : `<div class="mf-norows mf-nothing"><strong>No usable data found.</strong> Inspect source reports below.</div>`;
+    return `<div class="mf-paper-body">${curatorSection}${requestSection}${why}${locs.map((l) => locationHtml(l, !rows.length)).join("")}
       ${rows.length ? `<div class="table-wrap"><table class="rec-table"><thead><tr><th>Status</th><th>Dataset</th><th>Context</th><th>Pop.</th><th>N</th><th>Build</th><th>File</th><th>Data</th><th>Issues</th><th></th></tr></thead>
         <tbody>${rows.map(rowHtml).join("")}</tbody></table></div>` : ""}</div>`;
   }
 
-  const paperHtml = (id) => `<div class="dq-paper mf-paper" data-record="${id}"><div class="mf-paper-head">${headHtml(id)}</div>
-    ${openPapers.has(id) && isBuilt(id) ? bodyHtml(id) : ""}</div>`;
+  const paperHtml = (id) => `<tbody class="mf-paper" data-record="${id}"><tr class="mf-paper-head">${headHtml(id)}</tr>
+    ${openPapers.has(id) ? `<tr><td colspan="${COLUMNS.length}">${bodyHtml(id)}</td></tr>` : ""}</tbody>`;
 
   function shownIds() {
     const q = filter.value.trim().toLowerCase();
     return Object.keys(data.records).map(Number).filter((id) => {
       const p = data.records[id], rows = rowsOf(id), st = stateOf(id);
-      if (human.checked && p.not_eligible) return false;
+      if (!matchesColumns(id)) return false;
+      if (human.checked && !/\bhuman\b|homo sapiens/i.test(p.species || "")) return false;
+      if (show.value === "not_qtl" && p.qtl_review !== "not_qtl") return false;
       if (show.value === "sumstats" && p.data_kind !== "open_sumstats") return false;
       if (show.value === "exists" && st !== "exists") return false;
       if (show.value === "unbuilt" && st !== "unbuilt") return false;
       if (show.value === "built" && st !== "built") return false;
-      if (show.value === "needs" && !needsYou(id).length) return false;
+      if (show.value === "needs" && !followUp(id).human) return false;
+      if (ManifestStatus.priority.includes(show.value) && !followUp(id).kinds.includes(show.value)) return false;
       if (show.value === "tocheck" && !rows.some((r) => r.review === "pending")) return false;
       if (show.value === "approved" && !rows.some((r) => r.review === "approved")) return false;
       if (show.value === "processed" && !rows.some((r) => (r.evidence.data || {}).status === "processed")) return false;
@@ -370,22 +501,39 @@
     buildAll.disabled = !n;
     const builtN = ids.filter(isBuilt).length, toCheck = ids.reduce((n, id) => n + rowsOf(id).filter((r) => r.review === "pending").length, 0);
     const handN = ids.filter((id) => needsYou(id).length).length;
-    count.textContent = `${plural(ids.length, "paper")} · ${builtN} built · ${handN} need you · ${plural(toCheck, "row")} to check`;
+    count.textContent = `${plural(ids.length, "paper")} · ${builtN} built · ${handN} need an access / browser / budget action · ${plural(toCheck, "row")} to check`;
     const mf = (data.files || {})["qtl_manifest.tsv"];
     $("mf-file-rows").textContent = mf ? `· ${plural(mf.rows, "row")}` : "";
   }
 
   function render() {
+    const active = document.activeElement;
+    const activeKey = active?.dataset?.columnFilter;
+    const caret = activeKey && active.type === "search" ? active.selectionStart : null;
+    const scroll = body.querySelector?.(".mf-overview-wrap")?.scrollLeft || 0;
     const ids = shownIds();
     updateCount(ids);
-    body.innerHTML = ids.length ? ids.slice(0, limit).map(paperHtml).join("")
-      + (ids.length > limit ? `<button type="button" class="rec-btn mf-more">Show ${Math.min(PAGE, ids.length - limit)} more (${ids.length - limit} not shown)</button>` : "")
-      : '<div class="rec-empty">No paper matches.</div>';
+    body.innerHTML = `<div class="table-wrap mf-overview-wrap"><table class="rec-table mf-overview" role="table" aria-label="Manifest papers"><colgroup>${COLUMNS.map(([key]) => `<col class="mf-col-${key}">`).join("")}</colgroup><caption class="muted">One row per paper. Column filters combine with each other and the filters above.</caption><thead><tr>
+      ${COLUMNS.map(([, label]) => `<th scope="col">${label}</th>`).join("")}
+      </tr><tr class="mf-column-filters">${COLUMNS.map(([key, label]) => `<th data-label="${esc(label)}">${columnFilterHtml(key, label)}</th>`).join("")}</tr></thead>
+      ${ids.length ? ids.slice(0, limit).map(paperHtml).join("") : `<tbody><tr><td colspan="${COLUMNS.length}" class="rec-empty">No paper matches. Adjust or clear the filters above.</td></tr></tbody>`}</table></div>`
+      + (ids.length > limit ? `<button type="button" class="rec-btn mf-more">Show ${Math.min(PAGE, ids.length - limit)} more (${ids.length - limit} not shown)</button>` : "");
+    const wrap = body.querySelector?.(".mf-overview-wrap");
+    if (wrap) wrap.scrollLeft = scroll;
+    if (activeKey) {
+      const input = body.querySelector(`[data-column-filter="${activeKey}"]`);
+      input?.focus({ preventScroll: true });
+      if (input && caret !== null) input.setSelectionRange(caret, caret);
+    }
   }
 
   // While builds run only the paper headers change; redrawing everything would wipe a half-typed correction.
   function refreshHeads() {
-    body.querySelectorAll(".mf-paper").forEach((el) => { el.querySelector(".mf-paper-head").innerHTML = headHtml(+el.dataset.record); });
+    const editing = document.activeElement?.closest?.(".mf-human-decision")?.closest(".mf-paper");
+    body.querySelectorAll(".mf-paper").forEach((el) => {
+      if (el === editing) return; // Keep the focused curator editor intact while polling.
+      el.querySelector(".mf-paper-head").innerHTML = headHtml(+el.dataset.record);
+    });
   }
   function refreshPaper(id) {
     const el = body.querySelector(`.mf-paper[data-record="${id}"]`);
@@ -393,7 +541,14 @@
   }
 
   async function load(redraw = true) {
-    try { data = await (await fetch("/api/manifest")).json(); } catch { /* keep what is shown */ }
+    try {
+      const [manifest, records] = await Promise.all([
+        fetch("/api/manifest").then((r) => { if (!r.ok) throw new Error("Manifest unavailable"); return r.json(); }),
+        fetch("/api/records").then((r) => r.ok ? r.json() : []).catch(() => []),
+      ]);
+      data = manifest;
+      records.forEach((r) => { if (data.records[r.record_id]) Object.assign(data.records[r.record_id], {download_url: r.download_url, curator_note: r.curator_note, qtl_review: r.qtl_review || "", qtl_review_note: r.qtl_review_note || "", qtl_reviewed_at: r.qtl_reviewed_at || ""}); });
+    } catch { /* keep what is shown */ }
     if (redraw) render();
   }
 
@@ -462,7 +617,43 @@
     await build(ids.slice().sort((a, b) => b - a));  // in the order they are listed
   });
 
+  body.addEventListener("input", (e) => {
+    const edit = e.target.closest(".mf-qtl-review, .mf-qtl-review-note");
+    if (edit) {
+      const id = +edit.dataset.record, row = edit.closest(".mf-paper-head");
+      reviewDrafts.set(id, {value: row.querySelector(".mf-qtl-review").value, note: row.querySelector(".mf-qtl-review-note").value});
+      return;
+    }
+    const input = e.target.closest("[data-column-filter]");
+    if (!input) return;
+    columnFilters[input.dataset.columnFilter] = input.value;
+    limit = PAGE;
+    render();
+  });
+  async function saveQtlReview(button) {
+    const id = +button.dataset.record, row = button.closest(".mf-paper-head");
+    const decision = row.querySelector(".mf-qtl-review").value;
+    const note = row.querySelector(".mf-qtl-review-note").value;
+    button.disabled = true;
+    try {
+      const response = await fetch(`/api/records/${id}`, {method: "PATCH", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({qtl_review: decision, qtl_review_note: note})});
+      const saved = await response.json();
+      if (!response.ok) throw new Error(saved.detail || "Could not save curator decision");
+      if ((saved.qtl_review || "") !== decision || (saved.qtl_review_note || "") !== note) throw new Error("Server did not persist this decision. Reload and retry.");
+      Object.assign(data.records[id], {qtl_review: saved.qtl_review, qtl_review_note: saved.qtl_review_note, qtl_reviewed_at: saved.qtl_reviewed_at});
+      reviewDrafts.delete(id);
+      refreshPaper(id); updateCount(shownIds());
+    } catch (err) { alert(err.message); button.disabled = false; }
+  }
+
   body.addEventListener("click", (e) => {
+    const reviewButton = e.target.closest(".mf-save-qtl-review");
+    if (reviewButton) { saveQtlReview(reviewButton); return; }
+    if (e.target.closest(".mf-clear-columns")) {
+      Object.keys(columnFilters).forEach((key) => delete columnFilters[key]);
+      limit = PAGE; render(); return;
+    }
     const b = e.target.closest(".mf-build");
     if (b) { b.disabled = true; build([+b.dataset.record]); return; }
     const o = e.target.closest(".mf-open");

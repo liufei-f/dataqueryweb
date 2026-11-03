@@ -68,9 +68,14 @@ COLUMNS = [
     "curator_note",
     "saved_by",
     "record_code",
+    "qtl_review",
+    "qtl_review_note",
+    "qtl_reviewed_at",
     "saved_at",
 ]
 TEXT_FIELDS = [c for c in COLUMNS if c not in ("record_id", "saved_at")]
+QTL_REVIEW_VALUES = {"", "qtl", "not_qtl", "needs_recheck"}
+QTL_REVIEW_FIELDS = ("qtl_review", "qtl_review_note", "qtl_reviewed_at")
 
 
 # The one word of a record code: the first tissue or cell type its context names.
@@ -337,6 +342,9 @@ class RecordStore:
         unless the save brings one.
         """
         values = {f: _text(data.get(f)) for f in TEXT_FIELDS}
+        # AI autosaves and location edits never set or erase a curator's decision.
+        for field in QTL_REVIEW_FIELDS:
+            values[field] = ""
         values["saved_by"] = "auto" if auto else "human"
         values["record_code"] = ""  # assigned below for a new record, kept for an old one
         if not values["download_url"]:
@@ -367,6 +375,8 @@ class RecordStore:
                 merged["curator_note"] = values["curator_note"] or old["curator_note"]
                 merged["saved_by"] = values["saved_by"]
                 merged["record_code"] = old["record_code"]
+                for field in QTL_REVIEW_FIELDS:
+                    merged[field] = old[field]
                 db.execute(
                     f"UPDATE records SET {', '.join(f'{f} = ?' for f in TEXT_FIELDS)}, "
                     "saved_at = ?, locations = ? WHERE record_key = ?",
@@ -401,10 +411,18 @@ class RecordStore:
         return self.update(record_id, curator_note=note)
 
     def update(
-        self, record_id: int, *, curator_note: str | None = None, confirm: bool = False
+        self, record_id: int, *, curator_note: str | None = None, confirm: bool = False,
+        qtl_review: str | None = None, qtl_review_note: str | None = None,
     ) -> dict[str, Any] | None:
-        """Edit the note and/or mark an auto-saved record as confirmed by a person."""
+        """Edit curator notes, confirmation or an explicit, reversible QTL decision."""
+        if qtl_review is not None and qtl_review not in QTL_REVIEW_VALUES:
+            raise ValueError("qtl_review must be qtl, not_qtl, needs_recheck or empty")
         with self._connect() as db:
+            if qtl_review is not None:
+                db.execute("UPDATE records SET qtl_review = ?, qtl_reviewed_at = ? WHERE record_id = ?",
+                           [qtl_review, datetime.now(UTC).isoformat(timespec="seconds"), record_id])
+            if qtl_review_note is not None:
+                db.execute("UPDATE records SET qtl_review_note = ? WHERE record_id = ?", [qtl_review_note, record_id])
             if curator_note is not None:
                 db.execute(
                     "UPDATE records SET curator_note = ? WHERE record_id = ?",
@@ -435,6 +453,11 @@ class RecordStore:
             ):
                 found.append(r)
         return found
+
+    def get(self, record_id: int) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM records WHERE record_id = ?", [record_id]).fetchone()
+        return dict(row) if row else None
 
     def all(self) -> list[dict[str, Any]]:
         with self._connect() as db:

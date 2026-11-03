@@ -10,9 +10,10 @@ The model works through tools, one call at a time, until it submits:
   limit and the free disk space; a URL already downloaded for another paper is reused).
 - ``inspect_local`` — the first lines of a downloaded file or archive member.
 - ``run_python`` — Python the model writes to turn a table into one the importer reads
-  (``<name>_processed.tsv.gz``). It runs in the dataset folder with no network, no API keys
-  and a time limit; code that reaches for the network, other processes or deletes files is
-  refused before it runs.
+  (``<name>_processed.tsv.gz``), including a narrowly scoped join to a documented,
+  same-study variant map when needed. It runs in the dataset folder with no network, no API
+  keys and a time limit; code that reaches for the network, other processes or deletes files
+  is refused before it runs.
 - ``validate`` — read a file exactly as ``load_gwas_qtl_catalog.py`` will (pandas.read_csv
   with the manifest's delimiter and columns) and check the values. A row can only point at a
   file that passed.
@@ -123,18 +124,24 @@ ids MUST be chr_start_end (chr1_1000_2000); rewrite them if they are written oth
 chi-square instead of p, no header, is parquet/xlsx/inside an archive, or uses whitespace: \
 write Python with run_python that produces <original name>_processed.tsv.gz (tab-separated, \
 with a header) next to the original. Never invent values: if alleles or positions exist \
-nowhere, the table cannot be used (say so in skipped_tables).
+neither in the association file nor in a verified companion map, the table cannot be used.
 
-DOWNLOAD ONLY QTL SUMMARY STATISTICS. Download a file only after peek_file (or a listing \
-with a clear README) showed it is a table of QTL associations, or an archive of such tables. \
-Never download anything else: no reference or annotation data (dbSNP, gene annotation, HGNC, \
-Ensembl/GENCODE, genome FASTA, chain files, array platform annotations), no genotypes, \
-expression matrices, peaks or counts, no supplementary bundles, web pages, XML or PDFs \
-(read those with open_url). Processing may only use the downloaded summary statistics \
-themselves. If a table can only be made loadable with outside reference data (e.g. it has \
-rsIDs or positions but no chromosome anywhere), do not process it: list it in \
-skipped_tables with what it lacks. Phenotype ids that are not Ensembl (gene symbols, RefSeq, \
-probe ids) are kept as they are; the row is flagged for a person.
+DOWNLOAD QTL SUMMARY STATISTICS AND DOCUMENTED STUDY COMPANION MAPS ONLY. Download an \
+association file after peek_file (or a listing with a clear README) shows it is a QTL table \
+or archive of such tables. A narrowly scoped exception allows a variant map/annotation file \
+when the paper or the same release's README explicitly links it to those association files \
+and the association rows reference its documented key (for example, rsID). Inspect the README, \
+the map header and examples, genome build, key uniqueness and allele definitions first. It may \
+be used only to add missing variant metadata to those same-study/same-release association rows; \
+never join association results to other analyses or use generic/external annotation. Do not \
+download a map based on its filename alone. Do not download other reference data (dbSNP, gene \
+annotation, HGNC, Ensembl/GENCODE, genome FASTA, chain files, array platform annotations), \
+genotypes, expression matrices, peaks or counts, unrelated supplementary bundles, web pages, \
+XML or PDFs (read pages with open_url). Python processing may read the downloaded association \
+file and its verified companion map in the dataset folder, with no network. Preserve association \
+rows and effect estimates, validate one-to-one/allele-resolved matches, and report unmatched or \
+ambiguous keys; never guess. Phenotype ids that are not Ensembl (gene symbols, RefSeq, probe \
+ids) are kept as they are; the row is flagged for a person.
 
 THE SERVER: 2 CPUs, 3 GB RAM. Process big tables in chunks (pandas chunksize ≤ 200000, \
 write with gzip in append mode). A 3 GB .gz file takes ~20 minutes; that is fine. Files \
@@ -1103,6 +1110,11 @@ def first_message(s: Session, previous: list[str]) -> str:
         "Saved data locations (found when the paper was screened; may be incomplete or wrong):",
         *[f"- {x.get('download_url')} [{x.get('content')}; {x.get('access_route')}] {x.get('extraction_note', '')[:200]}" for x in locs],
     ]
+    if r.get("qtl_review") or r.get("qtl_review_note") or r.get("curator_note"):
+        lines += ["", f"Curator classification: {r.get('qtl_review') or 'not reviewed'}",
+                  f"Curator evidence / correction: {r.get('qtl_review_note', '')[:4000]}",
+                  f"Record notes: {r.get('curator_note', '')[:6000]}",
+                  "Earlier AI QTL labels may be mistaken; distinguish software names from measured phenotypes and inspect the actual tables."]
     if p is not None:
         lines += ["", f"Paper text: {'FULL TEXT' if p.full_text else 'abstract/page only'}, "
                   f"{len(p.paragraphs) + len(p.availability)} paragraphs (read_paper).",

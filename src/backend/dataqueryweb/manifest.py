@@ -877,6 +877,8 @@ def already_exists(record: dict[str, Any], target: rules.Target) -> str:
 
 def eligible(record: dict[str, Any], *, all_species: bool = False) -> str:
     """"" when the record should be processed, else why not."""
+    if record.get("qtl_review") == "not_qtl":
+        return "human review: not QTL data" + (f" — {record['qtl_review_note']}" if record.get("qtl_review_note") else "")
     if not all_species and not HUMAN_RE.search(record.get("species", "")):
         return f"species is {record.get('species') or 'not stated'}, not human"
     return ""
@@ -893,6 +895,9 @@ async def build_record(
     ``step`` hears what is being done, for a progress line."""
     step = step or (lambda _: None)
     target = target or rules.load_target()
+    if record.get("qtl_review") == "not_qtl":
+        return {"record_id": record["record_id"], "rows": 0, "statuses": {}, "locations": {}, "tokens": 0,
+                "model": "", "note": "", "skipped": eligible(record, all_species=True)}
     if exists := already_exists(record, target):
         return {"record_id": record["record_id"], "rows": 0, "statuses": {}, "locations": {}, "tokens": 0,
                 "model": "", "note": "", "skipped": f"already exists in the reference manifest as {exists} — skipped"}
@@ -998,7 +1003,7 @@ def select(
     waiting ones, oldest first."""
     if record_ids:
         by_id = {r["record_id"]: r for r in saved}
-        return [by_id[i] for i in dict.fromkeys(record_ids) if i in by_id]
+        return [by_id[i] for i in dict.fromkeys(record_ids) if i in by_id and by_id[i].get("qtl_review") != "not_qtl"]
     todo = []
     for record in sorted(saved, key=lambda r: r["record_id"]):
         if record_ids:
@@ -1029,7 +1034,8 @@ class Batch:
 
     def __init__(self, todo: list[dict[str, Any]], store: ManifestStore, *, no_llm: bool = False,
                  include_supplements: bool = False, target: rules.Target | None = None,
-                 data: fetch.Options | None = None) -> None:
+                 data: fetch.Options | None = None, record_store: records.RecordStore | None = None) -> None:
+        self.record_store = record_store
         self.todo, self.store, self.no_llm, self.data = todo, store, no_llm, data
         self.cancel = threading.Event()  # tells download and processing threads to stop
         self.include_supplements, self.target = include_supplements, target
@@ -1077,6 +1083,8 @@ class Batch:
             i = 0
             while i < len(self.todo):  # the list grows when records are queued during the run
                 record = self.todo[i]
+                if self.record_store is not None:
+                    record = self.record_store.get(record["record_id"]) or record
                 rid = record["record_id"]
                 self.current = current = {"record_id": rid, "title": record["publication_title"], "step": "",
                                           "since": datetime.now().astimezone().isoformat(timespec="seconds")}
@@ -1153,7 +1161,7 @@ async def run(args: argparse.Namespace) -> int:
     print(f"{len(todo)} record(s) to process · reference manifest: {target.path or 'not found (built-in vocabulary)'}")
     data = fetch.Options(fetch.data_dir(store.path), download=not args.no_download, max_bytes=args.max_gb * 1e9)
     batch = Batch(todo, store, no_llm=args.no_llm, include_supplements=args.include_supplements, target=target,
-                  data=data)
+                  data=data, record_store=saved)
     await batch.run(lambda line, ok: print(line, file=sys.stdout if ok else sys.stderr))
     if batch.state == "usage_limit":
         print("Stopping: the LLM's usage limit is reached. Re-run later; finished records are kept.")

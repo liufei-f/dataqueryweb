@@ -167,11 +167,16 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
     @app.patch("/api/records/{record_id}")
     async def edit_record(record_id: int, data: JsonBody) -> dict[str, Any]:
         note = data.get("curator_note")
-        row = saved.update(
-            record_id,
-            curator_note=None if note is None else str(note),
-            confirm=data.get("saved_by") == "human",
-        )
+        try:
+            row = saved.update(
+                record_id,
+                curator_note=None if note is None else str(note),
+                confirm=data.get("saved_by") == "human",
+                qtl_review=None if "qtl_review" not in data else str(data["qtl_review"]),
+                qtl_review_note=None if "qtl_review_note" not in data else str(data["qtl_review_note"]),
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         if row is None:
             raise HTTPException(404, "No such record")
         return row
@@ -214,9 +219,9 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
     async def list_manifest() -> dict[str, Any]:
         """Candidate manifest rows and per-location reports, with what explains them."""
         reference = rules.load_target().publications
-        papers = {r["record_id"]: {**{k: r[k] for k in ("publication_title", "doi", "first_author", "year", "journal",
+        papers = {r["record_id"]: {**{k: r[k] for k in ("publication_title", "doi", "first_author", "year", "journal", "preprint_server",
                                                          "qtl_type", "qtl_context", "publication_url", "species", "saved_by",
-                                                         "record_code")},
+                                                         "record_code", "qtl_review", "qtl_review_note", "qtl_reviewed_at")},
                                    "n_locations": n_locations(r), "data_kind": data_kind(r),
                                    "already_exists": reference.get((r.get("doi") or "").strip().lower(), ""),
                                    "not_eligible": manifest.eligible(r)}
@@ -282,7 +287,7 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
             saved.all(), manifests.processed(), record_ids=ids, limit=limit,
             redo=bool(data.get("redo")), all_species=bool(data.get("all_species")))
         if not todo:
-            raise HTTPException(400, "No such saved record" if ids else "No saved record is waiting")
+            raise HTTPException(400, "No eligible saved record (missing or marked not QTL)" if ids else "No saved record is waiting")
         if job is not None and job.running:  # a Build click while a run goes: join its queue
             job.add(todo)
             return run_status()
@@ -293,7 +298,7 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         options = fetch.Options(data_root, download=data.get("download", True) is not False,
                                 max_bytes=max(0.0, max_gb) * 1e9)
         job = manifest.Batch(todo, manifests, no_llm=bool(data.get("no_llm")),
-                             include_supplements=bool(data.get("include_supplements")), data=options)
+                             include_supplements=bool(data.get("include_supplements")), data=options, record_store=saved)
         job.task = asyncio.create_task(job.run())
         app.state.manifest_job = job
         return run_status()

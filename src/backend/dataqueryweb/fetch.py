@@ -48,7 +48,7 @@ from dataqueryweb import manifest_rules as rules
 if TYPE_CHECKING:  # manifest imports this module
     from dataqueryweb.manifest import Candidate
 
-MAX_PAPER_GB = float(os.environ.get("MANIFEST_MAX_GB") or 50)  # per paper, by default
+MAX_PAPER_GB = float(os.environ.get("MANIFEST_MAX_GB") or 1000)  # per paper, by default
 MIN_FREE = 20e9  # never fill the disk past this
 CHUNK_ROWS = 500_000
 CHECK_ROWS = 2000
