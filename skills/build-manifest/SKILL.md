@@ -42,7 +42,7 @@ program refuses or flags it whatever you do.
 | QTL type not eQTL / sQTL / caQTL / pQTL (mQTL, isoQTL, apaQTL, …) | skipped_tables "qtl_type not in the manifest"; never relabel it | submit refuses other types |
 | Results of a reused resource (GTEx, eQTLGen, …), non-human cohort | skipped_tables | — |
 | Genotypes, expression matrices, counts, peaks, covariates | not a table; note_location `not_data` | — |
-| Paper already in the reference manifest | add only the QTL types / contexts it lacks; use its dataset name (the first message lists what it has) | — (not checked at submit) |
+| Paper already in the reference manifest (same DOI) | not built at all: LocusCompare has it (you will not see such a paper) | the queue skips it |
 | A person marked the record `not_qtl` | do not build it | the queue skips it |
 
 **Columns: what is missing and what supplies it**

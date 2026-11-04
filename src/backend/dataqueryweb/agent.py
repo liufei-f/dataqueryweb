@@ -143,8 +143,9 @@ chi-square instead of p, no header, is parquet/xlsx/inside an archive, or uses w
 write Python with run_python that produces <original name>_processed.tsv.gz (tab-separated, \
 with a header) next to the original. Never invent values: if positions or the effect allele \
 exist neither in the association file nor in a verified companion map, the table cannot be used.
-- NO NOMINAL P-VALUE (nor -log10 p / chi-square to make it from) → the table cannot be \
-processed: assess it processable no and list it in skipped_tables. This is enforced.
+- NO NOMINAL P-VALUE (nor -log10 p / 1-df chi-square / z score to compute it from) → the table \
+cannot be processed: assess it processable no and list it in skipped_tables. A t statistic or \
+beta / se alone is not enough. This is enforced. From z: p = erfc(|z| / sqrt(2)) (two-sided).
 - MISSING NON-EFFECT ALLELE is NOT a reason to skip: a fixed program maps it. Write the table \
 with the effect allele in alt and ref empty, then call fill_alleles — with map_file set to the \
 study's own SNP info/variant map when the source provides one (before liftover), otherwise \
@@ -272,8 +273,9 @@ TOOLS: list[dict[str, Any]] = [
                   "file or tool (liftover, fill_alleles, add_rsid) supplies what is missing"},
          "missing": {"type": "array", "items": {"type": "string"}, "description": "standard columns the file lacks"},
          "reason": {"type": "string", "description": "for no: why (it goes to skipped_tables)"},
-         "pval_column": {"type": "string", "description": "for ready / yes: the nominal p-value column (or -log10 p "
-                         "/ chi-square); it must be among the format check's p-value columns. No p-value → no"}},
+         "pval_column": {"type": "string", "description": "for ready / yes: the nominal p-value column (or the -log10 p "
+                         "/ 1-df chi-square / z score column p is computed from); it must be among the format check's "
+                         "p-value or z-score columns. No p-value and nothing to compute it from → no"}},
                     "required": ["path", "contents", "description", "processable"]}},
     {"name": "run_python", "description": "Run Python 3 (pandas, numpy, pyarrow, gzip, zipfile, tarfile, "
      "math available; no network) with the dataset folder as the working directory. Use relative paths. "
@@ -815,10 +817,12 @@ class Session:
             for c in checks:
                 usable |= set(c.get("pvalue_candidates") or [])
                 usable |= {v for r, v in (c.get("roles_found") or {}).items() if r in ("pval", "neglog10p", "chisq")}
+                usable |= set(c.get("zscore_candidates") or [])
             if not usable:
                 return {"error": "the format check found no nominal p-value column (values 0–1, not FDR/q/adjusted/"
-                                 "permutation, or -log10 p / chi-square) in the inspected rows: without a p-value the "
-                                 "table cannot be processed; assess it processable no"}
+                                 "permutation), and no -log10 p, 1-df chi-square or z score to compute it from, in the "
+                                 "inspected rows: without a p-value the table cannot be processed (a t statistic or "
+                                 "beta / se alone is not enough); assess it processable no"}
             if pval_column.strip() not in usable:
                 return {"error": f"name the nominal p-value column as pval_column; the format check accepts: "
                                  f"{', '.join(sorted(usable))}"}
@@ -1098,6 +1102,17 @@ NA_VALUES = ["NA", "NaN", ".", "", "nan"]
 ENSG = re.compile(r"^ENSG\d{11}$")
 
 
+ZSCORE_NAME = re.compile(r"z|zs|zscore|z_score|z_?stat(istic)?|z_?val(ue)?|z_?wald|wald_?z")
+
+
+def _is_number(v: str) -> bool:
+    try:
+        float(v)
+    except ValueError:
+        return False
+    return True
+
+
 def format_check(lines: list[str]) -> dict[str, Any]:
     """The program's own look at a table's first lines: delimiter, header and manifest columns found."""
     if not lines:
@@ -1117,11 +1132,17 @@ def format_check(lines: list[str]) -> dict[str, Any]:
              and (vals := [r[i].strip() for r in rows if i < len(r) and r[i].strip().lower() not in rules.NA])
              and all(rules.VALUE_TESTS["pval"](v) for v in vals)
              and not all(v in ("0", "1") for v in vals)]
+    # A z score gives the nominal p exactly (two-sided: p = erfc(|z| / sqrt(2))); a t statistic
+    # needs its degrees of freedom and beta / se an assumed normal, so neither counts.
+    zs = [c for i, c in enumerate(cols)
+          if ZSCORE_NAME.fullmatch(rules.norm(c)) and not rules.ADJUSTED_RE.search(rules.norm(c))
+          and (vals := [r[i].strip() for r in rows if i < len(r) and r[i].strip().lower() not in rules.NA])
+          and all(_is_number(v) for v in vals)]
     missing = [r for r in rules.REQUIRED_ROLES if r not in found and r not in roles.derivable]
     return {"kind": "table", "delimiter": {"\t": "tab", " ": "whitespace"}.get(sep, sep), "columns": len(cols),
             "header": cols[:60], "rows_same_width": widths <= {len(cols)}, "roles_found": found,
             "derivable": roles.derivable, "required_missing": missing, "issues": roles.issues,
-            "pvalue_candidates": pvals,
+            "pvalue_candidates": pvals, "zscore_candidates": zs,
             "build_hint": roles.build_hint}
 
 

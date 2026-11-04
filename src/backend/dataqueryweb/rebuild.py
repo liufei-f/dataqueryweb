@@ -198,6 +198,10 @@ def prepare(s: Session, skill_text: str) -> str:
     sources = s.source_files()
     reused = load_assessments(s)
     for rel in sources:
+        # A tar archive has no index: listing it decompresses the whole file (GBs), so the
+        # model inspects archives itself; only plain tables and zips are checked here.
+        if rel.endswith((".tar", ".tar.gz", ".tgz")):
+            continue
         if rel not in s.checked:
             try:
                 s.inspect_local(rel)
@@ -205,7 +209,8 @@ def prepare(s: Session, skill_text: str) -> str:
                 s.checked[rel] = {"kind": "unreadable", "error": str(exc)[:200]}
     left = s.unassessed()
     lines += ["", f"DOWNLOADED FILES: {len(sources)} in {s.folder_name()}/, each already format-checked by the "
-              f"program (inspect_local is optional for them). Assessments reused from earlier builds of unchanged "
+              "program, except tar archives (inspect_local is optional for the others). Assessments reused from "
+              f"earlier builds of unchanged "
               f"files: {len(reused)}; still to assess: {len(left)}. assess_file takes a glob for files with the "
               "same header and contents (e.g. every per-cell-type table), so one call can cover a group."]
     if reused:
