@@ -659,7 +659,7 @@ ISSUES: dict[str, str] = {
     "data_too_large": "Not downloaded: over the per-paper size limit or the free disk space; raise the limit or download elsewhere.",
     "download_failed": "Downloading the files failed; see the data section for the error.",
     "processing_failed": "No processing plan produced values the importer accepts; see the plans that were tried.",
-    "rsid_not_added": "The table has no rs id column; add_rsid fills one from the local dbSNP copy.",
+    "rsid_not_added": "The table has no rs id column, or leaves empty rs ids that dbSNP holds; add_rsid fills them from the local dbSNP copy.",
     "non_full_summary_statistics": "Not full summary statistics: the table lacks some tested variant–phenotype pairs "
                                    "(e.g. significant pairs only); kept because no full table was found. "
                                    "The row's note says what it holds.",

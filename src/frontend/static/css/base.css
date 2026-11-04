@@ -1010,14 +1010,14 @@ code { color: var(--ink); }
 
 /* Manifest overview table: rebalanced default widths (sum 100%) and drag-to-resize headers. */
 .mf-col-index { width: 6.5%; }
-.mf-col-paper { width: 10%; }
+.mf-col-paper { width: 7.5%; }
 .mf-col-journal { width: 5%; }
-.mf-col-data_url { width: 9%; }
+.mf-col-data_url { width: 4.5%; }
 .mf-col-qtl { width: 5.5%; }
 .mf-col-context { width: 8%; }
 .mf-col-sample_size { width: 6.5%; }
-.mf-col-build { width: 7%; }
-.mf-col-result { width: 11%; }
+.mf-col-build { width: 9.5%; }
+.mf-col-result { width: 15.5%; }
 .mf-col-files { width: 6.5%; }
 .mf-col-review { width: 8.5%; }
 .mf-col-human { width: 8%; }
@@ -1040,3 +1040,27 @@ code { color: var(--ink); }
 .mf-overview > thead > tr:first-child > th:last-child .mf-col-resize { display: none; }
 body.mf-col-resizing { cursor: col-resize; user-select: none; }
 @media (max-width: 1500px) { .mf-col-resize { display: none; } }
+
+/* Build progress: where the latest build is or stopped (progress.py). */
+.mf-prog-cell .badge { margin-bottom: 2px; }
+.mf-prog-where { font-size: 12.5px; margin-top: 2px; }
+.mf-progress { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 0 0 12px; }
+.mf-progress h3 { margin: 0 0 8px; font-size: 15px; display: flex; gap: 8px; align-items: center; }
+.mf-phases { list-style: none; padding: 0; margin: 0 0 10px; display: flex; flex-wrap: wrap; gap: 4px 6px; font-size: 12px; }
+.mf-phases li { padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); }
+.mf-ph-done { color: #166534; border-color: #bbf7d0 !important; }
+.mf-ph-now { background: #fee2e2; color: #991b1b; border-color: #fecaca !important; font-weight: 600; }
+.mf-ph-todo { color: var(--muted); }
+.mf-prog-facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0 0 8px; font-size: 13px; }
+.mf-prog-facts dt { font-weight: 600; }
+.mf-prog-facts dd { margin: 0; overflow-wrap: anywhere; }
+.mf-oc-refused, .mf-oc-error, .mf-oc-rejected, .mf-oc-interrupted { color: #b91c1c; font-weight: 600; }
+.mf-oc-ok { color: #166534; }
+.mf-sources > summary { cursor: pointer; font-weight: 600; margin: 8px 0; }
+@media (max-width: 640px) { .mf-prog-facts { grid-template-columns: 1fr; } }
+.mf-legend { margin: 0 0 10px; font-size: 13px; }
+.mf-legend > summary { cursor: pointer; color: var(--muted); }
+.mf-legend dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 6px 0 0; }
+.mf-legend dt { font-weight: 600; }
+.mf-legend dd { margin: 0; }
+@media (max-width: 640px) { .mf-legend dl { grid-template-columns: 1fr; } }

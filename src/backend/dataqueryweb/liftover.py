@@ -74,7 +74,8 @@ def lift(path: Path, lifter: Lifter, columns: dict[str, str],
                 df.loc[minus, c] = df.loc[minus, c].str.upper().str.translate(COMPLEMENT)
             df = df[ok]
             if vid_c and vid_c in df.columns:
-                df[vid_c] = "chr" + df[chrom_c] + "_" + df[pos_c] + "_" + df[ref_c] + "_" + df[alt_c]
+                vid = "chr" + df[chrom_c] + "_" + df[pos_c] + "_" + df[ref_c] + "_" + df[alt_c]
+                df[vid_c] = vid.where(df[ref_c].ne("") & df[alt_c].ne(""), "")  # an unresolved allele stays empty
             rows += len(ok)
             kept += len(df)
             flipped += int(minus[ok].sum())

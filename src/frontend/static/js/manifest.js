@@ -418,12 +418,16 @@
   }
 
   function resultOf(id) {
-    const state = dataResult(id);
-    const cls = state.complete ? "mf-d-ok" : ["network", "software"].includes(state.kinds[0]) ? "mf-d-bad" : "mf-d-warn";
-    return `<span class="badge ${cls}">${esc(state.label)}</span>
-      ${state.good.length ? `<div class="rec-sub">${state.good.length}/${state.rows.length} rows downloaded or processed</div>` : ""}
-      ${state.partial ? '<div class="rec-sub">Partial statistics only; full data not ready</div>' : ""}
-      ${needsBadge(id, state.label)}${humanBottlenecks(state)}`;
+    // One answer (the filter's five words), then at most three short lines; the full account is in Details.
+    const state = dataResult(id), b = resultBucket(id), [label, help] = RESULT[b];
+    const cls = { ready: "mf-d-ok", partial: "mf-d-warn", needs_you: "mf-d-warn", none: "mf-d-bad", pending: "mf-d-none" }[b];
+    const rows = state.good.length ? `${state.good.length}/${state.rows.length} rows have data${state.partial ? " · partial statistics only" : ""}` : "";
+    const causes = state.kinds.map((k) => ManifestStatus.labels[k]);
+    const human = state.reasons.some((r) => ManifestStatus.human.has(r.kind));
+    return `<span class="badge ${cls}" title="${esc(help)}">${esc(label)}</span>
+      ${rows ? `<div class="rec-sub">${esc(rows)}</div>` : ""}
+      ${causes.length ? `<div class="rec-sub" title="${esc(state.reasons.map((r) => r.why).join("\n"))}">Cause: ${esc(causes.join(" · "))}</div>` : ""}
+      ${human ? '<div class="rec-sub">What to do: open Details</div>' : ""}`;
   }
 
   const columnFilters = {};
@@ -437,10 +441,104 @@
     return unique([...(p.download_url || "").split(/;\s*/), ...locsOf(id).map((l) => l.url), ...rowsOf(id).map((r) => r.source_url)])
       .filter((u) => safeUrl(u) !== "#");
   }
+  // Where the latest build is, or where it stopped (server: progress.py, read from the build log).
+  const STATE = {
+    running: ["Building", "mf-d-warn"], finished: ["Finished", "mf-d-ok"], interrupted: ["Interrupted", "mf-d-bad"],
+    stopped: ["Stopped", "mf-d-bad"], failed: ["Failed", "mf-d-bad"], usage_limit: ["Waiting for AI quota", "mf-d-warn"],
+    unknown: ["Unknown", "mf-d-none"],
+  };
+  const phaseOfTool = (tool) => (data.phases || []).find((p) => p.tools.includes(tool));
+  function progressOf(id) {
+    const pr = (data.progress || {})[id];
+    const live = stateOf(id) === "building" ? (job.active || [job.current]).find((c) => c?.record_id === id) : null;
+    if (live) {
+      const tool = ((live.step || "").match(/^AI: (\w+)/) || [])[1] || (/^rebuild:/.test(live.step || "") ? "rebuild" : "");
+      return { state: "running", phase: phaseOfTool(tool) || (pr && pr.phase) || null, step: live.step || "starting", pr };
+    }
+    return pr ? { state: pr.state, phase: pr.phase, pr } : null;
+  }
+  const phaseText = (ph) => ph ? `Phase ${ph.num} · ${ph.name}` : "";
+  function progressCell(id) {
+    const g = progressOf(id), run = (data.runs || {})[id];
+    if (!g) return `<strong>${esc(buildStatusOf(id))}</strong>`;
+    const [, cls] = STATE[g.state] || STATE.unknown;
+    const label = BUILD[buildBucket(id)][0];  // the same five words as the filter
+    const cause = { interrupted: "Interrupted", stopped: "Stopped by a person", failed: "Failed", usage_limit: "Waiting for AI quota" }[g.state];
+    const last = g.pr?.last;
+    const where = g.state === "finished" ? "" : `<div class="mf-prog-where">${g.state === "running" ? "Now" : "Stopped in"}: <strong>${esc(phaseText(g.phase) || "—")}</strong></div>`;
+    const step = g.state === "running" ? `<div class="rec-sub">${esc(String(g.step).slice(0, 140))}</div>`
+      : last && g.state !== "finished" ? `<div class="rec-sub">Last step: <code>${esc(last.tool)}</code>${last.done ? "" : " (unfinished)"}${last.why ? ` — ${esc(last.why.slice(0, 120))}` : ""}</div>` : "";
+    const why = ["stopped", "failed", "usage_limit"].includes(g.state) && run?.note ? `<div class="rec-sub">${esc(run.note.slice(0, 160))}</div>`
+      : g.state === "interrupted" ? '<div class="rec-sub">The log just ends: the server or machine stopped mid-build.</div>' : "";
+    const when = g.pr?.last_at ? new Date(g.pr.last_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    return `<span class="badge ${cls}" title="${esc(BUILD[buildBucket(id)][1])}">${esc(label)}</span>${when && g.state !== "running" ? ` <span class="rec-sub">${esc(when)}</span>` : ""}${cause ? `<div class="rec-sub"><strong>${esc(cause)}</strong></div>` : ""}${where}${step}${why}`;
+  }
+  function progressSection(id) {
+    const g = progressOf(id), pr = g?.pr;
+    if (!pr) return "";
+    const reached = new Set((pr.phases_reached || []).map((p) => p.num));
+    const current = g.phase?.num;
+    const steps = (data.phases || []).map((p) => {
+      const mark = p.num === current ? (g.state === "finished" ? "✓" : g.state === "running" ? "▶" : "■") : reached.has(p.num) ? "✓" : "·";
+      const cls = p.num === current && g.state !== "finished" ? "mf-ph-now" : reached.has(p.num) ? "mf-ph-done" : "mf-ph-todo";
+      return `<li class="${cls}"><span aria-hidden="true">${mark}</span> ${esc(p.num)} ${esc(p.name)}</li>`;
+    }).join("");
+    const last = pr.last;
+    const [label, cls] = STATE[g.state] || STATE.unknown;
+    const recent = (pr.recent || []).slice().reverse().map((r) => `<li><code>${esc(r.tool)}</code> <span class="mf-oc-${esc(r.outcome)}">${esc(r.outcome)}</span>${r.why ? ` — ${esc(r.why)}` : ""}</li>`).join("");
+    return `<section class="mf-progress"><h3>Build progress <span class="badge ${cls}">${esc(label)}</span></h3>
+      <ol class="mf-phases">${steps}</ol>
+      <dl class="mf-prog-facts">
+        ${last ? `<dt>${g.state === "finished" ? "Last step" : g.state === "running" ? "Current step" : "Stopped at"}</dt><dd><code>${esc(last.tool)}</code>${last.done ? ` (${esc(last.outcome)})` : " — had not finished"}${last.target ? ` · ${esc(last.target)}` : ""}${last.why ? `<div>Reason: ${esc(last.why)}</div>` : ""}${last.output ? `<div class="rec-sub">Last output: ${esc(last.output)}</div>` : ""}</dd>` : ""}
+        ${pr.problem ? `<dt>Problem</dt><dd class="mf-bad">${esc(pr.problem.tool)} ${esc(pr.problem.outcome)}: ${esc(pr.problem.why)}</dd>` : ""}
+        <dt>Next</dt><dd>${esc(pr.next || "")}</dd>
+        <dt>Run</dt><dd class="rec-sub">${esc(pr.run_id || "")} · ${pr.steps || 0} AI steps · ${(pr.tokens || 0).toLocaleString()} tokens</dd>
+      </dl>
+      ${recent ? `<details><summary>Recent steps (${(pr.recent || []).length})</summary><ul class="mf-log">${recent}</ul></details>` : ""}</section>`;
+  }
+
+  // The two columns each answer one question, with five answers. The detailed reason is shown
+  // under the answer in the cell, not as more filter options.
+  const BUILD = {
+    not_built: ["Not built", "No build has run for this paper yet."],
+    building: ["Building", "A build of this paper is running now."],
+    queued: ["Queued", "Waiting in the queue; it starts when a build slot is free."],
+    finished: ["Finished", "The last build ran to the end (submit or give up)."],
+    stopped: ["Stopped early", "The last build did not finish: stopped by a person, failed, interrupted by a restart, or waiting for AI quota. Rebuild resumes it."],
+    skipped: ["Skipped", "Not built on purpose: a person marked it not QTL data, or it is already in the reference manifest."],
+  };
+  const RESULT = {
+    ready: ["Ready", "Every manifest row has its data downloaded or processed, with full summary statistics. Rows may still need review."],
+    partial: ["Partial", "Some usable rows, but not all rows have data, or only partial statistics (e.g. significant pairs) exist."],
+    needs_you: ["Needs you", "A person must act: an access application, a browser-only download, or approving a larger download."],
+    none: ["No usable data", "The build finished without usable data; the cause is shown under it (network, tool, unsupported type, …)."],
+    pending: ["No result yet", "Not built, still building, or stopped before a result."],
+  };
+  // When the latest build started: its log, or the saved outcome for builds older than the logs.
+  function lastBuildAt(id) {
+    const g = (data.progress || {})[id], run = (data.runs || {})[id];
+    return [g?.started, run?.at].filter(Boolean).sort((a, b) => new Date(b) - new Date(a))[0] || "";
+  }
+  function buildBucket(id) {
+    const st = stateOf(id), g = (data.progress || {})[id], run = (data.runs || {})[id];
+    if (st === "excluded" || st === "exists") return "skipped";
+    if (st === "building" || st === "queued") return st;
+    if (g && g.state !== "finished") return "stopped";
+    if (!g && run && ["stopped", "failed", "usage_limit"].includes(run.outcome)) return "stopped";
+    return isBuilt(id) || run || g ? "finished" : "not_built";
+  }
+  function resultBucket(id) {
+    const state = followUp(id);
+    if (state.good.length) return state.complete ? "ready" : "partial";
+    if (state.human) return "needs_you";
+    return buildBucket(id) === "finished" ? "none" : "pending";
+  }
+
   function buildStatusOf(id) {
     const st = stateOf(id), run = (data.runs || {})[id];
     return st === "excluded" ? "Excluded by human" : st === "building" ? `Building${job.no_llm ? " (AI skipped)" : " with AI"}…`
       : st === "queued" ? "Queued" : run?.outcome === "failed" ? "Build failed"
+      : (data.progress || {})[id]?.state === "interrupted" ? "Build interrupted"
       : run?.outcome === "stopped" ? "Build stopped" : run?.outcome === "usage_limit" ? "Waiting for AI quota"
       : isBuilt(id) || run ? "Build completed" : "Not built";
   }
@@ -456,17 +554,12 @@
       context: [p.qtl_context, ...rows.map((r) => [r.biocontext, r.level_1_context, r.level_2_context].join(" "))].join(" "),
       sample_size: rows.map(r => [r.sample_size, r.biocontext].filter(Boolean).join(" ")).join(" "),
       files: `${rows.filter((r) => r.evidence.data?.status === "processed").length} processed ${rows.filter((r) => r.evidence.data?.status === "as_is").length} downloaded ${rows.length} candidate rows ` + rows.map((r) => r.file_path).join(" "),
-      date: run?.at ? `${run.at} ${new Date(run.at).toLocaleString()}` : "",
+      date: lastBuildAt(id) ? `${lastBuildAt(id)} ${new Date(lastBuildAt(id)).toLocaleString()}` : "",
     };
     return Object.entries(columnFilters).every(([key, value]) => {
       if (!value.trim()) return true;
-      if (key === "build") {
-        if (value === "ai_yes") return aiStatus(id) === "Yes";
-        if (value === "ai_no") return aiStatus(id).startsWith("No");
-        if (value === "ai_unknown") return aiStatus(id).startsWith("Unknown");
-        return buildStatusOf(id) === value;
-      }
-      if (key === "result") return value.startsWith("reason:") ? followUp(id).kinds.includes(value.slice(7)) : dataResult(id).label === value;
+      if (key === "build") return buildBucket(id) === value;
+      if (key === "result") return resultBucket(id) === value;
       if (key === "human") return (p.qtl_review || "") === (value === "unreviewed" ? "" : value);
       if (key === "review") return value === "none" ? !rows.length : rows.some((r) => r.review === value);
       return String(text[key] || "").toLowerCase().includes(value.trim().toLowerCase());
@@ -474,17 +567,12 @@
   }
   function columnFilterHtml(key, label) {
     if (key === "actions") return '<button type="button" class="rec-btn mf-clear-columns">Clear filters</button>';
-    const options = key === "build" ? [
-      ["ai_yes", "AI build: Yes"], ["ai_no", "AI build: No"], ["ai_unknown", "AI build: Unknown"],
-      ...["Excluded by human", "Not built", "Build completed", "Building with AI…", "Building (AI skipped)…", "Queued", "Build failed", "Build stopped", "Waiting for AI quota"].map((s) => [s, s]),
-    ] : key === "result" ? [
-      ...["Needs recheck", "Human decision: not QTL data", "Processed — review pending", "Downloaded / processed", "Partial success", "Build failed", "Pending", "Stopped", "Waiting for AI quota", "No usable data found", "In reference manifest", "Not attempted"].map((s) => [s, s]),
-      ...ManifestStatus.priority.map((kind) => [`reason:${kind}`, ManifestStatus.labels[kind]]),
-    ]
+    const options = key === "build" ? Object.entries(BUILD).map(([v, [t, d]]) => [v, t, d])
+      : key === "result" ? Object.entries(RESULT).map(([v, [t, d]]) => [v, t, d])
       : key === "human" ? [["unreviewed", "Not reviewed"], ["qtl", "QTL data"], ["not_qtl", "Not QTL data"], ["needs_recheck", "Needs recheck"]]
       : key === "review" ? [["pending", "To review"], ["approved", "Has approved rows"], ["rejected", "Has rejected rows"], ["none", "No candidate rows"]] : null;
     const attrs = `data-column-filter="${key}" aria-label="Filter ${esc(label)}"`;
-    if (options) return `<select class="dq-input mf-column-filter" ${attrs}><option value="">All</option>${options.map(([v, t]) => `<option value="${esc(v)}" ${columnFilters[key] === v ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>`;
+    if (options) return `<select class="dq-input mf-column-filter" ${attrs}><option value="">All</option>${options.map(([v, t, d]) => `<option value="${esc(v)}" ${d ? `title="${esc(d)}"` : ""} ${columnFilters[key] === v ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>`;
     return `<input type="search" class="dq-input mf-column-filter" ${attrs} value="${esc(columnFilters[key] || "")}" placeholder="${key === "date" ? "e.g. 2026-11-02" : "Filter…"}">`;
   }
 
@@ -519,7 +607,7 @@
       <td class="mf-url-cell">${urlList || '<span class="muted">No data URL recorded</span>'}</td>
       <td>${esc(types) || "—"}</td><td class="mf-context-cell">${esc(contexts.slice(0, 3).join("; ")) || "—"}${contexts.length > 3 ? `<details><summary>${contexts.length - 3} more contexts</summary>${esc(contexts.slice(3).join("; "))}</details>` : ""}</td>
       <td>${sampleSizeHtml(rows)}</td>
-      <td><strong>${esc(status)}</strong><div class="rec-sub">AI build: ${esc(aiStatus(id))}</div>${busy && (job.active || [job.current]).some(c => c?.record_id === id) ? `<div class="rec-sub">${esc((job.active || [job.current]).find(c => c?.record_id === id)?.step || "starting")}</div>` : ""}${lastOutcome(id)}</td>
+      <td class="mf-prog-cell">${["queued", "excluded", "exists"].includes(st) || !(data.progress || {})[id] && st !== "building" ? `<strong title="${esc(BUILD[buildBucket(id)][1])}">${esc(BUILD[buildBucket(id)][0])}</strong>${st === "excluded" ? '<div class="rec-sub">Human decision: not QTL data</div>' : st === "exists" ? '<div class="rec-sub">Already in the reference manifest</div>' : st === "queued" && (job.queue || []).includes(id) ? `<div class="rec-sub">Position ${(job.queue || []).indexOf(id) + 1} of ${(job.queue || []).length}</div>` : ""}` : progressCell(id)}${(data.progress || {})[id] || busy ? "" : lastOutcome(id)}</td>
       <td>${resultOf(id)}</td>
       <td><span title="Unique registered source files present on the server; excludes generated outputs and unregistered manually copied files">Downloaded: ${data.downloaded_files?.[id] ?? "—"}</span><br>
         <span title="Manifest rows ready to use without conversion">No need to process: ${downloaded}</span><br>
@@ -533,7 +621,7 @@
         <textarea class="dq-input mf-qtl-review-note" data-record="${id}" aria-label="Review reason for paper ${id}" placeholder="Reason / evidence URL…">${esc(reviewDraft.note)}</textarea>
         <button type="button" class="rec-btn mf-save-qtl-review" data-record="${id}">Save decision</button>
         <div class="rec-sub">${p.qtl_reviewed_at ? `Saved ${esc(new Date(p.qtl_reviewed_at).toLocaleString())}` : ""}</div></td>
-      <td>${run?.at ? esc(new Date(run.at).toLocaleString()) : "—"}</td>
+      <td>${lastBuildAt(id) ? esc(new Date(lastBuildAt(id)).toLocaleString()) : "—"}</td>
       <td><div class="mf-paper-btns">${build}${check}</div></td>`.replace(/<td(?=\s|>)/g, () => `<td data-label="${esc(COLUMNS[cellIndex++][1])}"`);
   }
 
@@ -548,12 +636,15 @@
       <p>Open the recorded application page or author-request instructions:</p>
       ${requestUrls.length ? `<ul>${requestUrls.map((r) => `<li><a class="rec-url" href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${esc(r.url)}</a>${r.fallback ? '<div class="rec-sub">No separate application URL recorded. Check this paper’s Data availability statement for author contact instructions.</div>' : ""}</li>`).join("")}</ul>` : '<p>No application URL was recorded. The report calls for contacting the authors; verify their contact details in the paper.</p>'}
       <ul>${requests.map((r) => `<li>${esc(r.why)}</li>`).join("")}</ul></section>` : "";
-    const why = state.reasons.length
-      ? `<div class="mf-norows"><strong>Follow-up by cause</strong><ul>${state.reasons.map((r) => `<li><strong>${esc(ManifestStatus.labels[r.kind])}</strong>: <code>${esc(r.what)}</code> — ${esc(r.why)}</li>`).join("")}</ul>
+    // Access requests already have their own section above; list the other causes once.
+    const causes = requests.length ? state.reasons.filter((r) => r.kind !== "request") : state.reasons;
+    const why = causes.length
+      ? `<div class="mf-norows"><strong>Follow-up by cause</strong><ul>${causes.map((r) => `<li><strong>${esc(ManifestStatus.labels[r.kind])}</strong>: <code>${esc(r.what)}</code> — ${esc(r.why)}</li>`).join("")}</ul>
         <span class="rec-sub">Network and tool failures do not establish an access application requirement. Review the cause before retrying.</span></div>`
       : state.good.length ? '<p class="rec-sub">Data downloaded and processed. Review candidate rows below; failed alternate URLs remain in source history.</p>'
       : `<div class="mf-norows mf-nothing"><strong>No usable data found.</strong> Inspect source reports below.</div>`;
-    return `<div class="mf-paper-body"><p><a class="rec-btn" href="/api/manifest/${id}/logs" target="_blank" rel="noopener">View / download build logs (.md)</a></p>${buildChatHtml(id)}${curatorSection}${requestSection}${why}${locs.map((l) => locationHtml(l, !rows.length)).join("")}
+    const sources = locs.length ? `<details class="mf-sources"><summary>Source reports (${locs.length} location${locs.length === 1 ? "" : "s"})</summary>${locs.map((l) => locationHtml(l, !rows.length)).join("")}</details>` : "";
+    return `<div class="mf-paper-body">${progressSection(id)}<p><a class="rec-btn" href="/api/manifest/${id}/logs" target="_blank" rel="noopener">Full build logs (.md)</a></p>${requestSection}${humanBottlenecks({ ...state, reasons: state.reasons.filter((r) => r.kind !== "request" || !requests.length) })}${why}${curatorSection}${buildChatHtml(id)}${sources}
       ${rows.length ? `<div class="table-wrap"><table class="rec-table"><thead><tr><th>Status</th><th>Dataset</th><th>Context</th><th>Pop.</th><th>N</th><th>Build</th><th>File</th><th>Data</th><th>Issues</th><th></th></tr></thead>
         <tbody>${rows.map(rowHtml).join("")}</tbody></table></div>` : ""}</div>`;
   }
@@ -567,17 +658,11 @@
       const p = data.records[id], rows = rowsOf(id), st = stateOf(id);
       if (!matchesColumns(id)) return false;
       if (human.checked && !/\bhuman\b|homo sapiens/i.test(p.species || "")) return false;
-      if (show.value === "not_qtl" && p.qtl_review !== "not_qtl") return false;
       if (show.value === "sumstats" && p.data_kind !== "open_sumstats") return false;
-      if (show.value === "exists" && st !== "exists") return false;
-      if (show.value === "unbuilt" && st !== "unbuilt") return false;
-      if (show.value === "built" && st !== "built") return false;
       if (show.value === "needs" && !followUp(id).human) return false;
-      if (ManifestStatus.priority.includes(show.value) && !followUp(id).kinds.includes(show.value)) return false;
       if (show.value === "tocheck" && !rows.some((r) => r.review === "pending")) return false;
-      if (show.value === "approved" && !rows.some((r) => r.review === "approved")) return false;
-      if (show.value === "processed" && !rows.some((r) => (r.evidence.data || {}).status === "processed")) return false;
-      if (show.value === "as_is" && !rows.some((r) => (r.evidence.data || {}).status === "as_is")) return false;
+      if (show.value === "stopped" && buildBucket(id) !== "stopped") return false;
+      if (show.value === "unbuilt" && buildBucket(id) !== "not_built") return false;
       return !q || [id, p.publication_title, p.doi, p.first_author, p.journal, p.qtl_type, p.qtl_context, p.species,
         ...rows.map((r) => [r.dataset, r.biocontext, r.level_1_context, r.level_2_context, r.source_path, r.issues.join(" ")].join(" "))]
         .join(" ").toLowerCase().includes(q);
@@ -602,11 +687,12 @@
   // Column widths the user dragged on the overview header, as % of the table, kept in this browser.
   // The table always spans exactly the page width: dragging a column edge moves width between
   // that column and its right-hand neighbour, so the total stays 100%.
-  const WIDTHS_KEY = "dq.manifest.columnWidthsPct";
+  // v2: widths saved before the default columns were rebalanced are discarded.
+  const WIDTHS_KEY = "dq.manifest.columnWidthsPct.v2";
   const MIN_COL_PX = 48;
   let columnWidths = {};
   try { columnWidths = JSON.parse(localStorage.getItem(WIDTHS_KEY) || "{}") || {}; } catch { columnWidths = {}; }
-  try { localStorage.removeItem("dq.manifest.columnWidths"); } catch { /* old px widths, no longer used */ }
+  try { ["dq.manifest.columnWidths", "dq.manifest.columnWidthsPct"].forEach((k) => localStorage.removeItem(k)); } catch { /* older saved widths, no longer used */ }
   function saveColumnWidths() {
     try { localStorage.setItem(WIDTHS_KEY, JSON.stringify(columnWidths)); } catch { /* storage unavailable */ }
   }
@@ -670,7 +756,7 @@
     const scroll = body.querySelector?.(".mf-overview-wrap")?.scrollLeft || 0;
     const ids = shownIds();
     updateCount(ids);
-    body.innerHTML = `<p class="muted mf-overview-note">One row per paper. Column filters combine with each other and the filters above.</p><div class="table-wrap mf-overview-wrap"><table class="rec-table mf-overview" role="table" aria-label="Manifest papers"><colgroup>${COLUMNS.map(([key]) => `<col class="mf-col-${key}">`).join("")}</colgroup><thead><tr>
+    body.innerHTML = `<p class="muted mf-overview-note">One row per paper. Column filters combine with each other and the filters above.</p><details class="mf-legend"><summary>What the Build status and Data result values mean</summary><dl>${[...Object.values(BUILD).map(([t, d]) => ["Build status", t, d]), ...Object.values(RESULT).map(([t, d]) => ["Data result", t, d])].map(([c, t, d]) => `<dt>${esc(c)}: ${esc(t)}</dt><dd>${esc(d)}</dd>`).join("")}</dl></details><div class="table-wrap mf-overview-wrap"><table class="rec-table mf-overview" role="table" aria-label="Manifest papers"><colgroup>${COLUMNS.map(([key]) => `<col class="mf-col-${key}">`).join("")}</colgroup><thead><tr>
       ${COLUMNS.map(([key, label]) => `<th scope="col" data-col="${key}">${label}<span class="mf-col-resize" data-resize="${key}" title="Drag to resize · double-click to reset all columns" aria-hidden="true"></span></th>`).join("")}
       </tr><tr class="mf-column-filters">${COLUMNS.map(([key, label]) => `<th data-label="${esc(label)}">${columnFilterHtml(key, label)}</th>`).join("")}</tr></thead>
       ${ids.length ? ids.slice(0, limit).map(paperHtml).join("") : `<tbody><tr><td colspan="${COLUMNS.length}" class="rec-empty">No paper matches. Adjust or clear the filters above.</td></tr></tbody>`}</table></div>`

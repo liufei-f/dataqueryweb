@@ -75,7 +75,7 @@ def test_validate_requires_digits_upper_case_and_underscore_variant_ids(tmp_path
         return agent.validate_file(tmp_path, "t.tsv", "\\t", "eQTL", COLUMNS, "self")["problems"]
 
     assert check(["1\t10177\tA\tC\tchr1_10177_A_C", "22\t5\tTG\tT\tchr22_5_TG_T"]) == []
-    assert "chrom_col 'chrom' must be digits only" in " ".join(check(["chr1\t10177\tA\tC\tchr1_10177_A_C"]))
+    assert "chrom_col 'chrom' must be the autosome number only, 1 to 22" in " ".join(check(["chr1\t10177\tA\tC\tchr1_10177_A_C"]))
     assert "ref_col 'ref' must be upper-case" in " ".join(check(["1\t10177\ta\tC\t1_10177_a_C"]))
     assert "position_col 'pos' must be digits only" in " ".join(check(["1\t1.0e4\tA\tC\t1_1.0e4_A_C"]))
     for wrong in ("1_10177_A_C", "1:10177:A:C", "chr1:10177:A:C", "chr1_10177_A_C_b38", "rs123"):
@@ -140,7 +140,9 @@ class Script:
         self.seen.append(messages[-1])
         self.system = messages[0]["content"]
         usage["total_tokens"] += 100
-        calls = self.turns.pop(0)
+        # Every call states a reason (reasons.py refuses calls without one); a test may set its own.
+        calls = [(n, {"why": f"scripted test step {n}: the previous tool result leads here"} | a)
+                 for n, a in self.turns.pop(0)]
         return {"role": "assistant", "content": "", "tool_calls": [
             {"id": f"c{i}", "type": "function", "function": {"name": n, "arguments": json.dumps(a)}}
             for i, (n, a) in enumerate(calls)]}, "test · model"
@@ -176,6 +178,15 @@ def test_the_model_downloads_processes_validates_and_submits(tmp_path: Path, ser
     judge = Script([
         [("read_paper", {"query": "donors"})],
         [("download", {"dataset": "BrainSeq", "urls": ["https://zenodo.org/f/eqtl.tsv.gz"]})],
+        [("run_python", {"dataset": "BrainSeq", "code": SPLIT, "purpose": "too early: nothing assessed yet"})],
+        [("assess_file", {"path": "brainseq/eqtl.tsv.gz", "contents": "qtl_nominal_all", "description": "x",
+                          "processable": "yes", "plan": "split SNP",
+                          "evidence": [{"quote": "brainseq/eqtl.tsv.gz", "source": "download result"}]})],
+        [("inspect_local", {"path": "brainseq/eqtl.tsv.gz"})],
+        [("assess_file", {"path": "brainseq/eqtl.tsv.gz", "contents": "qtl_nominal_all", "description": "SNP gene beta p",
+                          "processable": "yes", "plan": "split SNP into chrom/pos/ref/alt",
+                          "pval_column": "p-value",
+                          "evidence": [{"quote": "SNP gene beta t-stat p-value", "source": "inspect_local head"}]})],
         [("run_python", {"dataset": "BrainSeq", "code": SPLIT, "purpose": "split SNP into chrom/pos/ref/alt"})],
         [("add_rsid", {"file_path": "brainseq/eqtl_processed.tsv.gz", "columns": COLUMNS})],
         [("validate", {"file_path": "brainseq/eqtl_processed.tsv.gz", "delimiter": "\\t", "qtl_type": "eQTL",
@@ -189,6 +200,10 @@ def test_the_model_downloads_processes_validates_and_submits(tmp_path: Path, ser
     out = asyncio.run(agent.run(RECORD, judge, root=tmp_path, max_bytes=1e9, target=rules.Target(level_1=["Brain"]),
                                 paper=PAPER, step=lambda _: None, cancel=threading.Event(), usage=usage))
     assert "quote was not found" in judge.seen[-1]["content"]  # the first submit was sent back
+    told = [m["content"] for m in judge.seen]
+    assert any("waits until every downloaded file is checked" in t for t in told)  # processing before assess_file
+    assert any("inspect_local 'brainseq/eqtl.tsv.gz' first" in t for t in told)  # assess before inspect
+    assert out["assessments"]["brainseq/eqtl.tsv.gz"]["format_check"]["kind"] == "table"
     assert "PROCEDURE (SKILL.md)" in judge.system and "Phase 7: Submit" in judge.system
     [r] = out["rows"]
     assert r["row"]["file_path"] == "brainseq/eqtl_processed.tsv.gz" and r["row"]["chrom_col"] == "chrom"
@@ -310,3 +325,80 @@ def test_liftover_moves_grch37_tables_to_grch38(tmp_path: Path) -> None:
     assert df[["chrom_grch37", "pos_grch37"]].values.tolist() == [["1", "10177"], ["2", "5"]]
     assert "x/eqtl_processed.tsv.gz" in s.lifted
     assert "lifted over before" in s.liftover("x/eqtl_processed.tsv.gz", cols)["error"]
+
+
+def test_fill_alleles_takes_the_other_allele_of_biallelic_sites_from_dbsnp(tmp_path: Path) -> None:
+    fake_dbsnp(tmp_path)  # rs1 at 1:10177 is A/C/G (multiallelic); rs2 at 1:10352 G/T; rs3 at 2:5 C/T
+    f = tmp_path / "x" / "eqtl_processed.tsv.gz"
+    f.parent.mkdir()
+    pd.DataFrame({"chrom": ["1", "1", "1", "2", "2", "1"], "pos": ["10177", "10352", "10352", "5", "5", "999"],
+                  "ref": ["", "", "", "", "T", ""], "alt": ["C", "T", "G", "T", "C", "A"],
+                  "variant_id": [""] * 6, "pval": ["0.1"] * 6, "gene": ["ENSG00000000001"] * 6}
+                 ).to_csv(f, sep="\t", index=False)
+    lookup = dbsnp.AlleleLookup(dbsnp.vcf_path(tmp_path))
+    cols = {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt", "variant_id_col": "variant_id"}
+    res = dbsnp.fill_alleles(f, lookup, cols)
+    out = pd.read_csv(f, sep="\t", dtype=str, keep_default_na=False)
+    assert out["ref"].tolist() == ["", "G", "T", "C", "T", ""]
+    assert out["variant_id"].tolist() == ["", "chr1_10352_G_T", "chr1_10352_T_G", "chr2_5_C_T", "chr2_5_T_C", ""]
+    assert res["filled"] == 3 and res["had_ref"] == 1 and res["multiallelic"] == 1 and res["not_in_dbsnp"] == 1
+    # validate accepts rows whose ref was left empty (with an empty variant id).
+    v = agent.validate_file(tmp_path, "x/eqtl_processed.tsv.gz", "\\t", "eQTL",
+                            cols | {"pval_col": "pval", "phenotype_id_col": "gene"}, "self")
+    assert not [p for p in v.get("problems", []) if "ref_col" in p or "variant_id_col" in p], v
+
+
+def test_validate_fails_when_rs_ids_dbsnp_holds_are_left_empty(tmp_path: Path) -> None:
+    fake_dbsnp(tmp_path)  # rs1 1:10177 A/C,G; rs2 1:10352 G/T; rs3 2:5 C/T
+    f = tmp_path / "x" / "eqtl_processed.tsv.gz"
+    f.parent.mkdir()
+    table = pd.DataFrame({"chrom": ["1", "1", "1"], "pos": ["10177", "10352", "999"], "ref": ["A", "T", "C"],
+                          "alt": ["C", "G", "G"], "pval": ["0.1"] * 3, "gene": ["ENSG00000000001"] * 3})
+    table["variant_id"] = "chr" + table["chrom"] + "_" + table["pos"] + "_" + table["ref"] + "_" + table["alt"]
+    table.assign(rsid="").to_csv(f, sep="\t", index=False)  # an rsid column the script left empty
+    cols = {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt", "pval_col": "pval",
+            "phenotype_id_col": "gene", "variant_id_col": "variant_id", "rsid_col": "rsid"}
+    v = agent.validate_file(tmp_path, "x/eqtl_processed.tsv.gz", "\\t", "eQTL", cols, "self")
+    assert not v["ok"] and any("dbSNP holds" in p and "add_rsid" in p for p in v["problems"]), v["problems"]
+    assert v["checks"]["rsid_vs_dbsnp"]["in_dbsnp_but_empty"] == 2
+    # add_rsid fills what dbSNP holds; the variant dbSNP lacks (1:999) stays empty and passes.
+    dbsnp.annotate(f, dbsnp.Lookup(dbsnp.vcf_path(tmp_path)), cols)
+    assert pd.read_csv(f, sep="\t", dtype=str, keep_default_na=False)["rsid"].tolist() == ["rs1", "rs2", ""]
+    v = agent.validate_file(tmp_path, "x/eqtl_processed.tsv.gz", "\\t", "eQTL", cols, "self")
+    assert v["ok"], v["problems"]
+    assert v["checks"]["rsid_vs_dbsnp"] == {"checked": 1, "in_dbsnp_but_empty": 0, "examples": []}
+
+
+def test_validate_wants_bare_chrom_and_chr_prefixed_variant_ids_in_every_file(tmp_path: Path) -> None:
+    def write(name: str, chrom: str, vid: str) -> None:
+        pd.DataFrame({"chrom": [chrom], "pos": ["32523"], "ref": ["A"], "alt": ["T"], "variant_id": [vid],
+                      "pval": ["0.1"], "gene": ["ENSG00000000001"]}).to_csv(tmp_path / "d" / name, sep="\t", index=False)
+    (tmp_path / "d").mkdir()
+    cols = {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt", "pval_col": "pval",
+            "phenotype_id_col": "gene", "variant_id_col": "variant_id"}
+    for i in range(1, 6):
+        write(f"t.chr{i}.tsv", "1", "chr1_32523_A_T")
+    assert agent.validate_file(tmp_path, "d/t.chr*.tsv", "\\t", "eQTL", cols, "self")["ok"]
+    write("t.chr3.tsv", "chr1", "chr1_32523_A_T")  # a middle file, not one of the fully checked ones
+    out = " ".join(agent.validate_file(tmp_path, "d/t.chr*.tsv", "\\t", "eQTL", cols, "self")["problems"])
+    assert "t.chr3.tsv" in out and "'chr' prefix" in out and "strip it" in out
+    write("t.chr3.tsv", "1", "1_32523_A_T")
+    out = " ".join(agent.validate_file(tmp_path, "d/t.chr*.tsv", "\\t", "eQTL", cols, "self")["problems"])
+    assert "lacks the 'chr' prefix" in out and "chr1_32523_A_T" in out
+    write("t.chr3.tsv", "01", "chr01_32523_A_T")
+    assert "1 to 22" in " ".join(agent.validate_file(tmp_path, "d/t.chr*.tsv", "\\t", "eQTL", cols, "self")["problems"])
+
+
+def test_validate_wants_caqtl_peaks_as_chr_start_end(tmp_path: Path) -> None:
+    def check(peak: str) -> str:
+        pd.DataFrame({"chrom": ["1"], "pos": ["722408"], "ref": ["G"], "alt": ["C"], "variant_id": ["chr1_722408_G_C"],
+                      "pval": ["0.1"], "peak": [peak]}).to_csv(tmp_path / "c.tsv", sep="\t", index=False)
+        cols = {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt", "pval_col": "pval",
+                "phenotype_id_col": "peak", "variant_id_col": "variant_id"}
+        return " ".join(agent.validate_file(tmp_path, "c.tsv", "\\t", "caQTL", cols)["problems"])
+
+    assert check("chr1_817095_817594") == ""
+    for wrong in ("chr1-817095-817594", "chr1:817095-817594", "1_817095_817594"):
+        assert "chr<chrom>_<start>_<end>" in check(wrong) and "replace '-' and ':'" in check(wrong), wrong
+    assert "chr<chrom>_<start>_<end>" in check("peak_123")
+    assert "start must be below end" in check("chr1_817594_817095")

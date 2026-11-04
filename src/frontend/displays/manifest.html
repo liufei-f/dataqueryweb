@@ -3,7 +3,7 @@
 {% block content %}
 <div class="dq mf-page">
   <h1>Manifest papers</h1>
-  <p class="muted lede">One row per saved paper. <strong>Build status</strong> shows whether a build was attempted and whether AI was used.
+  <p class="muted lede">One row per saved paper. <strong>Build status</strong> shows the latest build: running, finished, stopped or interrupted, the phase it is in or stopped in, its last step with the reason, and what a rebuild does next (Details has the full progress).
     <strong>Data result / success</strong> shows whether data was downloaded and processed, only partial statistics were obtained,
     or access, network, tool or download-limit issues remain. Downloaded data still needs review before approval.
     <strong>Human decision</strong> is saved separately from the AI result. “Not QTL data” excludes future builds; existing files are retained. A build already in progress is not cancelled.
@@ -13,25 +13,11 @@
     <input type="search" id="mf-filter" class="dq-input" placeholder="Filter papers by title, author, DOI, dataset, context, issue…" aria-label="Filter papers">
     <select id="mf-show" class="rec-btn" aria-label="Show">
       <option value="">All papers</option>
-      <option value="sumstats">Has full summary statistics (open)</option>
+      <option value="needs">Needs you (access request / browser download / larger download)</option>
+      <option value="tocheck">Has rows to review</option>
+      <option value="stopped">Build stopped early (rebuild to resume)</option>
       <option value="unbuilt">Not built yet</option>
-      <option value="not_qtl">Human decision: not QTL data</option>
-      <option value="built">Built</option>
-      <option value="needs">Your decision / browser / access request needed</option>
-      <option value="request">Access request required</option>
-      <option value="browser">Browser download needed</option>
-      <option value="software">Tool / processing issue</option>
-      <option value="network">Network / publisher error</option>
-      <option value="limit">Download limit exceeded</option>
-      <option value="waiting">Awaiting data release</option>
-      <option value="unsupported">Unsupported QTL type</option>
-      <option value="metadata">Metadata verification needed</option>
-      <option value="unknown">Access not confirmed</option>
-      <option value="exists">Already exists (in the reference manifest)</option>
-      <option value="tocheck">Built, rows to check</option>
-      <option value="approved">With approved rows</option>
-      <option value="processed">Data processed (rows with a _processed file)</option>
-      <option value="as_is">Data downloaded (rows readable as downloaded)</option>
+      <option value="sumstats">Has full summary statistics (open)</option>
     </select>
     <label class="muted mf-check" title="Species is human (Homo sapiens). Records saved by the AI and by you are both listed."><input type="checkbox" id="mf-human"> Species: human only</label>
     <span class="muted rec-count" id="mf-count"></span>

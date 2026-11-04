@@ -61,6 +61,9 @@ See `records.autosave`.
 
 ## Manifest rows
 
+The whole build pipeline — phases, tools, the formats and checks the program enforces, rebuilds,
+logs, the page's statuses and troubleshooting — is described in [docs/pipeline.md](docs/pipeline.md) (Chinese).
+
 By default each paper is built by the LLM itself, through tools (`agent.py`): it reads the
 paper, follows every data link, lists repositories, peeks into remote files, downloads, writes
 Python to convert tables the importer cannot read (run without network or keys, scripts kept in

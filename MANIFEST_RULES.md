@@ -14,7 +14,23 @@
 
 ### 2a. 默认：LLM 逐篇调查（`agent.py`）
 
-从 2026-10-20 起，每篇论文由 LLM 自己用工具完成，程序只提供工具并检查结果：
+从 2026-10-20 起，每篇论文由 LLM 自己用工具完成，程序只提供工具并检查结果。
+
+**每一步都要有理由、每个判定都要有证据（`reasons.py`，程序强制）**：
+
+- LLM 的每次工具调用都必须带 `why`：根据已经看到的什么（哪个工具结果、文件、论文段落），为什么现在做这一步、预期得到什么。少于 25 个字符或"next / continue"这类空话直接拒绝，不执行。
+- 判定类工具 `assess_file`（文件里是什么、能否处理）、`note_location`（位置状态）、`give_up` 还必须带 `evidence`：从 LLM 看过的内容（论文、网页、文件列表、文件开头、工具结果）**逐字**复制的引文及出处；程序逐条核对，一条都对不上就拒绝，不记录判定。`submit` 的每行事实仍用原来的引文核对。
+- 每次调用（接受或拒绝）都写进 build 日志（`Decision: <工具> (<结果>)`）和 `data/.build_logs/<record_id>/<run_id>.decisions.jsonl`：第几步、why、evidence（是否核对通过、在哪找到）、参数、结果。程序自己做的决定（各种拒绝、rebuild 删除或保留 processed 文件）同样带理由记录。
+
+**重新 build 时的程序检查（`rebuild.py`，LLM 第一步之前）**，结果放在给 LLM 的第一条消息开头：
+
+1. **skill 变动**：每次 build 用的 skill 全文存在 `data/.build_logs/<record_id>/<run_id>.skill.txt`；和上一次 build 的副本做 diff 给 LLM 看。没有旧副本时说明"所有规则都可能是新的"。
+2. **已下载文件**：每个下载的文件由程序先跑一遍 `inspect_local` 的格式检查；以前 build 对**未改动**文件（大小、修改时间不变）的 `assess_file` 判断从 `data/.build_logs/<record_id>/assessments.json` 复用；`assess_file` 可以用 glob 一次判断表头相同的一组文件。
+3. **已处理文件**（`*_processed.tsv(.gz)`）：每个文件**完整解压读到结尾**（中断写入会留下截断的 gzip），结果按大小和修改时间缓存在 `<论文文件夹>/.processed_checks.json`；再用前 2 万行检查目标格式（标准列 chrom/pos/ref/alt/variant_id，chrom 为 1–22、不带 `chr`，variant id `chr<chrom>_<pos>_<ref>_<alt>`，caQTL peak `chr<chrom>_<start>_<end>`）和 rsID（dbSNP 有的必须填）。
+   - 截断、读不了、格式不对 → **程序直接删除**，LLM 必须从源文件重新处理成目标格式（论文文件夹里没有下载的源文件时不删，只报告）；
+   - 只缺 rsID → 保留，要求跑 `add_rsid`，不重新处理；
+   - 格式正确 → 保留复用，提交前仍要 `validate`。
+   - 残留的 `*.tmp`（`add_rsid` / `fill_alleles` / `liftover` 写了一半的临时文件）一并删除。删除和保留清单写进 build 日志。
 
 | 工具 | 做什么 |
 |---|---|
@@ -24,10 +40,12 @@
 | `peek_file` | 不下载，读远程文件 / 压缩包成员 / xlsx / parquet 的表头和前几行 |
 | `download` | 下载到 `data/<记录编号>/`，断点续传，受每篇上限和磁盘剩余空间限制；别的论文下过的同一 URL 直接复用（`data/.downloads.json`） |
 | `inspect_local` | 看已下载文件或压缩包成员的前几行、文件夹或压缩包的内容 |
+| `assess_file` | **程序强制**：下载完之后，每个下载的文件都要先用 `inspect_local` 检查格式（程序自动给出 `format_check`：分隔符、表头、各行列数是否一致、找到了哪些 manifest 列、缺哪些必需列；压缩包要看成员列表并至少打开一个成员），再由 LLM 用 `assess_file` 判断文件里是什么（全量 nominal QTL、仅显著、仅 lead、变异映射表、README、后验/下游结果、注释/其他、读不了），以及能否处理成标准格式（`ready` 已是标准格式 / `yes` 可处理，必须写处理方案 / `no` 不可处理，必须写原因并放进 skipped_tables）。**没有 nominal p 值（也没有可换算的 −log10 p 或卡方）的表不能处理**：`assess_file` 要求 ready / yes 必须指明 p 值列，且要在程序格式检查认可的列里，否则只能判 `no`。变异映射表判 `companion`。还有文件没判断时，写 `_processed` 表的 `run_python`、`validate`、`liftover`、`fill_alleles`、`add_rsid` 和 `submit` 一律被拒绝；后来再下载的文件同样要补判断。判断结果随提交一起保存 |
 | `run_python` | LLM 写 Python 处理数据，生成 `<原名>_processed.tsv.gz`；在数据集文件夹里运行，无网络（`unshare -n`）、无 API key、有时间上限；出现联网、子进程、删除文件、读环境变量、绝对路径等写法的代码直接拒绝执行；脚本保存在 `data/.agent_scripts/<record_id>/` |
 | `liftover` | 把 GRCh37/hg19 的处理后表格（`<原名>_processed.tsv.gz`）原地转成 GRCh38：用 UCSC 的 `hg19ToHg38.over.chain.gz`（`data/reference/liftover/`，所有论文共用）逐个转换位置；落到负链的变异 ref/alt 取互补碱基；重建 `variant_id`；原来的 GRCh37 坐标保存在 `chrom_grch37`、`pos_grch37` 两列；转不过去或转到别的染色体的变异删掉。每个文件只能转一次，必须在 `add_rsid` 之前。提交时 genome_build 记为 GRCh38，证据里写明从 GRCh37 转换、保留了多少变异。GRCh37 的行没转换就提交会被退回 |
-| `add_rsid` | 给处理后的表（`<原名>_processed.tsv.gz`）补 rsID：用本地的 NCBI dbSNP（GRCh38，build 157，`data/reference/dbsnp/GCF_000001405.40.gz` 及其 tabix 索引，所有论文共用）按 chrom、pos、ref、alt 精确匹配，匹配不上时再试 ref/alt 互换；dbSNP 里没有的变异 rsID 留空，不猜、不借用相邻位置。表里已有的 rsID 保留。只适用于 GRCh38 坐标。LLM 不能自己下载 dbSNP 或其他参考数据 |
-| `validate` | 按导入脚本的方式（`pandas.read_csv`，manifest 的分隔符和列名）读文件前 2 万行，逐列检查数值；**格式必须每一行都对**：染色体和位置只能是数字（`1`，不能是 `chr1`），ref/alt 大写，variant id 写成 `chr<chrom>_<pos>_<ref>_<alt>` 用下划线连接、带 `chr` 前缀（`chr1_12345_A_G`）且和这四列一致，`variant_id_col` 必填；`rsid_col` 必填，值只能是 `rs<数字>` 或空；还检查导入脚本过滤后保留的比例、gene id / caQTL peak id 格式 |
+| `add_rsid` | 给处理后的表（`<原名>_processed.tsv.gz`）补 rsID：用本地的 NCBI dbSNP（GRCh38，build 157，`data/reference/dbsnp/GCF_000001405.40.gz` 及其 tabix 索引，所有论文共用）按 chrom、pos、ref、alt 精确匹配，匹配不上时再试 ref/alt 互换；dbSNP 里没有的变异 rsID 留空，不猜、不借用相邻位置；**dbSNP 里有的变异必须填上 rsID**，只建一个空的 rsid 列不算补过（`validate` 会程序检查）。表里已有的 rsID 保留。只适用于 GRCh38 坐标。LLM 不能自己下载 dbSNP 或其他参考数据 |
+| `fill_alleles` | **固定程序补 allele，不让 LLM 写代码 map**：表里只有效应等位基因时，LLM 处理时只把效应等位基因放进 alt、ref 留空，然后调用它。数据来源提供了 SNP info / 变异映射文件（assess 为 `variant_map` / `companion`）时用 `map_file` 读这个文件（同一基因组版本，所以在 `liftover` 之前；第一次会建索引 `<map>.alleles.sqlite`）；来源没有提供时才用本地 dbSNP（GRCh38，build 157，在 `liftover` 之后）。该位置（有 rsID 时只看同一 rsID，`rs1;1_10505_A_T` 这种按 `;` 拆开）的记录恰好是两个单碱基等位基因、且包含效应等位基因才补；多等位、未列出、找不到的行 ref 和 variant_id 留空、原样保留，不因此跳过整张表。写 `_processed` 表又引用映射文件的 `run_python` 会被拒绝 |
+| `validate` | 按导入脚本的方式（`pandas.read_csv`，manifest 的分隔符和列名）读文件前 2 万行，逐列检查数值；**格式必须每一行都对**：染色体只能是 1–22 的数字（`1`，不能是 `chr1`、`01`），位置只能是数字，ref/alt 大写（ref 可以为空：多等位等补不出来的非效应等位基因，这些行 variant_id 也为空），variant id 写成 `chr<chrom>_<pos>_<ref>_<alt>` 用下划线连接、带 `chr` 前缀（`chr1_32523_A_T`）且和这四列一致——即 chrom 列不带 `chr`，variant id 带 `chr`；caQTL 的 phenotype id（peak）必须写成 `chr<chrom>_<start>_<end>`，用下划线连接、带 `chr`、start 小于 end（`chr1_817095_817594`；`chr1-817095-817594`、`chr1:817095-817594`、`1_817095_817594` 都不行，原值留在 `phenotype_id_original`）；glob 匹配到的每个文件都检查前 2 万行，`variant_id_col` 必填；`rsid_col` 必填，值只能是 `rs<数字>` 或空；**空值只允许出现在 dbSNP 查不到的变异上**：程序从每个文件读到的行里抽取 rsID 为空的变异（最多 500 个），按 `add_rsid` 的方式查本地 dbSNP，查到任何一个就判不通过，要求先跑 `add_rsid` 再 validate（本地没有 dbSNP 时跳过，并在 note 里说明）；还检查导入脚本过滤后保留的比例、gene id / caQTL peak id 格式 |
 | `note_location` | 记录某个数据位置的结论（需要人工、打不开、不是数据……） |
 | `submit` / `give_up` | 提交行；程序检查：`file_path` 必须通过 `validate` 且列名一致、QTL 类型在 manifest 范围内、引用逐字出现在 LLM 实际看过的文本里、context 词表、标签格式、同一 context 不重复。有问题退回给 LLM 改，最多 3 轮 |
 
@@ -97,6 +115,7 @@ LLM 只回答文件本身说不出来的事实，以及“这张表要怎么处�
 
 - **列合在一起**：`chr1_13550_G_A_b38` 这类 variant id、`chr16:85721809` 这类位置列 → 标 `columns_need_deriving`，可拆分出 chrom/pos/ref/alt。id 带 `_b38`/`_b37` 后缀时顺便得到基因组版本。
 - **没有 p 值但有 −log10 p 或卡方** → 同样标 `columns_need_deriving`。
+- **只有效应等位基因、缺另一个等位基因**：先用数据来源提供的 SNP info / 变异映射文件补 ref；来源没有提供时用 `fill_alleles` 从本地 dbSNP 补。只补双等位位点；多等位位点的 ref 留空、原样保留，不猜，也不因此跳过整张表。note 里写明补了多少行、留空多少行。
 - **A1/A2 编号等位基因**：暂按 A1 = alt、A2 = ref 填，并标 `allele_order_ambiguous`，因为各软件约定不同。
 - **只有等位基因频率没有 MAF**：填进 `maf_col` 并标 `maf_col_is_allele_frequency`。
 - **效应列取样值全在 0–1 之间**（如 RASQUAL 的 π）→ 标 `effect_scale_check`。

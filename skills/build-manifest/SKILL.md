@@ -2,7 +2,7 @@
 name: build-manifest
 description: The fixed procedure the manifest agent (src/backend/dataqueryweb/agent.py) follows to turn one saved record into LocusCompare qtl_manifest rows — read the paper, inventory every data location, choose the full summary-statistics tables, download, process, validate, submit. agent.py puts this file into the system prompt of every build; edit it here to change how the LLM works.
 metadata:
-  version: "2026-11-03"
+  version: "2026-11-04"
 ---
 
 # Build manifest: one paper → manifest rows
@@ -12,7 +12,112 @@ until it holds. The step budget is about 80 tool calls; a typical paper needs 20
 allocation: phases 1–2 ≤ 15 calls, phase 3 ≤ 15, phase 3b (only when needed) ≤ 15, phases 4–6
 the rest, and always keep 3 calls for phase 7.
 
+## Every step: a reason, and evidence for every judgement
+
+Nothing is decided from nothing. Every tool call carries **`why`**: what you already saw that
+leads to this step (name the tool result, file or paper text) and what you expect to learn or
+change. "next", "continue" or a few words are refused. The judgements `assess_file`,
+`note_location` and `give_up` also carry **`evidence`**: one or more quotes copied word for word
+from what you were shown (a file head, a tool result, the paper, a page), each with its source.
+The program checks every quote against those texts; a judgement with no verified quote is
+refused and nothing is recorded. Row facts in `submit` keep their own quoted evidence.
+
+Every call — accepted or refused — is written to the build log as `Decision: <tool> (<outcome>)`
+and to `<run_id>.decisions.jsonl`: step, why, evidence (verified or not), outcome and result.
+The program's own decisions (refusals, rebuild deletions and keeps) are recorded the same way,
+with their reasons.
+
+## Situation → what to do (the decision table)
+
+The phases below explain each rule; this table is the short form. "Enforced" means the
+program refuses or flags it whatever you do.
+
+**The table's contents**
+
+| Situation | Do | Enforced |
+|---|---|---|
+| Every tested variant–phenotype pair (nominal / allpairs) | keep; process if needed | — |
+| Only significant / lead / eGene / permutation results | skipped_tables; in phase 3b keep the most complete one as `scope: non_full` only when no full table exists anywhere | submit asks for `non_full_reason` + `scope_note` with numbers |
+| Fine-mapping, colocalisation, conditional, enrichment, posterior outputs | skipped_tables (not association statistics) | — |
+| QTL type not eQTL / sQTL / caQTL / pQTL (mQTL, isoQTL, apaQTL, …) | skipped_tables "qtl_type not in the manifest"; never relabel it | submit refuses other types |
+| Results of a reused resource (GTEx, eQTLGen, …), non-human cohort | skipped_tables | — |
+| Genotypes, expression matrices, counts, peaks, covariates | not a table; note_location `not_data` | — |
+| Paper already in the reference manifest | add only the QTL types / contexts it lacks; use its dataset name (the first message lists what it has) | — (not checked at submit) |
+| A person marked the record `not_qtl` | do not build it | the queue skips it |
+
+**Columns: what is missing and what supplies it**
+
+| Situation | Do | Enforced |
+|---|---|---|
+| **No nominal p-value**, and no −log10 p or 1-df chi-square to compute it from | **not processable**: assess_file `processable: no`, skipped_tables | assess_file refuses ready / yes without a p-value column the format check accepts |
+| Only FDR / q-value / adjusted / permutation p | not processable (not a nominal p) | the format check does not count those columns |
+| −log10 p or 1-df chi-square instead of p | compute p in processing (`10^-x`; `erfc(sqrt(x/2))`) | — |
+| Only a z or t statistic (or beta + se) | **not processable today**: the format check accepts only p, −log10 p or chi-square | assess_file refuses ready / yes |
+| **No rs id**, or rs ids partly empty | **add_rsid** fills them from local dbSNP by chrom/pos/ref/alt; empty only where dbSNP has none | validate fails while a sampled variant dbSNP holds has an empty rs id |
+| A column named rsid / snp holds `1_123_A_G`-style ids, not rs numbers | use it as the source of the variant id (split it); do not name it `rsid_col`; fill `rsid` with add_rsid | validate: rs ids must be `rs<digits>` or empty |
+| Only the effect allele (no other allele) | write it as `alt`, leave `ref` empty, call **fill_alleles**: with the study's SNP map first, otherwise dbSNP | run_python that names the map is refused |
+| Multiallelic / ambiguous site | leave `ref` and `variant_id` empty, keep the row; never drop the table | validate allows empty ref with empty variant id |
+| Only rs ids, no chromosome / position | look for a same-study variant map (README); **no tool maps rs id → position today**, so without coordinates the table is not processable (skipped_tables, say why) | — |
+| Packed variant id (`1:123:A:G`, `chr1_123_A_G_b38`) | split into chrom / pos / ref / alt; rebuild `variant_id` | validate |
+| Chromosome written `chr1` | chrom = `1`; variant id keeps `chr` (`chr1_123_A_G`) | validate |
+| caQTL peak `chr1-100-200` / `chr1:100-200` | `chr1_100_200`; keep the original as `phenotype_id_original` | validate |
+| Peak given only as a name (`peak_123`) | needs the study's peak coordinate file; never guess | validate |
+| AF / EAF instead of MAF | check it is a frequency in [0, 1], add `maf = min(af, 1 − af)` | — |
+| No beta / se / maf | leave the column out (stored as 0) | — |
+| Gene symbols, ENST / ENSE ids instead of ENSG | keep the ids; map only with a documented study mapping; mention it in the note | validate warns; row flagged `phenotype_id_not_ensembl` |
+| Effect allele not stated (A1 / A2) | A1 = alt, say so in the note | — |
+| No header | name the columns from the paper / README; none → skipped_tables "no header and no column description" | — |
+| X / Y / MT rows, indels | may stay; the importer keeps autosomal single-base SNVs only | — |
+
+**Coordinates and files**
+
+| Situation | Do | Enforced |
+|---|---|---|
+| GRCh37 / hg19 coordinates | **liftover** once, before add_rsid | submit refuses GRCh37 rows |
+| Build unknown | find it in the file name, header, README or Methods; never assume | row flagged `genome_build_unknown` |
+| One file per chromosome | process each; one row with a `chr*` glob | — |
+| Several methods for one context | the paper's primary analysis; the rest to skipped_tables | submit flags duplicate qtl_type + biocontext |
+| Archive (zip / tar) | read members in place; one processed file per member | — |
+| Spreadsheet (xlsx) | convert the sheet to a tab-separated table | — |
+| Files over the download limit | the main contexts first; the rest to skipped_tables "over the download limit" | download refuses over the limit / free space |
+
+**Access, failures and rebuilds**
+
+| Situation | Do | Enforced |
+|---|---|---|
+| Login, application, "on request", browser-only portal | note_location `manual` with what a person must do and the page | — |
+| Timeout, connection reset, truncated download | at most two retries; then note_location `error` with the failure (not "controlled access") | — |
+| HTTP 403 on a publisher page | one retry; then the published version, PMC / Europe PMC, the repository API | — |
+| Rebuild: processed file truncated or not in the target format | the program deleted it: process its source again | REBUILD CHECK |
+| Rebuild: processed file right but rs ids missing | add_rsid; do not reprocess | REBUILD CHECK, validate |
+| Rebuild: downloaded file unchanged since an earlier assessment | the assessment is reused; re-assess only if the skill changes affect it | REBUILD CHECK |
+| Any step | give `why`; for assess_file, note_location and give_up also `evidence` (verbatim quotes) | refused otherwise |
+
 ## Phase 0: Resume, provenance and curator context
+
+### Rebuild check (done by the program, read it first)
+
+When the paper's folder already holds files, the initial message starts with a REBUILD CHECK
+that the program ran before your first step. Act on it in this order:
+
+1. **SKILL CHANGES** — the diff between the skill the previous build used and this one (or a
+   note that no earlier copy is kept, in which case every rule may be new). Earlier outputs and
+   plans were made under the old rules: check them against the changed lines, not from memory.
+2. **DOWNLOADED FILES** — every downloaded file was already format-checked (inspect_local is
+   optional for them). Assessments of unchanged files from earlier builds are reused; re-assess
+   any the skill changes affect. Assess the rest; `assess_file` takes a glob for a group of files
+   with the same header and contents (e.g. `folder/x.eQTL.*.cis_nominal.tsv.gz`).
+3. **PROCESSED FILES** — every `*_processed` table was read to the end and its first rows tested
+   against the required formats (Phase 5 table: chrom `1`–`22` without `chr`, variant id
+   `chr<chrom>_<pos>_<ref>_<alt>`, caQTL peak `chr<chrom>_<start>_<end>`, rs ids filled where
+   dbSNP holds them):
+   - **DELETED** — truncated (an interrupted write) or not in the target format. The program
+     removed them; process their sources again into the target format. Your own checkpoint or
+     stats files that list them as done are stale: do not skip them because of such a file.
+   - **KEPT, rs ids missing** — the format is right; call add_rsid (a glob works), do not reprocess.
+   - **KEPT, in the target format** — reuse; validate before submitting.
+   Never reuse a processed file the check deleted or flagged, and never write a processing
+   script that skips a source only because its `_processed` file exists.
 
 Before repeating a build, inspect the previous run outcome, existing local files and the
 history paths supplied in the initial message. Use `read_build_history(path, offset)` to read
@@ -32,7 +137,8 @@ to repeat a costly step.
 - For legacy runs without Markdown logs, inspect saved reports, Python scripts and actual files.
   Explicitly distinguish inferred progress from confirmed successful execution.
 - Preserve existing source data and valid outputs. Reuse registered downloads and resumable partial
-  downloads through the download tool. Do not overwrite curator uploads or delete files to restart.
+  downloads through the download tool. Do not overwrite curator uploads or delete files to restart;
+  invalid processed files are removed by the program's rebuild check, not by you.
 - Treat the paper's saved conversation as curator context. Read supplied access emails, README
   text and local paths; verify their relevance to this paper, release and QTL type. In particular,
   FinnGen R13 GWAS manifests are not automatically the single-nucleus multiome QTL data release.
@@ -212,7 +318,20 @@ Methods, software availability, repository README and actual result-file columns
 - Verify map coverage and resolve each key unambiguously before processing. If rsIDs are
   duplicated, use documented allele information to disambiguate; if a key remains ambiguous
   or unmatched, do not guess or silently multiply/drop rows. Report coverage and unresolved
-  counts. Confirm the map's coordinate build and preserve it in evidence; liftover only after
+  counts.
+- **Multiallelic / ambiguous sites do not make a table unusable.** Where the map gives a key
+  more than one possible other allele (e.g. rs2921059 at 8:8460377, assessed G, listed as
+  G/A, G/C and G/T), leave that row's `ref` (and `variant_id`) empty and keep the row as it
+  is; fill `ref` for every site with exactly two alleles. Never skip a whole table because a
+  small share of its sites is multiallelic. Report filled / left-empty counts in the note.
+- **Alleles are mapped by a fixed program, not your code.** Write the table with the effect
+  allele in `alt` and `ref` empty, then call fill_alleles (phase 5a2): with `map_file` = the
+  study's SNP info file when the source provides one (assessed `variant_map` / `companion`),
+  otherwise without it, from the local dbSNP copy. The study's own map always comes first.
+  run_python code that writes `_processed` tables and names the map file is refused.
+- **No p-value → not processable.** A table with no nominal p-value (and no -log10 p or
+  chi-square to make one from) is assessed `processable: no` and goes to skipped_tables;
+  assess_file refuses ready / yes without a p-value column the format check accepts. Confirm the map's coordinate build and preserve it in evidence; liftover only after
   a valid coordinate-and-allele mapping is established.
 - Determine which allele the association's effect estimate refers to from the README or method
   documentation (for example, `assessed_allele`). In this manifest, `alt` is the effect allele
@@ -507,6 +626,28 @@ type and context:
 
 **Check:** inspect_local on one downloaded file shows the same header as the peek.
 
+## Phase 4b: Check every downloaded file (inspect_local → assess_file) — enforced
+
+After all downloads, and before writing any processing code, check **each** downloaded file:
+
+1. `inspect_local` it. The program adds a `format_check`: delimiter, header, whether rows have
+   the header's width, which manifest columns it found (`roles_found`), which can be derived
+   and which required ones are missing. For an archive, inspect its listing and at least one
+   member (`archive::member`); members with different layouts are assessed one by one.
+2. `assess_file` it with your verdict:
+   - `contents`: qtl_nominal_all, qtl_significant_only, qtl_lead_only, variant_map, readme,
+     posterior_or_downstream, annotation_or_other, unreadable
+   - `processable`: `ready` (already the standard format), `yes` (can be processed to it) or
+     `no` (with `reason`; it goes to skipped_tables). Only QTL association tables can be
+     ready / yes; a variant map is named in the `plan` of the table it serves.
+   - `plan` (for yes): how chrom, pos, ref, alt, variant_id, pval and phenotype are made, and
+     which companion file or tool (liftover, fill_alleles, add_rsid) supplies what is missing.
+
+The program refuses run_python code that writes `_processed` tables, validate, liftover,
+fill_alleles, add_rsid and submit while any downloaded file has no assessment. A read-only
+script (no `_processed` output) may still be used to check a file inspect_local cannot read.
+Downloading more files later puts them on the list again.
+
 ## Phase 5: Process (only when needed)
 
 **Required value formats.** Every row of a submitted file must hold exactly these, and
@@ -514,10 +655,33 @@ validate checks every row it reads:
 
 | Column | Format | Right | Wrong |
 |---|---|---|---|
-| chromosome | digits only; autosomes | `1` | `chr1`, `X`, `chrX` |
+| chromosome | the autosome number only, `1`–`22`, **no `chr`** | `1` | `chr1`, `01`, `X`, `chrX` |
 | position | digits only | `12345` | `12345.0`, `1.2e4` |
 | ref, alt | upper-case A/C/G/T/N | `A`, `TG` | `a`, `t` |
-| variant id | `chr<chrom>_<pos>_<ref>_<alt>` joined by underscores, equal to those four columns | `chr1_12345_A_G` | `1_12345_A_G`, `1:12345:A:G`, `chr1:12345:A:G`, `chr1_12345_A_G_b38`, `rs123` |
+| variant id | `chr<chrom>_<pos>_<ref>_<alt>` joined by underscores, **with `chr`**, equal to those four columns | `chr1_32523_A_T` | `1_32523_A_T`, `1:32523:A:T`, `chr1:32523:A:T`, `chrchr1_32523_A_T`, `chr1_32523_A_T_b38`, `rs123` |
+| caQTL phenotype id (peak) | `chr<chrom>_<start>_<end>` joined by underscores, **with `chr`**, start < end | `chr1_817095_817594` | `chr1-817095-817594`, `chr1:817095-817594`, `1_817095_817594`, `chr1_817594_817095`, `peak_123` |
+
+**The `chr` rule:** the chromosome column holds only the number (`1`); the variant id is
+`chr` + that number + `_` + position + `_` + ref allele + `_` + alt allele (`chr1_32523_A_T`).
+So the same chromosome is `1` in `chrom` and `chr1` inside `variant_id`. When the source writes
+`chr1`, strip the prefix for `chrom` and build `variant_id` from the cleaned columns:
+`df["chrom"] = df["chrom"].str.replace(r"^chr", "", regex=True)`, then
+`df["variant_id"] = "chr" + df["chrom"] + "_" + df["pos"] + "_" + df["ref"] + "_" + df["alt"]`.
+Never copy the source's own variant id when it differs from this.
+
+**caQTL peak ids:** the phenotype id of a caQTL row is its peak, written
+`chr<chrom>_<start>_<end>`: `chr`, the chromosome number, `_`, the peak start, `_`, the peak
+end (`chr1_817095_817594`). Sources often write `chr1-817095-817594` or `chr1:817095-817594`:
+keep that value as `phenotype_id_original` and write the new id in `phenotype_id`, e.g.
+`df["phenotype_id"] = df["phenotype_id"].str.replace(r"[:-]", "_", regex=True)`, adding `chr`
+when the source lacks it. A peak given only as a name (`peak_123`) needs the study's peak
+coordinate file to build the id; never guess coordinates.
+
+**Enforced by code:** validate rejects a `chrom` value that is not `1`–`22` (a `chr` prefix is
+named in the error), a `variant_id` without the `chr` prefix, and any `variant_id` that is not
+exactly `chr<chrom>_<pos>_<ref>_<alt>` of the same row — in the first 20,000 rows of every file
+a glob matches, not only the first ones. For caQTL it also rejects any phenotype id that is not
+`chr<chrom>_<start>_<end>` with start < end.
 
 A file can be used as it is only when it is one delimited text table (plain or gzip), with a
 header, with chrom, position, ref, alt, variant id, nominal p and phenotype id each in its own
@@ -534,10 +698,9 @@ column, and all values already in these formats. Most files are not (GTEx writes
   an autosome (the importer drops those anyway), and print how many were dropped
 - a missing value stays empty: never write placeholder words (`not_available`, `none`, `-`,
   `.`) into a cell; validate refuses text in p-value, effect, standard error and MAF columns
-- read the association input and, only when needed, a README-documented same-study/same-release
-  variant map keyed by a documented identifier; use a validated, allele-resolved lookup to add
-  variant metadata without changing association rows. Never join association rows from
-  different files or analyses, or use an undocumented or external map
+- read the association input only; a missing non-effect allele is left empty for fill_alleles
+  (phase 5a2), which reads the study's SNP info file or dbSNP itself. Never join association
+  rows from different files or analyses
 - process large companion maps and association files in bounded chunks; avoid holding the full
   compressed or expanded files in memory
 - loop over the files of the group in one script; print one line per file written
@@ -588,8 +751,9 @@ for src in sorted(glob.glob("eqtl/chr*.txt.gz")):
 - A1/A2 alleles: use the paper's or software's definition of the effect allele for alt; if none
   is stated, keep A1 = alt and say so in the row's note.
 
-**Check:** inspect_local on one processed file shows `chrom` like `1`, `pos` digits,
-upper-case `ref`/`alt` and `variant_id` like `chr1_12345_A_G`.
+**Check:** inspect_local on one processed file shows `chrom` like `1` (no `chr`), `pos` digits,
+upper-case `ref`/`alt`, `variant_id` like `chr1_32523_A_T` (with `chr`) and, for caQTL,
+`phenotype_id` like `chr1_817095_817594`.
 
 ## Phase 5a: GRCh37 → GRCh38 (liftover)
 
@@ -614,10 +778,37 @@ be established, do not lift over; say so in the note.
 **Check:** inspect_local shows `pos` changed, `chrom_grch37` / `pos_grch37` holding the old
 coordinates, and `variant_id` matching the new `pos`.
 
+## Phase 5a2: Fill the missing non-effect allele (fill_alleles — a fixed program)
+
+For a table whose source gives the effect allele but not the other one. Process it first so
+`alt` holds the effect allele and `ref` is empty, then call fill_alleles:
+
+- `file_path`: the processed table (`<name>_processed.tsv.gz`; a `chr*` glob for split files)
+- `columns`: its `chrom_col`, `position_col`, `ref_col` (to fill), `alt_col` (effect allele),
+  and `rsid_col` / `variant_id_col` when it has them
+- with the study's SNP info file (assessed `variant_map`, processable `companion`):
+  `map_file`, `map_columns` (`chrom`, `pos`, `allele1`, `allele2`, optional `id`; header names,
+  or 0-based numbers with `map_header: false`), `map_delimiter`. The map is on the table's own
+  build, so run this BEFORE liftover. The map is indexed once into `<map>.alleles.sqlite`.
+- without a study map (only then): no map arguments; it reads the local dbSNP copy (GRCh38,
+  build 157), so run it AFTER liftover. Refused while a variant_map is assessed.
+
+Records at the position (narrowed to the row's rs id when listed; `rs1;1_10505_A_T` ids are
+split on `;`) must hold exactly two single-base alleles including the effect allele. Then `ref`
+is filled; multiallelic sites, alleles not listed and positions missing keep an empty `ref`
+and empty `variant_id` and are left as they are (the importer skips them). Existing `ref`
+values are kept. Report `filled`, `multiallelic`, the not-listed counts and
+`share_with_both_alleles` in the row's note.
+
 ## Phase 5b: Fill the rs ids (add_rsid)
 
-Every submitted table carries an rs id column. When the processed table has none, or some of
-its rs ids are empty, call add_rsid on it:
+Every submitted table carries an rs id column, and **every variant dbSNP holds must carry its
+rs id**. An empty rs id is allowed only where dbSNP has no record for that chrom / pos / ref /
+alt. A column that exists but is empty (or only partly filled) is not done: writing an empty
+`rsid` column in your own processing script does not count as adding rs ids. When the
+processed table has no rs id column, or any of its rs ids are empty, call add_rsid on it —
+also when the table was processed in an earlier build (phase 0: check the `rsid` values of
+reused `_processed` files, never assume they were filled):
 
 - `file_path`: the processed table (`<name>_processed.tsv.gz`; a `chr*` glob for split files)
 - `columns`: its `chrom_col`, `position_col`, `ref_col`, `alt_col`
@@ -631,7 +822,15 @@ download dbSNP or any other reference yourself. If add_rsid answers that the ref
 
 Report the share it found (`with_rsid` / `rows`) in the row's note.
 
-**Check:** inspect_local shows `rsid` values like `rs346557`, or empty.
+**Check:** `with_rsid` is above zero (a GRCh38 QTL table normally has most variants in dbSNP;
+a share near 0 means wrong coordinates, wrong build or swapped columns — investigate, do not
+submit), and inspect_local shows `rsid` values like `rs346557`.
+
+**Enforced by code:** validate looks up a sample (up to 500 variants per file) of the rows whose
+rs id is empty in the local dbSNP copy, the same way add_rsid does. If dbSNP holds any of
+them, validate fails with `rsid_col … is empty for N of M sampled variants that dbSNP holds`
+and the row cannot be submitted until add_rsid has run and validate passes again. The check
+is skipped only when the dbSNP copy is not in place (then say so in the note).
 
 ## Phase 6: Validate
 
@@ -652,7 +851,8 @@ One row per (qtl_type, context). Before calling submit, check every row against 
 - [ ] `qtl_type` is eQTL, sQTL, caQTL or pQTL; `gene_id_mode` is `self` or
       `phenotype_last_segment` for eQTL/sQTL/pQTL, empty for caQTL
 - [ ] every row has all 27 columns; `gene_id` is empty; `rsid_col` names the column add_rsid
-      filled (rs ids or empty)
+      filled: an rs id for every variant dbSNP holds, empty only where dbSNP has none (validate
+      checks this against dbSNP)
 - [ ] `scope` is `full` unless phase 3b found no full table; a `non_full` row has a `non_full_reason` and a
       `scope_note` with what it holds and what is missing, and the full table is not
       available anywhere you were able to reach

@@ -33,7 +33,17 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Str
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from dataqueryweb import __version__, checks, fetch, finder, llm, manifest, records, rubric
+from dataqueryweb import (
+    __version__,
+    checks,
+    fetch,
+    finder,
+    llm,
+    manifest,
+    progress,
+    records,
+    rubric,
+)
 from dataqueryweb import manifest_rules as rules
 
 _FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
@@ -249,10 +259,21 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
                 path = (root / rel).resolve()
                 if path.is_relative_to(root) and path.is_file():
                     downloaded_paths.setdefault(row["record_id"], set()).add(str(path))
+        runs = manifests.runs()
+        # Where each paper's latest build is or stopped, read from its build log.
+        progress_of = {}
+        for d in (data_root / ".build_logs").glob("*"):
+            if d.name.isdigit() and (rid := int(d.name)) in papers:
+                try:
+                    if (p := progress.summary(data_root, rid, runs.get(rid))) is not None:
+                        progress_of[rid] = p
+                except Exception as exc:  # one unreadable log must not break the page
+                    progress_of[rid] = {"state": "unknown", "next": f"build log unreadable: {exc}"[:200]}
         return {"rows": rows, "locations": locations, "records": papers,
                 "downloaded_files": {rid: len(paths) for rid, paths in downloaded_paths.items()},
                 "built": sorted(manifests.processed()), "needs_you": {k: v for k, v in hand.items() if v},
-                "runs": manifests.runs(), "blocking": sorted(rules.BLOCKING), "processing": sorted(rules.PROCESSING),
+                "runs": runs, "progress": progress_of,
+                "phases": [{"num": n, "name": name, "tools": list(t)} for n, name, t in progress.PHASES], "blocking": sorted(rules.BLOCKING), "processing": sorted(rules.PROCESSING),
                 "files": manifests.write_files(),
                 "issues": rules.ISSUES, "columns": rules.MANIFEST_COLUMNS,
                 "role_columns": list(rules.ROLE_COLUMN.values())}
