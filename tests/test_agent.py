@@ -402,3 +402,65 @@ def test_validate_wants_caqtl_peaks_as_chr_start_end(tmp_path: Path) -> None:
         assert "chr<chrom>_<start>_<end>" in check(wrong) and "replace '-' and ':'" in check(wrong), wrong
     assert "chr<chrom>_<start>_<end>" in check("peak_123")
     assert "start must be below end" in check("chr1_817594_817095")
+
+
+def test_a_z_score_counts_as_a_p_value_source_but_a_t_statistic_does_not() -> None:
+    z = agent.format_check(["snp\tgene\tbeta\tz_score", "1:5:A:C\tENSG00000000001\t-0.4\t-2.3",
+                            "1:6:A:G\tENSG00000000001\t1.7\t1.1"])
+    assert z["zscore_candidates"] == ["z_score"] and not z["pvalue_candidates"]
+    t = agent.format_check(["snp\tgene\tbeta\tt_stat", "1:5:A:C\tENSG00000000001\t-0.4\t-2.3"])
+    assert t["zscore_candidates"] == [] and not t["pvalue_candidates"]
+
+
+def test_assess_file_accepts_a_z_column_and_refuses_a_t_only_table(tmp_path: Path) -> None:
+    s = session(tmp_path)
+    folder = tmp_path / s.folder_name()
+    folder.mkdir()
+    (folder / "z.tsv").write_text("snp\tgene\tz\n1:5:A:C\tENSG00000000001\t-2.3\n")
+    (folder / "t.tsv").write_text("snp\tgene\tt_stat\n1:5:A:C\tENSG00000000001\t-2.3\n")
+    (tmp_path / agent.INDEX_FILE).write_text(json.dumps(
+        {n: {"path": f"{s.folder_name()}/{n}", "record_id": 7} for n in ("z.tsv", "t.tsv")}))
+    for n in ("z.tsv", "t.tsv"):
+        s.inspect_local(f"{s.folder_name()}/{n}")
+    ok = s.assess_file(f"{s.folder_name()}/z.tsv", "qtl_nominal_all", "snp gene z", "yes", plan="p from z",
+                       pval_column="z")
+    assert "recorded" in ok, ok
+    no = s.assess_file(f"{s.folder_name()}/t.tsv", "qtl_nominal_all", "snp gene t", "yes", plan="p from t",
+                       pval_column="t_stat")
+    assert "t statistic" in no["error"]
+
+
+def test_fill_positions_places_rs_ids_from_the_study_map(tmp_path: Path) -> None:
+    from dataqueryweb import allelemap
+
+    folder = tmp_path / "x"
+    folder.mkdir()
+    snp_map = folder / "SNPinfo.tsv"
+    snp_map.write_text("CHR\tBP\tSNP\tA1\tA2\n1\t100\trs1\tA\tG\n2\t200\trs2;2_200_C_T\tC\tT\n"
+                       "3\t300\trs3\tG\tA\n4\t400\trs3\tG\tA\n")  # rs3 at two positions: ambiguous
+    mc = {"chrom": "CHR", "pos": "BP", "id": "SNP", "allele1": "A1", "allele2": "A2"}
+    allelemap.build_index(snp_map, mc, True)
+    assert allelemap.ensure_id_index(snp_map) == 5
+    f = folder / "eqtl_processed.tsv.gz"
+    pd.DataFrame({"rsid": ["rs1", "rs2", "rs3", "rs9", "rs1"], "chrom": ["", "", "", "", "7"],
+                  "pos": ["", "", "", "", "70"], "ref": ["A", "C", "G", "A", "A"], "alt": ["G", "T", "A", "C", "G"],
+                  "variant_id": [""] * 5, "p": ["0.1"] * 5}).to_csv(f, sep="\t", index=False)
+    cols = {"rsid_col": "rsid", "chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt",
+            "variant_id_col": "variant_id"}
+    lookup = allelemap.PositionLookup(snp_map)
+    res = allelemap.fill_positions(f, lookup, cols)
+    lookup.close()
+    out = pd.read_csv(f, sep="\t", dtype=str, keep_default_na=False)
+    assert out["variant_id"].tolist() == ["chr1_100_A_G", "chr2_200_C_T", "chr7_70_A_G"]  # existing position kept
+    assert res == {"rows": 5, "had_position": 1, "filled": 2, "ambiguous": 1, "not_in_map": 1, "removed": 2,
+                   "share_with_position": 0.6}
+
+
+def test_fill_positions_needs_an_assessed_study_map(tmp_path: Path) -> None:
+    s = session(tmp_path)
+    f = tmp_path / "x" / "eqtl_processed.tsv.gz"
+    f.parent.mkdir()
+    pd.DataFrame({"rsid": ["rs1"], "chrom": [""], "pos": [""]}).to_csv(f, sep="\t", index=False)
+    out = s.fill_positions("x/eqtl_processed.tsv.gz", {"rsid_col": "rsid", "chrom_col": "chrom", "position_col": "pos"},
+                           "x/dbsnp.vcf.gz", {"chrom": "c", "pos": "p", "id": "i", "allele1": "a", "allele2": "b"})
+    assert "must be a downloaded file you assessed with contents variant_map" in out["error"]

@@ -52,7 +52,18 @@ from urllib.parse import urljoin
 import httpx
 import pandas as pd
 
-from dataqueryweb import allelemap, dbsnp, fetch, finder, liftover, llm, probe, reasons, rebuild, records
+from dataqueryweb import (
+    allelemap,
+    dbsnp,
+    fetch,
+    finder,
+    liftover,
+    llm,
+    probe,
+    reasons,
+    rebuild,
+    records,
+)
 from dataqueryweb import manifest_rules as rules
 
 MAX_STEPS = int(os.environ.get("MANIFEST_AGENT_STEPS") or 80)  # tool calls per paper
@@ -146,6 +157,11 @@ exist neither in the association file nor in a verified companion map, the table
 - NO NOMINAL P-VALUE (nor -log10 p / 1-df chi-square / z score to compute it from) → the table \
 cannot be processed: assess it processable no and list it in skipped_tables. A t statistic or \
 beta / se alone is not enough. This is enforced. From z: p = erfc(|z| / sqrt(2)) (two-sided).
+- ONLY RS IDS, NO CHROMOSOME / POSITION: when the study provides its own SNP info / variant map \
+(README-documented, assessed variant_map), write the table with the rs ids and empty chrom / pos, \
+then call fill_positions with that map (before fill_alleles and liftover). Ids the map does not \
+place at exactly one position are removed and counted. Without such a map the table cannot be \
+used (no other source of positions is allowed).
 - MISSING NON-EFFECT ALLELE is NOT a reason to skip: a fixed program maps it. Write the table \
 with the effect allele in alt and ref empty, then call fill_alleles — with map_file set to the \
 study's own SNP info/variant map when the source provides one (before liftover), otherwise \
@@ -181,8 +197,8 @@ file — inspect_local it (the program adds a format_check: delimiter, header, m
 found and missing; for an archive inspect its listing and at least one member) and record \
 your verdict with assess_file (what it holds; ready / yes / no for processing to the standard \
 format, with the plan or the reason). Only then write the processing code. Code that writes \
-_processed tables, validate, liftover, fill_alleles, add_rsid and submit are refused while any \
-downloaded file has no assessment. Files assessed "no" go to skipped_tables.
+_processed tables, validate, liftover, fill_alleles, fill_positions, add_rsid and submit are \
+refused while any downloaded file has no assessment. Files assessed "no" go to skipped_tables.
 
 FIELDS
 - dataset: the resource or cohort name the paper uses (OneK1K, SingleBrain, GALA_II, …), \
@@ -321,6 +337,24 @@ TOOLS: list[dict[str, Any]] = [
          "map_header": {"type": "boolean", "description": "whether the map's first line is a header (default true)"},
          "map_delimiter": {"type": "string", "description": "\\t (default) , ; or a space"}},
                     "required": ["file_path", "columns"]}},
+    {"name": "fill_positions", "description": "Fixed program for association tables that give only rs ids: fills "
+     "the empty chrom_col and position_col of a processed table (<name>_processed.tsv.gz; globs allowed) from the "
+     "study's own SNP info / variant map (map_file, assessed variant_map), matching the table's rs id to the map's "
+     "id column (ids like 'rs1;1_10505_A_T' are split on ';'). Only ids the map places at exactly ONE position are "
+     "filled; ids it lacks or lists at several positions cannot be placed, and those rows are removed and counted. "
+     "Existing positions are kept; the variant id is rebuilt where both alleles are known. The coordinates are on "
+     "the map's build, so run it BEFORE fill_alleles and liftover. Never map positions in your own Python. Then "
+     "fill_alleles / liftover / add_rsid as needed and validate.",
+     "parameters": {"type": "object", "properties": {
+         "file_path": {"type": "string"},
+         "columns": {"type": "object", "description": "rsid_col (the rs ids), chrom_col and position_col (to fill), "
+                     "and optional ref_col, alt_col, variant_id_col"},
+         "map_file": {"type": "string", "description": "the study SNP info file, relative to the data folder"},
+         "map_columns": {"type": "object", "description": "chrom, pos, id (the rs ids) and allele1, allele2 of the map: "
+                         "header names, or 0-based column numbers when map_header is false"},
+         "map_header": {"type": "boolean", "description": "whether the map's first line is a header (default true)"},
+         "map_delimiter": {"type": "string", "description": "\\t (default) , ; or a space"}},
+                    "required": ["file_path", "columns", "map_file", "map_columns"]}},
     {"name": "liftover", "description": "Convert a processed GRCh37/hg19 table (<name>_processed.tsv.gz; "
      "globs allowed) to GRCh38 in place with UCSC's hg19ToHg38 chain: chrom and position are converted, alleles "
      "complemented where the variant lands on the minus strand, the variant id rebuilt, and variants with no "
@@ -1004,6 +1038,51 @@ class Session:
         out |= {"share_with_both_alleles": round(known / out["rows"], 4) if out.get("rows") else 0.0,
                 "next": "rows left without ref stay as they are (the importer skips them); report the counts "
                         "in the row's note and evidence, then liftover / add_rsid as needed and validate again"}
+        self.validated.pop(file_path.strip(), None)  # the file changed
+        return out
+
+    def fill_positions(self, file_path: str, columns: dict[str, str], map_file: str,
+                       map_columns: dict[str, str], map_header: bool = True,
+                       map_delimiter: str = "\\t") -> dict[str, Any]:
+        """Fill the empty chromosome and position of processed tables from their rs ids, with a fixed
+        program reading the study's own SNP info file (assessed variant_map)."""
+        if no := self.need_assessments("fill_positions"):
+            return no
+        files = expand(self.root, file_path)
+        if not files:
+            return {"error": f"no file matches {file_path} under the data folder"}
+        if any("_processed" not in f.name or not f.name.endswith(".tsv.gz") for f in files):
+            return {"error": "fill_positions writes into processed tables only (<name>_processed.tsv.gz); process the file first"}
+        if missing := [k for k in ("rsid_col", "chrom_col", "position_col") if not columns.get(k)]:
+            return {"error": f"name the columns: {', '.join(missing)}"}
+        key = map_file.strip()
+        if (self.assessments.get(key) or {}).get("contents") != "variant_map":
+            return {"error": f"{key!r} must be a downloaded file you assessed with contents variant_map; positions "
+                             "come only from the study's own map (no other source is used)"}
+        mc = {k: str(v) for k, v in (map_columns or {}).items() if str(v).strip()}
+        if missing := [r for r in ("chrom", "pos", "id", "allele1", "allele2") if r not in mc]:
+            return {"error": f"map_columns needs {', '.join(missing)} (header names, or 0-based column numbers when "
+                             "map_header is false)"}
+        src = self.root / key
+        built = allelemap.build_index(src, mc, bool(map_header), resolve_delimiter(map_delimiter),
+                                      step=lambda m: self.step(f"AI: fill_positions: {m}"))
+        ids = allelemap.ensure_id_index(src, step=lambda m: self.step(f"AI: fill_positions: {m}"))
+        lookup = allelemap.PositionLookup(src)
+        out: dict[str, Any] = {"files": len(files), "source": "study SNP info file", "map_file": key,
+                               "map_rows": built["rows"], "map_ids": ids}
+        try:
+            for f in files:
+                res = allelemap.fill_positions(f, lookup, columns,
+                                               step=lambda m, f=f: self.step(f"AI: fill_positions {f.name}: {m}"))
+                for k, v in res.items():
+                    if k != "share_with_position":
+                        out[k] = out.get(k, 0) + v
+        finally:
+            lookup.close()
+        known = out.get("had_position", 0) + out.get("filled", 0)
+        out |= {"share_with_position": round(known / out["rows"], 4) if out.get("rows") else 0.0,
+                "next": "report filled / ambiguous / not_in_map / removed in the row's note; then fill_alleles (map "
+                        "first), liftover if the map is GRCh37, add_rsid, and validate"}
         self.validated.pop(file_path.strip(), None)  # the file changed
         return out
 
@@ -1821,7 +1900,7 @@ async def dispatch(s: Session, name: str, args: dict[str, Any]) -> dict[str, Any
         return {"accepted": True}
     fn = {"read_build_history": s.read_build_history, "read_paper": s.read_paper, "open_url": s.open_url, "list_files": s.list_files, "peek_file": s.peek_file,
           "download": s.download, "inspect_local": s.inspect_local, "run_python": s.run_python,
-          "validate": s.validate, "liftover": s.liftover, "add_rsid": s.add_rsid, "fill_alleles": s.fill_alleles,
+          "validate": s.validate, "liftover": s.liftover, "add_rsid": s.add_rsid, "fill_alleles": s.fill_alleles, "fill_positions": s.fill_positions,
           "note_location": s.note_location, "assess_file": s.assess_file}.get(name)
     if fn is None:
         return {"error": f"no tool {name!r}"}

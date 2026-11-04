@@ -52,12 +52,13 @@ program refuses or flags it whatever you do.
 | **No nominal p-value**, and no −log10 p or 1-df chi-square to compute it from | **not processable**: assess_file `processable: no`, skipped_tables | assess_file refuses ready / yes without a p-value column the format check accepts |
 | Only FDR / q-value / adjusted / permutation p | not processable (not a nominal p) | the format check does not count those columns |
 | −log10 p or 1-df chi-square instead of p | compute p in processing (`10^-x`; `erfc(sqrt(x/2))`) | — |
-| Only a z or t statistic (or beta + se) | **not processable today**: the format check accepts only p, −log10 p or chi-square | assess_file refuses ready / yes |
+| A z score instead of p | compute the two-sided p: `erfc(|z| / sqrt(2))`; name the z column as `pval_column` in assess_file | the format check lists z-score columns; assess_file accepts them |
+| Only a t statistic, or only beta + se | not processable (t needs its degrees of freedom; beta / se would assume a normal) | assess_file refuses ready / yes |
 | **No rs id**, or rs ids partly empty | **add_rsid** fills them from local dbSNP by chrom/pos/ref/alt; empty only where dbSNP has none | validate fails while a sampled variant dbSNP holds has an empty rs id |
 | A column named rsid / snp holds `1_123_A_G`-style ids, not rs numbers | use it as the source of the variant id (split it); do not name it `rsid_col`; fill `rsid` with add_rsid | validate: rs ids must be `rs<digits>` or empty |
 | Only the effect allele (no other allele) | write it as `alt`, leave `ref` empty, call **fill_alleles**: with the study's SNP map first, otherwise dbSNP | run_python that names the map is refused |
 | Multiallelic / ambiguous site | leave `ref` and `variant_id` empty, keep the row; never drop the table | validate allows empty ref with empty variant id |
-| Only rs ids, no chromosome / position | look for a same-study variant map (README); **no tool maps rs id → position today**, so without coordinates the table is not processable (skipped_tables, say why) | — |
+| Only rs ids, no chromosome / position | with the study's own SNP info / variant map (README-documented, assessed variant_map): **fill_positions** fills chrom / pos by rs id; ids the map lacks or places at several positions are removed and counted. Without such a map: not processable (skipped_tables, say why) | run_python that names the map is refused; fill_positions accepts only an assessed variant_map |
 | Packed variant id (`1:123:A:G`, `chr1_123_A_G_b38`) | split into chrom / pos / ref / alt; rebuild `variant_id` | validate |
 | Chromosome written `chr1` | chrom = `1`; variant id keeps `chr` (`chr1_123_A_G`) | validate |
 | caQTL peak `chr1-100-200` / `chr1:100-200` | `chr1_100_200`; keep the original as `phenotype_id_original` | validate |
@@ -329,9 +330,14 @@ Methods, software availability, repository README and actual result-file columns
   study's SNP info file when the source provides one (assessed `variant_map` / `companion`),
   otherwise without it, from the local dbSNP copy. The study's own map always comes first.
   run_python code that writes `_processed` tables and names the map file is refused.
-- **No p-value → not processable.** A table with no nominal p-value (and no -log10 p or
-  chi-square to make one from) is assessed `processable: no` and goes to skipped_tables;
-  assess_file refuses ready / yes without a p-value column the format check accepts. Confirm the map's coordinate build and preserve it in evidence; liftover only after
+- **No p-value → not processable.** A table with no nominal p-value (and no -log10 p, 1-df
+  chi-square or z score to compute one from) is assessed `processable: no` and goes to
+  skipped_tables; assess_file refuses ready / yes without a p-value or z-score column the format
+  check accepts. A t statistic or beta / se alone is not enough.
+- **Only rs ids, no chromosome / position → fill_positions with the study's map.** Write the
+  table with its rs ids and empty `chrom` / `pos`, then call fill_positions (phase 5a1) with the
+  study's SNP info file. Without such a map the table is not processable (no other source of
+  positions is used). Confirm the map's coordinate build and preserve it in evidence; liftover only after
   a valid coordinate-and-allele mapping is established.
 - Determine which allele the association's effect estimate refers to from the README or method
   documentation (for example, `assessed_allele`). In this manifest, `alt` is the effect allele
@@ -777,6 +783,25 @@ be established, do not lift over; say so in the note.
 
 **Check:** inspect_local shows `pos` changed, `chrom_grch37` / `pos_grch37` holding the old
 coordinates, and `variant_id` matching the new `pos`.
+
+## Phase 5a1: Fill chromosome and position from rs ids (fill_positions — a fixed program)
+
+Only for association tables that give rs ids but no chromosome / position, when the study
+provides its own SNP info / variant map (assessed `variant_map`). Write the processed table with
+the rs ids, the alleles you have, and empty `chrom` / `pos`, then call fill_positions:
+
+- `file_path`: the processed table (`<name>_processed.tsv.gz`; a glob for split files)
+- `columns`: `rsid_col`, `chrom_col`, `position_col`, and `ref_col`, `alt_col`, `variant_id_col`
+  when the table has them
+- `map_file`, `map_columns` (`chrom`, `pos`, `id`, `allele1`, `allele2`; header names, or 0-based
+  numbers with `map_header: false`), `map_delimiter`
+
+The map is indexed once (`<map>.alleles.sqlite`, shared with fill_alleles). An rs id gets the
+position only when the map places it at exactly one position; ids the map lacks or lists at
+several positions cannot be placed, and those rows are removed (the importer could not use them).
+The coordinates are on the map's build: run fill_positions BEFORE fill_alleles and liftover.
+Report `filled`, `ambiguous`, `not_in_map`, `removed` and `share_with_position` in the row's note.
+Never map positions in your own Python, and never use dbSNP or another resource for positions.
 
 ## Phase 5a2: Fill the missing non-effect allele (fill_alleles — a fixed program)
 

@@ -233,7 +233,7 @@ flowchart LR
 | | `processable`：能否处理成目标格式 | ready（已经是）/ yes（能处理）/ companion（给 fill_alleles 用的 variant map）/ no | |
 | | `description` | 列是什么，带表头和一行例子 | |
 | | `plan`（yes 时） | chrom/pos/ref/alt/variant_id/p 值/phenotype 各从哪来，缺的由哪个文件或工具补 | yes 没有 plan 就拒绝 |
-| | `pval_column`（ready / yes 时） | nominal p 值列名 | 必须是格式检查认可的 p 值 / −log10 p / 卡方列，否则拒绝 |
+| | `pval_column`（ready / yes 时） | nominal p 值列名（或用来算 p 的 −log10 p / 卡方 / z 值列） | 必须是格式检查认可的列，否则拒绝 |
 | | `missing`、`reason`（no 时） | 缺哪些标准列；为什么不能用 | no 没有 reason 就拒绝 |
 | | `evidence` | 从 inspect 结果、README 等逐字引用 | 逐条核对，一条都不对就拒绝 |
 | `note_location` | `status` | listed / downloaded / manual / error / not_data / duplicate | |
@@ -248,7 +248,7 @@ flowchart LR
 
 `submit` 每行的 27 个字段：`dataset`、`source_project_id`、`use_in_lc2`（程序固定为 FALSE）、`qtl_type`、`biocontext`、`level_1_context`、`level_2_context`、`population`、`sample_size`、`file_path`、`delimiter`、`chrom_col`、`position_col`、`ref_col`、`alt_col`、`beta_col`、`se_col`、`pval_col`、`rsid_col`、`maf_col`、`variant_id_col`、`phenotype_id_col`、`gene_id`（留空）、`gene_id_mode`、`median_tpm`、`url`、`publication`。
 
-**操作类工具**（`read_paper`、`open_url`、`list_files`、`peek_file`、`download`、`inspect_local`、`run_python`、`validate`、`liftover`、`fill_alleles`、`add_rsid`、`read_build_history`）只需要填参数（查询词、网址、文件路径、列名、代码和 `purpose`），加上 `why`。
+**操作类工具**（`read_paper`、`open_url`、`list_files`、`peek_file`、`download`、`inspect_local`、`run_python`、`validate`、`fill_positions`、`fill_alleles`、`liftover`、`add_rsid`、`read_build_history`）只需要填参数（查询词、网址、文件路径、列名、代码和 `purpose`），加上 `why`。
 
 ### D. Build conversation（Details 里的对话）
 
@@ -321,7 +321,7 @@ flowchart LR
 | 4 | 下载 | `download` |
 | 4b | 检查每个下载的文件，判断内容和能否处理 | `inspect_local`、`assess_file` |
 | 5 | 处理成目标格式，写 `<原名>_processed.tsv.gz` | `run_python` |
-| 5a | GRCh37 → GRCh38；只有效应等位基因时补另一个等位基因 | `liftover`、`fill_alleles` |
+| 5a | 只有 rsID 时补位置；只有效应等位基因时补另一个等位基因；GRCh37 → GRCh38 | `fill_positions`、`fill_alleles`、`liftover` |
 | 5b | 补 rsID | `add_rsid` |
 | 6 | 按导入脚本的方式验证 | `validate` |
 | 7 | 提交 manifest 行（或放弃） | `submit`、`give_up` |
@@ -339,6 +339,7 @@ flowchart LR
 | `assess_file` | 判定文件是什么、能否处理（可以用 glob 一次判定表头相同的一组文件） | 必须先 `inspect_local`；`ready/yes` 必须指明格式检查认可的 p 值列；必须带 `evidence` |
 | `run_python` | 在论文文件夹里运行 LLM 写的 Python（无网络） | 禁止网络、子进程、删除、绝对路径；**所有下载文件都判定完之前，不能写 `_processed` 文件**；有 variant map 时不能自己映射等位基因 |
 | `liftover` | 固定程序：UCSC chain 把 GRCh37 转成 GRCh38 | 每个文件只能转一次，必须在 `add_rsid` 之前 |
+| `fill_positions` | 固定程序：只有 rsID 的表，用研究自带的 SNP map 按 rsID 补染色体和位置 | 只接受 assess 为 variant_map 的文件；rsID 在 map 里唯一对应一个位置才补；在 `fill_alleles`、`liftover` 之前 |
 | `fill_alleles` | 固定程序：用研究自带的 SNP map 或 dbSNP 补非效应等位基因 | 只补双等位位点，不猜 |
 | `add_rsid` | 固定程序：用本地 dbSNP 按 chrom/pos/ref/alt 补 rsID | 只写 `_processed` 表；只适用于 GRCh38 |
 | `validate` | 按导入脚本读前 2 万行并逐列检查（第 4 节） | 不通过不能提交 |
@@ -407,15 +408,16 @@ flowchart LR
 
 | 情况 | 怎么做 | 程序强制 |
 |---|---|---|
-| **没有 nominal p 值**，也没有可换算的 −log10 p 或 1 自由度卡方 | **无法处理**：assess_file 判 `processable: no`，进 skipped_tables | 格式检查认可的 p 值列不存在时，assess_file 拒绝判 ready / yes |
+| **没有 nominal p 值**，也没有可换算的 −log10 p、1 自由度卡方或 z 值 | **无法处理**：assess_file 判 `processable: no`，进 skipped_tables | 格式检查认可的 p 值 / z 值列都不存在时，assess_file 拒绝判 ready / yes |
 | 只有 FDR / q 值 / 校正后 / permutation p | 无法处理（不是 nominal p） | 格式检查不把这些列算作 p 值 |
 | 有 −log10 p 或 1 自由度卡方，没有 p | 处理时换算：p = 10^−x；p = erfc(√(x/2)) | — |
-| 只有 z 或 t 统计量（或只有 beta + se） | **目前算无法处理**：格式检查只认 p、−log10 p、卡方 | assess_file 拒绝判 ready / yes |
+| 有 z 值，没有 p | 处理时换算双侧 p：p = erfc(\|z\| / √2)；assess_file 的 `pval_column` 填 z 列 | 格式检查列出 z 值列，assess_file 接受 |
+| 只有 t 统计量，或只有 beta + se | 无法处理（t 需要自由度；beta/se 要假设正态近似） | assess_file 拒绝判 ready / yes |
 | **没有 rsID**，或部分为空 | **用 `add_rsid` 补**：按 chrom/pos/ref/alt 查本地 dbSNP，dbSNP 没有的才留空 | 抽到 dbSNP 有但 rsID 为空的变异，validate 就不通过 |
 | 叫 rsid / snp 的列里是 `1_123_A_G` 这种 id，不是 rs 号 | 当作 variant id 的来源（拆开），不能填成 `rsid_col`；rsID 用 add_rsid 补 | validate：rsID 只能是 `rs<数字>` 或空 |
 | 只有效应等位基因，缺另一个 | 效应等位基因写进 `alt`，`ref` 留空，调用 **`fill_alleles`**：优先用研究自带的 SNP map，没有才用 dbSNP | 写 `_processed` 的 run_python 引用 map 文件会被拒绝 |
 | 多等位 / 不确定的位点 | 这一行 `ref` 和 `variant_id` 留空，保留该行；不因此放弃整张表 | validate 允许 ref 为空（variant_id 也为空） |
-| 只有 rsID，没有染色体 / 位置 | 找 README 里说明的同研究 variant map；**目前没有工具能从 rsID 查位置**，拿不到坐标就无法处理（skipped_tables 写明原因） | — |
+| 只有 rsID，没有染色体 / 位置 | 有研究自带的 SNP info / variant map（README 说明、assess 为 variant_map）时，用 **`fill_positions`** 按 rsID 补 chrom / pos；map 里没有或对应多个位置的 rsID 无法定位，这些行删除并计数。没有这样的 map → 无法处理（skipped_tables 写明原因），不用 dbSNP 等其他来源 | run_python 引用 map 会被拒绝；fill_positions 只接受 assess 为 variant_map 的文件 |
 | variant id 是打包的（`1:123:A:G`、`chr1_123_A_G_b38`） | 拆成 chrom / pos / ref / alt，重建 `variant_id` | validate |
 | 染色体写成 `chr1` | chrom 写 `1`；variant id 保留 `chr`（`chr1_123_A_G`） | validate |
 | caQTL peak 是 `chr1-100-200` / `chr1:100-200` | 改成 `chr1_100_200`，原值留在 `phenotype_id_original` | validate |
@@ -451,7 +453,7 @@ flowchart LR
 | Rebuild：下载文件和上次判定时一样 | 复用判定；只有 skill 变动影响到它时才重新判定 | REBUILD CHECK |
 | 任何一步 | 带 `why`；assess_file、note_location、give_up 还要带 `evidence`（逐字引文） | 不带就拒绝 |
 
-**目前和 skill 不完全一致的地方：** skill 的处理示例里有 "z → 双侧 p" 的换算，但 `assess_file` 只认 p、−log10 p、卡方列，所以只有 z / t 统计量的表目前会被判为无法处理。只有 rsID、没有坐标的表，也没有工具能补坐标。这两种情况要不要支持，需要决定。
+z → p 和按 rsID 补位置（`fill_positions`）在 2026-11-04 加入，代码、skill 和本文一致。
 
 ---
 
@@ -837,7 +839,7 @@ uv run ruff check src tests           # 代码风格
 | `reasons.py` | 每一步的理由和证据检查、decisions 记账 |
 | `progress.py` | 从日志读 build 进度，给网页用 |
 | `dbsnp.py` | 本地 dbSNP 查询：`add_rsid`、`fill_alleles`、rsID 检查 |
-| `allelemap.py` | 用研究自带的 SNP map 补等位基因 |
+| `allelemap.py` | 用研究自带的 SNP map 补等位基因（`fill_alleles`）和按 rsID 补位置（`fill_positions`） |
 | `liftover.py` | GRCh37 → GRCh38 |
 | `src/frontend/static/js/manifest.js` | Manifest rows 页面（状态、筛选、Details） |
 | `src/frontend/static/js/manifest-status.js` | 从位置报告和行推出"需要人做什么" |
@@ -852,6 +854,6 @@ uv run ruff check src tests           # 代码风格
 - rebuild 第一次完整读取大的 processed 文件很慢（每 GB 约 20 秒每线程），之后靠缓存。
 - `evidence` 核对的是"引文确实出现在 LLM 看过的内容里"，不能保证 LLM 对引文的解读正确；判定结果仍需人工审核行。
 - 2026-11-04 之前的 build 没有保存 skill 副本、`assess_file` 判定和 decisions 记录，rebuild 时这些只能从头开始。
-- **只有 z / t 统计量的表目前无法处理**：`assess_file` 只认 p、−log10 p、卡方列；但 build 的 system prompt、SKILL 的处理示例和旧流程都写了 z → p，两边不一致，待决定。
-- **只有 rsID、没有坐标的表目前无法处理**：`fill_alleles` 和 `add_rsid` 都按位置查，没有工具能从 rsID 查位置。
+- 只有 t 统计量或只有 beta + se 的表不能处理（2026-11-04 决定：只放开 z → p）。
+- 只有 rsID、没有坐标的表，只能用研究自带的 variant map 补位置（2026-11-04 决定：不用 dbSNP 查位置）。
 - rebuild 检查不预先检查 tar 压缩包（列出成员要解压整个文件），由 AI 自己 inspect。

@@ -28,7 +28,7 @@ PHASES = [
     ("4", "Download", ("download",)),
     ("4b", "Check each downloaded file", ("inspect_local", "assess_file")),
     ("5", "Process to the target format", ("run_python",)),
-    ("5a", "Liftover / fill alleles", ("liftover", "fill_alleles")),
+    ("5a", "Liftover / fill positions / fill alleles", ("liftover", "fill_positions", "fill_alleles")),
     ("5b", "Add rs ids", ("add_rsid",)),
     ("6", "Validate", ("validate",)),
     ("7", "Submit", ("submit", "give_up")),
