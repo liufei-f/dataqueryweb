@@ -1064,3 +1064,49 @@ body.mf-col-resizing { cursor: col-resize; user-select: none; }
 .mf-legend dt { font-weight: 600; }
 .mf-legend dd { margin: 0; }
 @media (max-width: 640px) { .mf-legend dl { grid-template-columns: 1fr; } }
+
+/* Navigation: the four steps of the pipeline in order, joined by arrows; "How it works" apart. */
+.site-nav .nav-arrow { align-self: center; color: var(--muted); font-size: 13px; padding: 0 1px; user-select: none; }
+.site-nav .nav-sep { align-self: center; width: 1px; height: 18px; background: var(--line); margin: 0 8px; }
+@media (max-width: 960px) { .site-nav .nav-arrow { font-size: 12px; } .site-nav .nav-sep { margin: 0 4px; } }
+
+/* Details: six steps, vertical, with a failed step's reason, solution and actions. */
+.mf-det-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 8px; }
+.mf-det-head h3 { margin: 0; font-size: 15px; display: flex; gap: 8px; align-items: center; }
+.mf-steps { list-style: none; padding: 0; margin: 0 0 12px; display: grid; gap: 6px; }
+.mf-step { border: 1px solid var(--line); border-left-width: 4px; border-radius: 6px; padding: 8px 12px; }
+.mf-step-head { display: flex; gap: 8px; align-items: center; }
+.mf-step-complete { border-left-color: #16a34a; }
+.mf-step-running { border-left-color: #d97706; }
+.mf-step-pending { border-left-color: var(--line); color: var(--muted); }
+.mf-step-failed { border-left-color: #dc2626; background: rgba(220, 38, 38, 0.04); }
+.mf-step .mf-prog-facts { margin-top: 6px; }
+.mf-step h4 { margin: 8px 0 4px; font-size: 13px; }
+/* Files: collapsible, one row per file, processed tables nested under their source. */
+.mf-files { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 0 0 12px; }
+.mf-files > summary { cursor: pointer; }
+.mf-file-table td { vertical-align: top; }
+.mf-file-sub > td { padding-top: 0; }
+.mf-stages { display: flex; flex-wrap: wrap; gap: 3px; }
+.mf-stage { font-size: 11.5px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
+.mf-stage-complete { color: #166534; border-color: #bbf7d0; }
+.mf-stage-failed { color: #991b1b; border-color: #fecaca; background: rgba(220, 38, 38, 0.06); }
+.mf-stage-pending, .mf-stage-skipped { color: var(--muted); }
+.mf-file-table { table-layout: fixed; width: 100%; }
+.mf-file-table th:first-child { width: 26%; }
+.mf-file-table td, .mf-files .mf-ev td { overflow-wrap: anywhere; word-break: break-word; }
+.mf-files .rec-url { white-space: normal; overflow-wrap: anywhere; word-break: break-all; }
+.mf-files td:first-child, .mf-steps td:first-child { white-space: normal; }
+/* Saved records and AI-checked papers use the Manifest papers table (.mf-overview): one tbody per paper. */
+.mf-overview > tbody.rec-is-auto > .mf-paper-head > td { background: #faf8ff; }
+.mf-overview > tbody.rec-is-auto > .mf-paper-head > td:first-child { box-shadow: inset 3px 0 0 #7c3aed; }
+.mf-overview .rec-delete:hover { background: #fee2e2; color: #b91c1c; border-color: #fecaca; }
+.mf-overview .rec-confirm { display: inline-block; }
+.mf-overview .rec-note { min-width: 0; }
+.mf-overview .dq-sources { table-layout: fixed; width: 100%; }
+.mf-overview .dq-sources td, .mf-overview .dq-sources td:first-child { white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+.mf-overview .dq-sources .dq-src-url { word-break: break-all; }
+.mf-overview .dq-sources .dq-save-cell { white-space: nowrap; }
+.mf-overview .dq-sources col:last-child { width: 12% !important; }
+.mf-overview .dq-sources col:nth-child(4) { width: 31% !important; }
+.mf-overview .dq-sources .dq-save { white-space: normal; }

@@ -52,6 +52,7 @@ def test_each_step_is_logged_with_its_reason_evidence_and_result(tmp_path: Path)
     judge = Script([
         [("read_paper", {"query": "donors", "why": "go"})],  # refused: no concrete reason
         [("read_paper", {"query": "donors"})],
+        [("read_skill", {"name": "full-vs-nonfull"}), ("read_skill", {"name": "access"})],
         [("give_up", {"reason": "nothing public"})],  # refused: no evidence
         [("give_up", {"reason": "nothing public",
                       "evidence": [{"quote": "We genotyped 412 donors of European ancestry", "source": "paper"}]})],
@@ -63,7 +64,25 @@ def test_each_step_is_logged_with_its_reason_evidence_and_result(tmp_path: Path)
     ledger = next((tmp_path / ".build_logs" / str(RECORD["record_id"])).glob("*.decisions.jsonl"))
     rows = [json.loads(x) for x in ledger.read_text().splitlines()]
     assert [(r["tool"], r["outcome"]) for r in rows] == [("read_paper", "refused"), ("read_paper", "ok"),
+                                                        ("read_skill", "ok"), ("read_skill", "ok"),
                                                         ("give_up", "refused"), ("give_up", "ok")]
-    assert rows[1]["why"].startswith("scripted test step") and rows[3]["evidence"][0]["verified"]
+    assert rows[1]["why"].startswith("scripted test step") and rows[5]["evidence"][0]["verified"]
     log = ledger.with_suffix("").with_suffix(".md").read_text()
     assert "Decision: give_up (ok)" in log and "Decision: read_paper (refused)" in log
+    from dataqueryweb import progress
+    stop = progress.parse(ledger.with_suffix("").with_suffix(".md"))["stop"]
+    assert stop["outcome"] == "gave_up" and stop["step"] == "6" and stop["last_tool"] == "give_up"
+    assert stop["reason"] == "gave up: nothing public"
+
+
+def test_printed_output_of_own_code_is_no_evidence_for_a_judgement(tmp_path: Path) -> None:
+    s = session(tmp_path)
+    s.log.append({"tool": "run_python", "result_full": "the authors state that no summary statistics exist"})
+    s.log.append({"tool": "list_files", "result_full": "eqtl_allpairs.tsv.gz 12 GB nominal results"})
+    why = "the listing shows the nominal table, so the location holds data"
+    _, refusal, _ = reasons.check(s, "give_up", {"reason": "x", "why": why, "evidence": [
+        {"quote": "the authors state that no summary statistics exist", "source": "python"}]})
+    assert refusal and "none of the quotes was found" in refusal["refused"]
+    _, refusal, _ = reasons.check(s, "give_up", {"reason": "x", "why": why, "evidence": [
+        {"quote": "eqtl_allpairs.tsv.gz 12 GB nominal results", "source": "list_files"}]})
+    assert refusal is None

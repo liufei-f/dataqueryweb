@@ -375,3 +375,26 @@ def test_an_archive_that_breaks_off_counts_as_a_failed_read(monkeypatch) -> None
     with httpx.Client(transport=httpx.MockTransport(stream)) as http:
         got = probe.probe_file(http, probe.RemoteFile("all.tar", "https://example.org/all.tar"))
     assert got.kind == "error" and got.note.startswith("the archive broke off after")
+
+
+def test_a_build_that_never_submitted_keeps_the_last_rows(tmp_path: Path, monkeypatch) -> None:
+    from dataqueryweb import agent, fetch
+
+    store = manifest.ManifestStore(tmp_path / "r.sqlite3")
+    saved_runs: list[int] = []
+    monkeypatch.setattr(store, "save_run", lambda rid, *a, **k: saved_runs.append(rid))
+
+    async def no_paper(record):
+        return None
+
+    async def unreachable(record, judge, **kw):
+        return {"audit_path": "", "rows": [], "reports": [], "model": "", "submitted": False,
+                "note": "LLM step failed: gpt: ConnectError", "summary": "", "log": [], "scripts": [],
+                "assessments": {}}
+
+    monkeypatch.setattr(manifest, "read_paper", no_paper)
+    monkeypatch.setattr(agent, "run", unreachable)
+    data = fetch.Options(tmp_path, download=True, max_bytes=1e9)
+    out = asyncio.run(manifest.build_with_agent(RECORD, store, None, target=rules.Target(), step=lambda _: None,
+                                                data=data, cancel=__import__("threading").Event()))
+    assert out["failed"] and "ConnectError" in out["note"] and saved_runs == []  # nothing replaced

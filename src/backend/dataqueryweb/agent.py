@@ -43,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -63,10 +64,12 @@ from dataqueryweb import (
     reasons,
     rebuild,
     records,
+    tables,
 )
 from dataqueryweb import manifest_rules as rules
 
 MAX_STEPS = int(os.environ.get("MANIFEST_AGENT_STEPS") or 80)  # tool calls per paper
+MAX_PROCESS_ATTEMPTS = 2  # failed validates of one file before it is reported instead of processed again
 MAX_TOKENS = int(os.environ.get("MANIFEST_AGENT_TOKENS") or 4_000_000)  # per paper
 RUN_MAX_SECONDS = int(os.environ.get("MANIFEST_RUN_MAX_SECONDS") or 6 * 3600)
 TOOL_CHARS = 14000  # longest tool result the model sees
@@ -116,7 +119,7 @@ WHAT THE MANIFEST NEEDS
 (nominal results, "allpairs", "full_assoc", "sumstats"). Tables of only significant, lead, \
 conditional, fine-mapped or colocalised hits are not wanted while a full table may exist — \
 list them in skipped_tables. Only when a careful search of the paper and everything it points \
-to (PROCEDURE phase 3b) shows that no full table is public, keep the most complete non-full \
+to (PROCEDURE step 1 and module full-vs-nonfull) shows that no full table is public, keep the most complete non-full \
 table of that QTL type and context as a row with scope "non_full", a non_full_reason and a \
 scope_note that says with numbers why it is not full.
 - qtl_type must be one of: eQTL, sQTL, caQTL, pQTL. Other types (mQTL, meQTL, metabolite QTL, \
@@ -132,6 +135,12 @@ pandas.read_csv(path, sep=delimiter, compression="infer", dtype=str) and needs t
 named in the row: chrom_col, position_col, ref_col, alt_col, variant_id_col, pval_col \
 (nominal p-value, not FDR/q/permutation), phenotype_id_col, and rsid_col (rs ids: every variant dbSNP holds must have one, empty only where \
 dbSNP has none; fill it with add_rsid — validate checks it against dbSNP). Optional: beta_col, se_col, maf_col.
+- The PROCEDURE below is the core; the exact procedure for special situations is in modules \
+(its module table says which and when). Read a module with read_skill before acting in its situation, \
+never improvise what a module covers: the actions a module covers are refused until it has been read, \
+and the refusal hands you its text.
+- Facts in supplementary tables (sample sizes per context, cohort tables): read them with read_table; \
+its rows count as evidence for quotes. Output printed by your own run_python code never does.
 - Every tool call carries `why`: what you already saw that leads to this step (name the tool result, file \
 or paper text) and what you expect. assess_file, note_location and give_up also carry `evidence`: quotes copied \
 word for word from what you were shown; the program checks them. A call without them is refused and not run, \
@@ -191,7 +200,7 @@ THE SERVER: 2 CPUs, 3 GB RAM. Process big tables in chunks (pandas chunksize ≤
 write with gzip in append mode). A 3 GB .gz file takes ~20 minutes; that is fine. Files \
 that exist already are not downloaded again.
 
-HOW TO WORK: follow the PROCEDURE at the end of these instructions, phase by phase. \
+HOW TO WORK: follow the PROCEDURE at the end of these instructions, step by step (six steps). \
 ENFORCED ORDER AFTER DOWNLOADING: download all the files first; then CHECK EVERY downloaded \
 file — inspect_local it (the program adds a format_check: delimiter, header, manifest columns \
 found and missing; for an archive inspect its listing and at least one member) and record \
@@ -228,6 +237,55 @@ Be thorough but do not loop: if a location is unreachable after a retry, note it
 # without touching code; appended to SYSTEM on every build.
 SKILL_FILE = Path(os.environ.get("MANIFEST_SKILL") or
                   Path(__file__).resolve().parents[3] / "skills" / "build-manifest" / "SKILL.md")
+
+
+def _front_matter(text: str) -> tuple[dict[str, Any], str]:
+    """({key: value}, body) of a Markdown file with a simple --- front matter; lists as [a, b]."""
+    if not text.startswith("---"):
+        return {}, text
+    _, head, body = text.split("---", 2)
+    meta: dict[str, Any] = {}
+    for line in head.strip().splitlines():
+        key, _, value = line.partition(":")
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            meta[key.strip()] = [v.strip() for v in value[1:-1].split(",") if v.strip()]
+        else:
+            meta[key.strip()] = value.strip('"')
+    return meta, body.strip()
+
+
+def modules(folder: Path | None = None) -> dict[str, dict[str, Any]]:
+    """The procedure modules (skills/build-manifest/modules/*.md): name → when, required_before, text.
+
+    ``required_before`` names the actions the program refuses until the module has been read.
+    """
+    folder = folder or SKILL_FILE.parent / "modules"
+    out = {}
+    for f in sorted(folder.glob("*.md")):
+        meta, body = _front_matter(f.read_text(encoding="utf-8"))
+        name = meta.get("name") or f.stem
+        out[name] = {"when": meta.get("when", ""), "required_before": meta.get("required_before", []),
+                     "text": body, "file": f.name}
+    return out
+
+
+def paper_note(record_id: Any, folder: Path | None = None) -> str:
+    """This paper's own notes (skills/build-manifest/papers/<record_id>.md), or ""."""
+    f = (folder or SKILL_FILE.parent / "papers") / f"{record_id}.md"
+    return _front_matter(f.read_text(encoding="utf-8"))[1] if f.is_file() else ""
+
+
+def procedure_all() -> str:
+    """The core procedure and every module, as one text: what the rebuild check compares between builds."""
+    parts = [skill()] + [f"MODULE {name}\n\n{m['text']}" for name, m in modules().items()]
+    return "\n\n".join(parts)
+
+
+def module_payload(names: list[str], mods: dict[str, dict[str, Any]], why: str) -> dict[str, Any]:
+    """A tool result carrying module texts. Its JSON starts with "procedure_module", which prune keeps whole."""
+    return {"procedure_module": names, "refused" if why else "read": why or ", ".join(names),
+            "text": "\n\n".join(f"=== MODULE {n} ===\n{mods[n]['text']}" for n in names)}
 
 
 def skill(path: Path = SKILL_FILE) -> str:
@@ -365,6 +423,22 @@ TOOLS: list[dict[str, Any]] = [
          "columns": {"type": "object", "description": "chrom_col, position_col, ref_col, alt_col and "
                      "variant_id_col of the table"}},
                     "required": ["file_path", "columns"]}},
+    {"name": "read_table", "description": "Rows of a downloaded table or spreadsheet sheet (.xlsx, .tsv/.csv/.txt, "
+     "optionally .gz), read by the program: rows from `start`, or with `find` (case-insensitive regex) the rows "
+     "that contain it. Without `sheet`, an .xlsx lists its sheets. Use it for facts in supplementary tables (sample "
+     "sizes per context, cohort tables): its rows count as text you were shown, so quotes copied from them pass "
+     "the check at submit. Output printed by your own run_python code does not count.",
+     "parameters": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "the file, relative to the data folder"},
+         "sheet": {"type": "string", "description": "sheet name (or 0-based number) of an .xlsx"},
+         "find": {"type": "string", "description": "only rows matching this (case-insensitive regex)"},
+         "start": {"type": "integer"}, "limit": {"type": "integer", "description": "rows to return (≤ 200)"}},
+                    "required": ["path"]}},
+    {"name": "read_skill", "description": "Read a procedure module (the exact procedure for one situation; the "
+     "core procedure's module table says which and when). Some actions are refused until their module is read. "
+     "Never improvise a procedure a module covers: read it first.",
+     "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "module name, e.g. "
+                    "variant-maps"}}, "required": ["name"]}},
     {"name": "read_build_history", "description": "Read a previous build Markdown log or Python script for THIS paper. Use paths listed in the initial resume context. Reads up to 24,000 bytes; follow next_offset while more is true. offset=-1 reads the tail.",
      "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}}, "required": ["path"]}},
     {"name": "note_location", "description": "Record what a data location is: status one of listed, "
@@ -397,6 +471,8 @@ class BuildAudit:
         self.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
         self.path = root / ".build_logs" / str(record["record_id"]) / (self.run_id + ".md")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Which server process runs this: a restart finds the run's process gone and records the interruption.
+        self.path.with_suffix(".pid").write_text(str(os.getpid()))
         self.lock = threading.Lock()
         self.secrets = [v for k, v in os.environ.items()
                         if len(v) >= 8 and re.search(r"KEY|TOKEN|SECRET|PASSWORD", k, re.I)]
@@ -465,6 +541,11 @@ class Session:
     checked: dict[str, dict[str, Any]] = field(default_factory=dict)  # path (or archive::member) → format check
     assessments: dict[str, dict[str, Any]] = field(default_factory=dict)  # downloaded file → the model's verdict
     rebuild_report: str = ""  # what rebuild.prepare found on disk before the first step
+    modules_read: set[str] = field(default_factory=set)  # procedure modules the model has been given
+    validate_failures: dict[str, list[str]] = field(default_factory=dict)  # file_path → problems of each failed validate
+    current_tool: str = ""  # the tool being executed now ("" between calls)
+    loop_model: str = ""  # the model that answered last, and why the loop ended (set by _loop)
+    loop_note: str = ""
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -591,6 +672,56 @@ class Session:
                 "texts": {k: v[:3000] for k, v in listing.texts.items()},
                 "files": [{"path": f["path"], "size_mb": round((f["size"] or 0) / 1e6, 1), "url": f["url"]}
                           for f in files[:300]]}
+
+    def read_table(self, path: str, sheet: str = "", find: str = "", start: int = 0, limit: int = 50) -> dict[str, Any]:
+        p = self.local(path.strip())
+        if not p.is_file():
+            return {"error": f"{path} is not a file in the data folder"}
+        try:
+            out = tables.read_table(p, str(sheet or ""), str(find or ""), start, limit)
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile, re.error) as exc:
+            return {"error": f"cannot read {path}: {type(exc).__name__}: {exc}"[:300]}
+        if out.get("rows") is not None:
+            name = f"table {path.strip()}" + (f" sheet {sheet}" if sheet else "")
+            self.see(f"{name} rows {start}+" + (f" find {find}" if find else ""), tables.as_text(out))
+            out["note"] = "these rows count as evidence: quote them word for word (cells joined by spaces is fine)"
+        return out
+
+    def read_skill(self, name: str) -> dict[str, Any]:
+        mods = modules()
+        name = name.strip()
+        if name not in mods:
+            return {"error": f"no module {name!r}; modules: " + "; ".join(f"{n} — {m['when']}" for n, m in mods.items())}
+        self.modules_read.add(name)
+        return module_payload([name], mods, "")
+
+    def module_gate(self, tool: str, args: dict[str, Any]) -> dict[str, Any] | None:
+        """Refuse an action whose procedure module has not been read yet, handing over that module.
+
+        The module counts as read from then on, so the same call goes through when it is made again.
+        """
+        events = {tool}
+        if tool == "assess_file" and str(args.get("contents") or "") == "variant_map":
+            events.add("assess_variant_map")
+        if tool == "run_python":
+            events = {"process"} if PROCESSING_CODE.search(str(args.get("code") or "")) else set()
+        if tool == "note_location":
+            events = {"note_manual"} if str(args.get("status") or "").strip() in ("manual", "error") else set()
+        if tool == "submit":
+            rows = args.get("rows") or []
+            if not rows:
+                events.add("submit_empty")
+            if any(str((r or {}).get("scope") or "").strip().lower().replace("-", "_") in ("non_full", "partial", "subset")
+                   for r in rows if isinstance(r, dict)):
+                events.add("submit_non_full")
+        mods = modules()
+        need = [n for n, m in mods.items() if events & set(m["required_before"]) and n not in self.modules_read]
+        if not need:
+            return None
+        self.modules_read.update(need)
+        return module_payload(need, mods, f"{tool} is refused until you have read the procedure module(s) "
+                              f"{', '.join(need)}; their text follows. Follow them, then make the call again "
+                              "(it will go through now). Do not improvise a procedure they cover.")
 
     def read_build_history(self, path: str, offset: int = 0) -> dict[str, Any]:
         allowed = build_history(self.root, self.record["record_id"], self.audit.path if self.audit else None)
@@ -820,7 +951,7 @@ class Session:
                     return out | {"file": x}
             left = self.unassessed()
             return {"recorded": len(hits), "files": hits[:10], "not_yet_assessed": left[:30],
-                    "next": "assess the remaining files" if left else "every downloaded file is assessed: write the processing code"}
+                    "next": self.after_assessments(left)}
         arc = path.partition("::")[0]
         if arc not in self.source_files():
             return {"error": f"{arc!r} is not a downloaded file of this paper; downloaded: {', '.join(self.source_files()[:30])}"}
@@ -867,8 +998,16 @@ class Session:
                                   "format_check": self.checked[path], "members_checked": members[:50]}
         rebuild.save_assessments(self)
         left = self.unassessed()
-        return {"recorded": path, "not_yet_assessed": left[:30],
-                "next": "assess the remaining files" if left else "every downloaded file is assessed: write the processing code"}
+        return {"recorded": path, "not_yet_assessed": left[:30], "next": self.after_assessments(left)}
+
+    def after_assessments(self, left: list[str]) -> str:
+        if left:
+            return "assess the remaining files"
+        qtl = [a for a in self.assessments.values() if a.get("contents") in QTL_CONTENTS]
+        if qtl and all(a.get("processable") == "no" for a in qtl):
+            return ("no QTL table can be converted to the standard format: stop and report — do not process; "
+                    "submit with rows [] and every table in skipped_tables with its reason")
+        return "every downloaded file is assessed: write the processing code (step 5) for the tables assessed yes"
 
     def need_assessments(self, action: str) -> dict[str, Any] | None:
         """The refusal while some downloaded file has no assessment, else None."""
@@ -947,12 +1086,31 @@ class Session:
         vcf = dbsnp.vcf_path(self.root)
         if self.rsid_lookup is None and vcf.exists() and vcf.with_name(vcf.name + ".tbi").exists():
             self.rsid_lookup = dbsnp.AlleleLookup(vcf)
-        result = validate_file(self.root, file_path, delimiter, qtl_type, columns, gene_id_mode, self.rsid_lookup)
         key = file_path.strip()
+        files = expand(self.root, file_path)
+        attempts = "|".join(sorted(str(f) for f in files)) or key  # counted per file set, however the path is written
+        failed = self.validate_failures.get(attempts, [])
+        if len(failed) >= MAX_PROCESS_ATTEMPTS:
+            return {"refused": f"{key!r} failed validate {len(failed)} times: processing it is given up. Do not "
+                               "process or validate it again: list it in skipped_tables with these problems as the "
+                               "reason and report the error in the summary", "problems": failed[-1][:600]}
+        result = validate_file(self.root, file_path, delimiter, qtl_type, columns, gene_id_mode, self.rsid_lookup)
+        # Empty rs ids are fixed by add_rsid, not by processing again: such a failure is not an attempt.
+        real = [p for p in result.get("problems") or [] if "rsid_col" not in p]
+        if not result.get("ok") and not real:
+            result["next"] = "only rs ids are missing: call add_rsid on it, then validate again (not counted as an attempt)"
+        elif not result.get("ok"):
+            failed = [*failed, "; ".join(real)]
+            self.validate_failures[attempts] = failed
+            result["attempt"] = f"{len(failed)} of {MAX_PROCESS_ATTEMPTS}"
+            result["next"] = ("fix the processing (step 5) and validate again" if len(failed) < MAX_PROCESS_ATTEMPTS
+                              else "second failure: stop processing this file; list it in skipped_tables with the "
+                                   "problems as the reason and report the error in the summary")
         self.validated[key] = result | {"columns": dict(columns), "delimiter": delimiter, "qtl_type": qtl_type,
                                         "gene_id_mode": gene_id_mode}
         if result.get("sample"):
-            self.see(f"file {key}", " ".join(result["header"]) + " " + " ".join(" ".join(r) for r in result["sample"]))
+            self.see(f"file {key}", " ".join(map(str, result["header"])) + " "
+                     + " ".join(" ".join(map(str, r)) for r in result["sample"]))
         return result
 
     def add_rsid(self, file_path: str, columns: dict[str, str], rsid_col: str = "rsid") -> dict[str, Any]:
@@ -973,11 +1131,19 @@ class Session:
         if self.rsid_lookup is None:
             self.rsid_lookup = dbsnp.AlleleLookup(vcf)
         out = {"files": len(files), "rows": 0, "with_rsid": 0}
-        for f in files:
-            res = dbsnp.annotate(f, self.rsid_lookup, columns, rsid_col.strip() or "rsid",
-                                 step=lambda m, f=f: self.step(f"AI: add_rsid {f.name}: {m}"))
-            out["rows"] += res["rows"]
-            out["with_rsid"] += res["with_rsid"]
+        cache = dbsnp.Cache(dbsnp.cache_path(self.root))
+        try:
+            for f in files:
+                if rebuild.rsid_complete(f):  # every rs id dbSNP holds is already there: do not rewrite it
+                    out.setdefault("skipped_complete", []).append(f.name)
+                    continue
+                res = dbsnp.annotate(f, self.rsid_lookup, columns, rsid_col.strip() or "rsid",
+                                     step=lambda m, f=f: self.step(f"AI: add_rsid {f.name}: {m}"), cache=cache)
+                out["rows"] += res["rows"]
+                out["with_rsid"] += res["with_rsid"]
+                rebuild.mark_rsid_complete(f)
+        finally:
+            cache.close()
         out |= {"rsid_col": rsid_col.strip() or "rsid", "share": round(out["with_rsid"] / out["rows"], 4) if out["rows"] else 0.0,
                 "next": "validate again with rsid_col set to this column"}
         self.validated.pop(file_path.strip(), None)  # the file changed
@@ -1659,6 +1825,40 @@ def _int(value: Any) -> int | None:
 # ── the loop ─────────────────────────────────────────────────────────────────
 
 
+STOP_EVENT = "Build stopped"  # the log's last word on a run: at which step it ended, and why
+
+
+def stop_record(s: Session, outcome: str, reason: str) -> dict[str, Any]:
+    """Where the run ended (the skill step of its last tool call) and why, for the log and the page.
+
+    outcome: submitted | gave_up | no_submission | llm_failed | usage_limit | stopped | error | interrupted
+    """
+    from dataqueryweb import progress
+
+    last = next((e for e in reversed(s.log) if e.get("tool") != "read_skill"), None)
+    if s.current_tool and s.current_tool != "read_skill":  # a tool was running when the run ended
+        last = {"tool": s.current_tool, "result": "(it had not finished)"}
+    tool = last["tool"] if last else ""
+    num, name = progress.PHASE_OF.get(tool, ("", "not started")) if tool else ("", "not started")
+    return {"outcome": outcome, "step": num, "step_name": name, "last_tool": tool,
+            "last_result": (last or {}).get("result", "")[:300], "tool_calls": len(s.log), "reason": reason[:600]}
+
+
+def end_reason(s: Session, note: str) -> tuple[str, str]:
+    """(outcome, reason) of a run that left the loop by itself."""
+    if s.result is not None:
+        if "reason" in s.result:  # only give_up's result carries a reason
+            return "gave_up", f"gave up: {s.result['reason']}"
+        rows = len(s.result.get("rows") or [])
+        summary = str(s.result.get("summary") or "")
+        return "submitted", f"submitted {rows} row(s)" + (f": {summary}" if summary else "")
+    if "usage limit" in note:
+        return "usage_limit", note
+    if note.startswith("LLM step failed"):
+        return "llm_failed", note
+    return "no_submission", note or "the run ended without a submission"
+
+
 def first_message(s: Session, previous: list[str]) -> str:
     r, p = s.record, s.paper
     locs = records._locations_of(r)
@@ -1688,6 +1888,15 @@ def first_message(s: Session, previous: list[str]) -> str:
     if s.rebuild_report:
         lines += ["", "REBUILD CHECK (done by the program before your first step; act on it first):", s.rebuild_report]
     history = build_history(s.root, r["record_id"], s.audit.path if s.audit else None)
+    if s.rebuild_report or history:
+        mods = modules()
+        if "resume-rebuild" in mods:
+            s.modules_read.add("resume-rebuild")
+            lines += ["", "PROCEDURE MODULE resume-rebuild (this paper was processed before; follow it first):",
+                      mods["resume-rebuild"]["text"]]
+    if note := paper_note(r["record_id"]):
+        lines += ["", f"NOTES FOR THIS PAPER (skills/build-manifest/papers/{r['record_id']}.md; leads to verify, "
+                  "not evidence):", note]
     if history:
         lines += ["", "RESUME CHECK REQUIRED before downloading or processing:",
                   "Inspect the previous logs and scripts below. Determine the last completed checkpoint, the interrupted step, and which outputs actually exist and validate. Record a concise resume plan via note_location (status listed, not manual): completed work, reusable outputs, next step and why. Continue from the first unfinished or invalid step. Do not repeat expensive scans merely because the run was interrupted; inspect existing inventories and intermediate files first. Script existence alone is NOT evidence of successful execution. Do not overwrite source files. Use read_build_history to read earlier sections whenever the excerpt is insufficient.",
@@ -1742,6 +1951,8 @@ def prune(messages: list[dict[str, Any]]) -> None:
     tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     for i in tool_idx[:-KEEP_FULL]:
         c = messages[i]["content"]
+        if c.startswith('{"procedure_module"'):  # a module stays whole: it is the procedure to follow
+            continue
         if len(c) > OLD_TOOL_CHARS:
             messages[i]["content"] = c[:OLD_TOOL_CHARS] + f" …[cut; {len(c)} chars]"
 
@@ -1781,13 +1992,55 @@ async def run(
     procedure = skill()
     system += "\n\n" + procedure
     try:
-        s.rebuild_report = await asyncio.to_thread(rebuild.prepare, s, procedure)
+        s.rebuild_report = await asyncio.to_thread(rebuild.prepare, s)
     except Exception as exc:  # the checks help the model; a failure here must not stop the build
         audit.write("Rebuild check failed", {"error": f"{type(exc).__name__}: {exc}"})
         s.rebuild_report = f"(the program's rebuild check failed: {type(exc).__name__}: {exc}; inspect files yourself)"
     messages: list[dict[str, Any]] = [{"role": "system", "content": system},
                                       {"role": "user", "content": first_message(s, list(previous))}]
     tools = [{"type": "function", "function": t} for t in reasons.with_reasons(TOOLS)]
+    try:
+        await _loop(s, judge, messages, tools, usage, step, cancel, audit, record)
+        audit.path.with_suffix(".pid").unlink(missing_ok=True)
+    except (fetch.Cancelled, asyncio.CancelledError):
+        audit.path.with_suffix(".pid").unlink(missing_ok=True)
+        audit.write(STOP_EVENT, stop_record(s, "stopped", "stopped by a person (Stop) or the queue was stopped "
+                                            + (f"while {s.current_tool} was running" if s.current_tool
+                                               else f"after {s.log[-1]['tool']}" if s.log else "before the first step")))
+        raise
+    except Exception as exc:
+        audit.path.with_suffix(".pid").unlink(missing_ok=True)
+        audit.write(STOP_EVENT, stop_record(s, "error", f"{type(exc).__name__}: {exc}"))
+        raise
+    model, note = s.loop_model, s.loop_note
+    res = s.result or {"rows": [], "skipped": [], "summary": "", "reason": note or "no submission"}
+    reports = list(s.locations.values())
+    for t in res.get("skipped") or []:
+        if isinstance(t, dict):
+            url = str(t.get("url") or "")
+            target_loc = s.locations.get(url) or (reports[0] if reports else None)
+            if target_loc is None:
+                s.location(url or "(paper)", status="listed")
+                target_loc = s.locations[url or "(paper)"]
+            target_loc["inventory"].append({"path": str(t.get("path") or url)[:200], "n_files": 1, "size": None,
+                                            "holds": "skipped", "why": str(t.get("reason") or "")[:300]})
+    for loc in reports:
+        loc["status"] = loc["status"] or "not_checked"
+    audit.write("Build investigation finished", {"result": res, "reports": reports, "usage": usage, "note": note})
+    audit.write(STOP_EVENT, stop_record(s, *end_reason(s, note)))
+    return {"audit_path": str(audit.path), "rows": res.get("rows") or [], "reports": reports, "model": model,
+            # False when the build ended without submit or give_up (LLM unreachable, the AI stopped,
+            # the budget ran out): its empty result must not replace the last saved one.
+            "submitted": s.result is not None,
+            "note": note if not res.get("rows") else "",
+            "summary": res.get("summary") or res.get("reason") or note, "log": s.log, "scripts": s.scripts,
+            "assessments": s.assessments}
+
+
+async def _loop(s: Session, judge: llm.Judge, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                usage: dict[str, int], step: Callable[[str], None], cancel: threading.Event,
+                audit: BuildAudit, record: dict[str, Any]) -> None:
+    """The model's turns until it submits, gives up, fails or runs out of steps (result on ``s``)."""
     model, note, nudges = "", "", 0
     for n in range(MAX_STEPS + 6):
         if cancel.is_set():
@@ -1821,12 +2074,16 @@ async def run(
             audit.write("Tool call: " + name, args)
             # Every step states its reason, every judgement its evidence; otherwise nothing runs.
             args, refusal, reasoning = reasons.check(s, name, args)
+            if refusal is None:
+                refusal = s.module_gate(name, args)  # the module's procedure before the action, never improvised
+            s.current_tool = name
             try:
                 out = refusal if refusal is not None else await dispatch(s, name, args)
             except BaseException as exc:
                 audit.write("Tool interrupted: " + name, {"error": type(exc).__name__, "message": str(exc)})
                 reasons.ledger(s, n + 1, name, args, reasoning, {"error": f"interrupted: {type(exc).__name__}"})
                 raise
+            s.current_tool = ""
             audit.write("Tool result: " + name, out)
             reasons.ledger(s, n + 1, name, args, reasoning, out)
             full = json.dumps(out, ensure_ascii=False, default=str)
@@ -1840,24 +2097,7 @@ async def run(
             break
     else:
         note = note or "the AI did not submit within the step budget"
-    res = s.result or {"rows": [], "skipped": [], "summary": "", "reason": note or "no submission"}
-    reports = list(s.locations.values())
-    for t in res.get("skipped") or []:
-        if isinstance(t, dict):
-            url = str(t.get("url") or "")
-            target_loc = s.locations.get(url) or (reports[0] if reports else None)
-            if target_loc is None:
-                s.location(url or "(paper)", status="listed")
-                target_loc = s.locations[url or "(paper)"]
-            target_loc["inventory"].append({"path": str(t.get("path") or url)[:200], "n_files": 1, "size": None,
-                                            "holds": "skipped", "why": str(t.get("reason") or "")[:300]})
-    for loc in reports:
-        loc["status"] = loc["status"] or "not_checked"
-    audit.write("Build investigation finished", {"result": res, "reports": reports, "usage": usage, "note": note})
-    return {"audit_path": str(audit.path), "rows": res.get("rows") or [], "reports": reports, "model": model,
-            "note": note if not res.get("rows") else "",
-            "summary": res.get("summary") or res.get("reason") or note, "log": s.log, "scripts": s.scripts,
-            "assessments": s.assessments}
+    s.loop_model, s.loop_note = model, note
 
 
 QUOTA_WAITS = int(os.environ.get("MANIFEST_QUOTA_WAITS") or 30)  # × 2 minutes
@@ -1901,7 +2141,7 @@ async def dispatch(s: Session, name: str, args: dict[str, Any]) -> dict[str, Any
     fn = {"read_build_history": s.read_build_history, "read_paper": s.read_paper, "open_url": s.open_url, "list_files": s.list_files, "peek_file": s.peek_file,
           "download": s.download, "inspect_local": s.inspect_local, "run_python": s.run_python,
           "validate": s.validate, "liftover": s.liftover, "add_rsid": s.add_rsid, "fill_alleles": s.fill_alleles, "fill_positions": s.fill_positions,
-          "note_location": s.note_location, "assess_file": s.assess_file}.get(name)
+          "note_location": s.note_location, "assess_file": s.assess_file, "read_skill": s.read_skill, "read_table": s.read_table}.get(name)
     if fn is None:
         return {"error": f"no tool {name!r}"}
     s.step(f"AI: {name} {short(args)[:100]}")

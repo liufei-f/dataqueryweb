@@ -40,7 +40,7 @@
     // The build's final account outranks a failed source URL or an early inventory entry.
     const summaries = [...new Set(locations.map((l) => l.run_note).filter(Boolean))];
     rows.forEach((r) => { if (r.evidence?.agent?.summary) summaries.push(r.evidence.agent.summary); });
-    summaries.forEach((s) => add("Build report", s));
+    summaries.forEach((s) => add("Processing report", s));
     locations.forEach((l) => {
       if (["manual", "error"].includes(l.status)) {
         const note = l.note || "Access conditions not established";
@@ -77,7 +77,7 @@
     }
     const kinds = priority.filter((k) => reasons.some((r) => r.kind === k));
     let label = good.length ? (partial || good.length < rows.length ? "Partial success" : rows.some((r) => r.review === "pending") ? "Processed — review pending" : "Downloaded / processed")
-      : kinds.length ? labels[kinds[0]] : run.outcome === "failed" ? "Build failed" : built ? "No usable data found" : "Not attempted";
+      : kinds.length ? labels[kinds[0]] : run.outcome === "failed" ? "Processing failed" : built ? "No usable data found" : "Not attempted";
     return { label, good, rows, partial, reasons, kinds, human: kinds.some((k) => human.has(k)), complete };
   }
   function requestLinks(reasons, publicationUrl = "") {

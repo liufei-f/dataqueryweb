@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}AI-checked papers — DataQuery{% endblock %}
 {% block content %}
-<div class="dq">
+<div class="dq mf-page">
   <h1>AI-checked papers</h1>
   <p class="muted lede">Every paper the AI has read, with its latest verdict and the download locations it found —
     whether or not it was auto-saved. Check them here and <strong>Save</strong> the locations that are correct; they go to
@@ -26,7 +26,20 @@
     <span class="muted rec-count" id="chk-count"></span>
   </div>
 
-  <div id="chk-list"><p class="muted">Loading…</p></div>
+  <p class="muted mf-overview-note">One row per checked paper. <strong>Locations</strong> opens the data locations the AI found, each with Save / Remove.</p>
+  <div class="table-wrap mf-overview-wrap">
+    <table class="rec-table mf-overview" id="chk-table" aria-label="AI-checked papers">
+      <colgroup>
+        <col style="width:5%"><col style="width:24%"><col style="width:11%"><col style="width:13%">
+        <col style="width:19%"><col style="width:9%"><col style="width:11%"><col style="width:8%">
+      </colgroup>
+      <thead>
+        <tr><th>Saved record</th><th>Paper / URL</th><th>AI verdict</th><th>QTL type · species · context</th>
+            <th>Reason</th><th>Data locations</th><th>Checked</th><th>Actions</th></tr>
+      </thead>
+      <tbody id="chk-list"><tr><td colspan="8" class="rec-empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
 </div>
 <script src="/static/js/journals.js?v={{ asset_version() }}"></script>
 <script src="/static/js/checked.js?v={{ asset_version() }}"></script>

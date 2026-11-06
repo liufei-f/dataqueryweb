@@ -1035,6 +1035,16 @@ async def build_with_agent(
     if "usage limit" in out["note"]:  # cut short: keep what the last full build stored
         return {"record_id": rid, "rows": 0, "statuses": {}, "data": {}, "locations": {}, "tokens": usage["total_tokens"],
                 "model": out["model"], "note": out["note"], "summary": out["summary"]}
+    if not out.get("submitted", True):
+        # No submit and no give_up (the LLM could not be reached, the AI stopped, or the step
+        # budget ran out): nothing was decided, so the rows and reports of the last build stay.
+        if out.get("audit_path"):
+            with Path(out["audit_path"]).open("a", encoding="utf-8") as audit_file:
+                audit_file.write(f"\n## Manifest not saved\n\nRecord: {rid}; the build ended without a submission "
+                                 f"({out['note'] or 'no submission'}); the rows of the last build are kept.\n")
+        return {"record_id": rid, "rows": 0, "statuses": {}, "data": {}, "locations": {}, "tokens": usage["total_tokens"],
+                "model": out["model"], "note": out["note"] or "the build ended without a submission",
+                "summary": out["summary"], "failed": True}
     step("saving")
     note = out["note"] or ("" if rows else f"no row: {out['summary'][:300]}")
     store.save_run(rid, rows, out["reports"], model=out["model"], tokens=usage["total_tokens"], run_note=note)
@@ -1174,7 +1184,10 @@ class Batch:
                 i += 1
                 self.rows += result["rows"]
                 line = describe(record, result)
-                if result.get("skipped"):
+                if result.get("failed"):
+                    self.failed += 1
+                    self.store.note_run(rid, "failed", result["note"] + " — nothing saved; the last build's rows are kept")
+                elif result.get("skipped"):
                     self.store.note_run(rid, "skipped", result["skipped"])
                 else:
                     self.store.note_run(rid, "built", result["note"])

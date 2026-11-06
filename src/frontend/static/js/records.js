@@ -1,6 +1,7 @@
 // Saved records page: list, filter, annotate and delete rows saved from Find QTL data.
 (() => {
-  const body = document.getElementById("rec-body");
+  const table = document.querySelector(".mf-overview");
+  const body = table;  // clicks and edits are handled for the whole table (one tbody per paper)
   const filter = document.getElementById("rec-filter");
   const count = document.getElementById("rec-count");
   const by = document.getElementById("rec-by");
@@ -12,35 +13,40 @@
   const safeUrl = (u) => /^(https?|ftp):\/\//i.test(u || "") ? u : "#";
   const BADGE = { open: "open", controlled: "controlled", request: "request" };
 
+  // One paper = one <tbody class="mf-paper">, laid out like the Manifest papers table (cards on
+  // narrower screens, with each cell's column name above it).
   function row(r) {
     const pubUrl = r.doi ? `https://doi.org/${r.doi}` : r.publication_url;
     const ids = [r.doi && `doi:${r.doi}`, r.pmid && `PMID ${r.pmid}`, r.pmcid, r.preprint_server && `${r.preprint_server} preprint`]
       .filter(Boolean).map(esc).join(" · ");
     const files = r.file_urls ? r.file_urls.split("; ").length : 0;
+    const urls = String(r.download_url || "").split("; ").filter(Boolean);
+    const link = (u) => `<a class="rec-url" href="${esc(safeUrl(u))}" target="_blank" rel="noopener">${esc(u)}</a>`;
     return `
-      <tr data-id="${r.record_id}"${r.saved_by === "auto" ? ' class="rec-is-auto"' : ""}>
-        <td class="muted">${r.record_id}</td>
-        <td>
-          ${r.record_code ? `<code class="rec-code" title="Record code; also the name of its data folder">${esc(r.record_code)}</code>` : ""}
-          <a class="rec-title" href="${esc(safeUrl(pubUrl))}" target="_blank" rel="noopener">${esc(r.publication_title || r.doi)}</a>
+      <tbody class="mf-paper${r.saved_by === "auto" ? " rec-is-auto" : ""}" data-id="${r.record_id}">
+      <tr class="mf-paper-head" data-id="${r.record_id}">
+        <td data-label="Paper index"><strong>#${r.record_id}</strong>${r.record_code ? `<div class="rec-sub"><code class="rec-code" title="Record code; also the name of its data folder">${esc(r.record_code)}</code></div>` : ""}</td>
+        <td data-label="Paper / URL" class="mf-paper-cell">
+          <strong><a class="mf-paper-title" href="${esc(safeUrl(pubUrl))}" target="_blank" rel="noopener">${esc(r.publication_title || r.doi)}</a></strong>
           <div class="rec-sub">${esc([r.first_author && `${r.first_author} et al.`, r.journal, r.year].filter(Boolean).join(" · "))}</div>
           <div class="rec-sub">${ids}</div>
         </td>
-        <td>${esc(r.qtl_type)}</td>
-        <td>${esc(r.qtl_context)}${r.species ? `<div class="rec-sub">${esc(r.species)}</div>` : ""}</td>
-        <td>
-          ${String(r.download_url || "").split("; ").filter(Boolean).map((u) =>
-            `<a class="rec-url" href="${esc(safeUrl(u))}" target="_blank" rel="noopener">${esc(u)}</a>`).join("<br>")}
+        <td data-label="QTL type(s)">${esc(r.qtl_type) || "—"}</td>
+        <td data-label="Context / species" class="mf-context-cell">${esc(r.qtl_context) || "—"}${r.species ? `<div class="rec-sub">${esc(r.species)}</div>` : ""}</td>
+        <td data-label="Download locations" class="mf-url-cell">
+          ${urls.slice(0, 2).map(link).join("<br>") || '<span class="muted">No location recorded</span>'}
+          ${urls.length > 2 ? `<details><summary>${urls.length - 2} more URLs</summary>${urls.slice(2).map(link).join("<br>")}</details>` : ""}
           <div class="rec-sub">${esc([r.repository, r.content, files && `${files} file${files > 1 ? "s" : ""}`].filter(Boolean).join(" · "))}</div>
         </td>
-        <td>${(r.access_route ? r.access_route.split("; ") : ["unknown"]).map((a) =>
+        <td data-label="Access / saved">${(r.access_route ? r.access_route.split("; ") : ["unknown"]).map((a) =>
             `<span class="badge badge-${BADGE[a] || "unknown"}">${esc(a)}</span>`).join(" ")}
-            <div class="rec-sub">saved ${esc(r.saved_at.slice(0, 10))}</div>
-            ${r.saved_by === "auto" ? `<span class="rec-auto" title="${esc(r.ai_reason)}">🤖 auto-saved${r.ai_confidence ? ` · ${Math.round(r.ai_confidence * 100)}%` : ""}</span>
-            <button type="button" class="rec-confirm" title="The AI got this right: mark it as checked by you">Confirm</button>` : ""}</td>
-        <td><textarea class="rec-note" placeholder="Add a note…" aria-label="Curator note">${esc(r.curator_note)}</textarea></td>
-        <td><button type="button" class="rec-del" title="Delete this record" aria-label="Delete">&times;</button></td>
-      </tr>`;
+            <div class="rec-sub">saved ${esc(r.saved_at.slice(0, 10))} · ${r.saved_by === "auto" ? "by the AI" : "by you"}</div>
+            ${r.saved_by === "auto" ? `<span class="rec-auto" title="${esc(r.ai_reason)}">AI auto-saved${r.ai_confidence ? ` · ${Math.round(r.ai_confidence * 100)}%` : ""}</span>
+            <button type="button" class="rec-btn rec-confirm" title="The AI got this right: mark it as checked by you">Confirm</button>` : ""}</td>
+        <td data-label="Curator note"><textarea class="dq-input rec-note" placeholder="Add a note…" aria-label="Curator note">${esc(r.curator_note)}</textarea></td>
+        <td data-label="Actions"><div class="mf-paper-btns"><a class="rec-btn" href="/manifest">Manifest</a>
+          <button type="button" class="rec-btn rec-delete" title="Delete this record" aria-label="Delete">Delete</button></div></td>
+      </tr></tbody>`;
   }
 
   function render() {
@@ -54,9 +60,10 @@
     const autos = rows.filter((r) => r.saved_by === "auto").length;
     count.textContent = (shown.length !== rows.length ? `${shown.length} of ${rows.length} records` : `${rows.length} record${rows.length === 1 ? "" : "s"}`)
       + (autos ? ` · ${autos} auto-saved to check` : "");
-    body.innerHTML = shown.length ? shown.map(row).join("") : `<tr><td colspan="8" class="rec-empty">${rows.length
+    table.querySelectorAll(":scope > tbody").forEach((t) => t.remove());
+    table.insertAdjacentHTML("beforeend", shown.length ? shown.map(row).join("") : `<tbody><tr><td colspan="8" class="rec-empty">${rows.length
       ? "No record matches the filter."
-      : 'No saved records yet. On <a href="/">Find QTL data</a>, click <strong>Save</strong> on a row that is correct.'}</td></tr>`;
+      : 'No saved records yet. On <a href="/">Find QTL data</a>, click <strong>Save</strong> on a row that is correct.'}</td></tr></tbody>`);
   }
 
   async function load() {
@@ -82,7 +89,7 @@
       if (resp.ok) { const updated = await resp.json(); rows = rows.map((x) => (x.record_id === id ? updated : x)); render(); }
       return;
     }
-    const btn = e.target.closest(".rec-del");
+    const btn = e.target.closest(".rec-delete");
     if (!btn) return;
     const tr = btn.closest("tr"), id = +tr.dataset.id;
     const r = rows.find((x) => x.record_id === id);

@@ -11,6 +11,10 @@
   const chatLoaded = new Set();
   const chatLoading = new Set();
   let chatAvailable = null;
+  const details = new Map(); // record id → /api/manifest/{id}/details: the six steps and every file
+  const detailsLoading = new Set();
+  const detailsAt = new Map(); // record id → when it was last loaded (throttles refreshes while it runs)
+  const filesOpen = new Set(); // file lists (and per-source lists) a curator opened, kept across redraws
   const openPapers = new Set(); // papers whose rows are shown
   let job = null; // the server's build queue, polled while it runs
 
@@ -90,7 +94,7 @@
 
   function dataSection(r) {
     const d = r.evidence.data;
-    if (!d) return '<p class="muted">This row was built before downloading existed — press Rebuild.</p>';
+    if (!d) return '<p class="muted">This row was made before downloading existed — press Reprocess.</p>';
     const facts = [];
     if (d.raw) facts.push(["Downloaded", `${list(d.raw, d.n_raw)}${d.bytes ? `<div class="rec-sub">${size(d.bytes)}${d.fresh_files === 0 ? " · already there, not downloaded again" : ""}</div>` : ""}`]);
     if (d.why_processing) facts.push(["Why processing", esc(d.why_processing.join("; "))]);
@@ -143,11 +147,11 @@
       <h3>${previewLabel}</h3>
       <p class="rec-sub">${esc(r.file_path || r.source_path)}</p>
       ${table.columns?.length ? sampleTable(table) : '<p class="muted">No saved file preview available.</p>'}
-      ${(table.rows || []).length < 5 ? '<p class="rec-sub">This build saved fewer than 5 preview rows. A new build will retain up to 5.</p>' : ""}
-      ${processed ? '<p class="rec-sub">This preview is from the converted output. A separate original-file preview was not retained by this build.</p>' : ""}
+      ${(table.rows || []).length < 5 ? '<p class="rec-sub">This processing run saved fewer than 5 preview rows. Reprocessing will retain up to 5.</p>' : ""}
+      ${processed ? '<p class="rec-sub">This preview is from the converted output. A separate original-file preview was not retained by this processing run.</p>' : ""}
       <h3>Correct and decide — manifest values</h3>
       <div class="table-wrap"><table class="mf-ev"><thead><tr><th>Manifest column</th><th>Value to export</th><th>Note / reason</th></tr></thead><tbody>${fields}</tbody></table></div>
-      ${r.llm_note ? `<p class="rec-sub"><strong>Build note:</strong> ${esc(r.llm_note)}</p>` : ""}
+      ${r.llm_note ? `<p class="rec-sub"><strong>Processing note:</strong> ${esc(r.llm_note)}</p>` : ""}
       ${r.issues.length ? `<p class="rec-sub"><strong>Checks to resolve:</strong> ${r.issues.map(i => esc(data.issues[i] || i)).join("; ")}</p>` : ""}
       <div class="mf-actions">
         <textarea class="rec-note mf-note" placeholder="Reviewer note…">${esc(r.reviewer_note)}</textarea>
@@ -234,18 +238,18 @@
       (m.role === "user" ? "You" : "AI") + (m.model ? " · " + esc(m.model) : "") + "</strong><div>" +
       esc(m.content) + "</div></article>").join("");
     const draft = chatDrafts.get(id) || "";
-    return "<section class=\"mf-build-chat\" data-chat-panel=\"" + id + "\"><h3>Build conversation</h3>" +
+    return "<section class=\"mf-build-chat\" data-chat-panel=\"" + id + "\"><h3>Processing conversation</h3>" +
       "<p class=\"rec-sub\">Paste a registration email, README text, URL, or local-file detail. The AI can discuss it here; " +
-      "this conversation is saved and included the next time you build this paper.</p>" +
+      "this conversation is saved and included the next time you process this paper.</p>" +
       "<div class=\"mf-chat-history\" aria-live=\"polite\">" + (transcript || "<p class=\"muted\">No messages yet.</p>") + "</div>" +
-      "<label class=\"mf-chat-label\" for=\"mf-chat-input-" + id + "\">Message to the build AI</label>" +
+      "<label class=\"mf-chat-label\" for=\"mf-chat-input-" + id + "\">Message to the processing AI</label>" +
       "<textarea id=\"mf-chat-input-" + id + "\" class=\"dq-input mf-chat-input\" data-chat-input=\"" + id + "\" rows=\"5\" " +
       "placeholder=\"Paste the relevant email or documentation here.\">" + esc(draft) + "</textarea>" +
       "<div class=\"mf-chat-actions\"><button type=\"button\" class=\"rec-btn mf-chat-send\" data-chat-send=\"" + id + "\" " +
       (chatLoading.has(id) ? "disabled" : "") + ">" + (chatLoading.has(id) ? "Waiting for AI…" : "Send to AI") + "</button>" +
       "<button type=\"button\" class=\"rec-btn primary mf-chat-build\" data-chat-build=\"" + id + "\" " +
-      (messages.some((m) => m.role === "user") ? "" : "disabled") + ">Continue build with this context</button></div>" +
-      "<p class=\"rec-sub\">Continuing starts a build for this paper only. The build agent will verify the provided details " +
+      (messages.some((m) => m.role === "user") ? "" : "disabled") + ">Continue processing with this context</button></div>" +
+      "<p class=\"rec-sub\">Continuing starts processing for this paper only. The processing agent will verify the provided details " +
       "and reuse files already in its data folder.</p></section>";
   }
 
@@ -260,6 +264,16 @@
       if (replacement) replacement.setSelectionRange(replacement.value.length, replacement.value.length);
     });
   });
+
+  async function loadDetails(id) {
+    if (detailsLoading.has(id)) return;
+    detailsLoading.add(id);
+    try {
+      const response = await fetch(`/api/manifest/${id}/details`);
+      if (response.ok) { details.set(id, await response.json()); detailsAt.set(id, Date.now()); }
+    } catch (error) { console.error(error); }
+    finally { detailsLoading.delete(id); refreshPaper(id); }
+  }
 
   async function loadChat(id) {
     if (chatLoaded.has(id) || chatLoading.has(id)) return;
@@ -276,10 +290,10 @@
     finally { chatLoading.delete(id); refreshPaper(id); }
   }
 
-  // ---- papers: one line each, with Build manifest and Check ----
+  // ---- papers: one line each, with Process data and Check ----
   const $ = (id) => document.getElementById(id);
   const show = $("mf-show"), human = $("mf-human"), runbar = $("mf-runbar"), runStatus = $("mf-run-status"), stopBtn = $("mf-stop");
-  const END = { stopped: "Stopped.", usage_limit: "Stopped: the AI's usage limit is reached. Built papers are kept; build again later." };
+  const END = { stopped: "Stopped.", usage_limit: "Stopped: the AI's usage limit is reached. Processed papers are kept; process again later." };
   const PAGE = 100;
   let limit = PAGE, timer = null, seenDone = -1, seenLog = 0;
   const rowsOf = (id) => data.rows.filter((r) => r.record_id === id);
@@ -363,7 +377,7 @@
   }
 
   // How the last build of this paper ended, when it did not end well (kept on the server).
-  const OUTCOME = { failed: "Last build failed", stopped: "Last build was stopped", usage_limit: "Waiting: the AI's usage limit was reached; the run checks every hour and resumes with this paper" };
+  const OUTCOME = { failed: "Last processing failed", stopped: "Last processing was stopped", usage_limit: "Waiting: the AI's usage limit was reached; the run checks every hour and resumes with this paper" };
   function lastOutcome(id) {
     const run = (data.runs || {})[id];
     if (!run || !OUTCOME[run.outcome] || stateOf(id) === "building" || stateOf(id) === "queued") return "";
@@ -384,13 +398,13 @@
     const rows = rowsOf(id), locs = locsOf(id);
     if (rows.some((r) => r.model || (r.evidence || {}).agent) || locs.some((l) => l.model || l.tokens > 0)) return "Yes";
     if (locs.some((l) => /LLM step skipped|AI step skipped/.test([l.note, l.run_note].join(" ")))) return "No (AI skipped)";
-    return isBuilt(id) || (data.runs || {})[id] ? "Unknown (legacy build)" : "No";
+    return isBuilt(id) || (data.runs || {})[id] ? "Unknown (legacy run)" : "No";
   }
 
   function dataResult(id) {
     const state = followUp(id), st = stateOf(id), run = (data.runs || {})[id] || {};
-    if (!state.good.length && st === "queued") state.label = "Queued — build not started";
-    else if (!state.good.length && st === "building") state.label = "Building — result not yet available";
+    if (!state.good.length && st === "queued") state.label = "Queued — processing not started";
+    else if (!state.good.length && st === "building") state.label = "Processing — result not yet available";
     else if (!state.good.length && run.outcome === "stopped") state.label = "Stopped";
     else if (!state.good.length && run.outcome === "usage_limit") state.label = "Waiting for AI quota";
     else if (!state.good.length && st === "exists") state.label = "In reference manifest";
@@ -433,8 +447,8 @@
   const columnFilters = {};
   const COLUMNS = [
     ["index", "Paper index"], ["paper", "Paper / URL"], ["journal", "Journal"], ["data_url", "Data URL"],
-    ["qtl", "QTL type(s)"], ["context", "Context"], ["sample_size", "Sample size"], ["build", "Build status"], ["result", "Data result / success"],
-    ["files", "Files / rows"], ["review", "Review"], ["human", "Human decision"], ["date", "Last build"], ["actions", "Actions"],
+    ["qtl", "QTL type(s)"], ["context", "Context"], ["sample_size", "Sample size"], ["build", "Processing status"], ["result", "Data result / success"],
+    ["files", "Files / rows"], ["review", "Review"], ["human", "Human decision"], ["date", "Last processed"], ["actions", "Actions"],
   ];
   function dataUrls(id) {
     const p = data.records[id] || {};
@@ -443,7 +457,7 @@
   }
   // Where the latest build is, or where it stopped (server: progress.py, read from the build log).
   const STATE = {
-    running: ["Building", "mf-d-warn"], finished: ["Finished", "mf-d-ok"], interrupted: ["Interrupted", "mf-d-bad"],
+    running: ["Processing", "mf-d-warn"], finished: ["Finished", "mf-d-ok"], interrupted: ["Interrupted", "mf-d-bad"],
     stopped: ["Stopped", "mf-d-bad"], failed: ["Failed", "mf-d-bad"], usage_limit: ["Waiting for AI quota", "mf-d-warn"],
     unknown: ["Unknown", "mf-d-none"],
   };
@@ -452,67 +466,47 @@
     const pr = (data.progress || {})[id];
     const live = stateOf(id) === "building" ? (job.active || [job.current]).find((c) => c?.record_id === id) : null;
     if (live) {
-      const tool = ((live.step || "").match(/^AI: (\w+)/) || [])[1] || (/^rebuild:/.test(live.step || "") ? "rebuild" : "");
-      return { state: "running", phase: phaseOfTool(tool) || (pr && pr.phase) || null, step: live.step || "starting", pr };
+      // The server's answer (progress.current_step), the same as the Details panel; never the previous run's step.
+      const tool = ((live.step || "").match(/^AI: (\w+)/) || [])[1] || "";
+      return { state: "running", phase: live.phase || phaseOfTool(tool) || null, step: live.step || "starting", pr };
     }
     return pr ? { state: pr.state, phase: pr.phase, pr } : null;
   }
-  const phaseText = (ph) => ph ? `Phase ${ph.num} · ${ph.name}` : "";
+  const phaseText = (ph) => ph ? `Step ${ph.num} · ${ph.name}` : "";
   function progressCell(id) {
-    const g = progressOf(id), run = (data.runs || {})[id];
+    const g = progressOf(id);
     if (!g) return `<strong>${esc(buildStatusOf(id))}</strong>`;
     const [, cls] = STATE[g.state] || STATE.unknown;
-    const label = BUILD[buildBucket(id)][0];  // the same five words as the filter
-    const cause = { interrupted: "Interrupted", stopped: "Stopped by a person", failed: "Failed", usage_limit: "Waiting for AI quota" }[g.state];
-    const last = g.pr?.last;
-    const where = g.state === "finished" ? "" : `<div class="mf-prog-where">${g.state === "running" ? "Now" : "Stopped in"}: <strong>${esc(phaseText(g.phase) || "—")}</strong></div>`;
-    const step = g.state === "running" ? `<div class="rec-sub">${esc(String(g.step).slice(0, 140))}</div>`
-      : last && g.state !== "finished" ? `<div class="rec-sub">Last step: <code>${esc(last.tool)}</code>${last.done ? "" : " (unfinished)"}${last.why ? ` — ${esc(last.why.slice(0, 120))}` : ""}</div>` : "";
-    const why = ["stopped", "failed", "usage_limit"].includes(g.state) && run?.note ? `<div class="rec-sub">${esc(run.note.slice(0, 160))}</div>`
-      : g.state === "interrupted" ? '<div class="rec-sub">The log just ends: the server or machine stopped mid-build.</div>' : "";
-    const when = g.pr?.last_at ? new Date(g.pr.last_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
-    return `<span class="badge ${cls}" title="${esc(BUILD[buildBucket(id)][1])}">${esc(label)}</span>${when && g.state !== "running" ? ` <span class="rec-sub">${esc(when)}</span>` : ""}${cause ? `<div class="rec-sub"><strong>${esc(cause)}</strong></div>` : ""}${where}${step}${why}`;
-  }
-  function progressSection(id) {
-    const g = progressOf(id), pr = g?.pr;
-    if (!pr) return "";
-    const reached = new Set((pr.phases_reached || []).map((p) => p.num));
-    const current = g.phase?.num;
-    const steps = (data.phases || []).map((p) => {
-      const mark = p.num === current ? (g.state === "finished" ? "✓" : g.state === "running" ? "▶" : "■") : reached.has(p.num) ? "✓" : "·";
-      const cls = p.num === current && g.state !== "finished" ? "mf-ph-now" : reached.has(p.num) ? "mf-ph-done" : "mf-ph-todo";
-      return `<li class="${cls}"><span aria-hidden="true">${mark}</span> ${esc(p.num)} ${esc(p.name)}</li>`;
-    }).join("");
-    const last = pr.last;
-    const [label, cls] = STATE[g.state] || STATE.unknown;
-    const recent = (pr.recent || []).slice().reverse().map((r) => `<li><code>${esc(r.tool)}</code> <span class="mf-oc-${esc(r.outcome)}">${esc(r.outcome)}</span>${r.why ? ` — ${esc(r.why)}` : ""}</li>`).join("");
-    return `<section class="mf-progress"><h3>Build progress <span class="badge ${cls}">${esc(label)}</span></h3>
-      <ol class="mf-phases">${steps}</ol>
-      <dl class="mf-prog-facts">
-        ${last ? `<dt>${g.state === "finished" ? "Last step" : g.state === "running" ? "Current step" : "Stopped at"}</dt><dd><code>${esc(last.tool)}</code>${last.done ? ` (${esc(last.outcome)})` : " — had not finished"}${last.target ? ` · ${esc(last.target)}` : ""}${last.why ? `<div>Reason: ${esc(last.why)}</div>` : ""}${last.output ? `<div class="rec-sub">Last output: ${esc(last.output)}</div>` : ""}</dd>` : ""}
-        ${pr.problem ? `<dt>Problem</dt><dd class="mf-bad">${esc(pr.problem.tool)} ${esc(pr.problem.outcome)}: ${esc(pr.problem.why)}</dd>` : ""}
-        <dt>Next</dt><dd>${esc(pr.next || "")}</dd>
-        <dt>Run</dt><dd class="rec-sub">${esc(pr.run_id || "")} · ${pr.steps || 0} AI steps · ${(pr.tokens || 0).toLocaleString()} tokens</dd>
-      </dl>
-      ${recent ? `<details><summary>Recent steps (${(pr.recent || []).length})</summary><ul class="mf-log">${recent}</ul></details>` : ""}</section>`;
+    const label = BUILD[buildBucket(id)][0];  // the same words as the filter
+    const pr = g.pr || {}, last = pr.last;
+    const when = (pr.stop_at || pr.last_at) ? new Date(pr.stop_at || pr.last_at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    if (g.state === "running") {
+      return `<span class="badge ${cls}">${esc(label)}</span><div class="mf-prog-where">Now: <strong>${esc(phaseText(g.phase) || "starting")}</strong></div>
+        <div class="rec-sub">${esc(String(g.step).slice(0, 140))}</div>`;
+    }
+    // Where it stopped and why: the run's own stop record (log), or, for older logs, what is known.
+    const where = `<div class="mf-prog-where">${g.state === "finished" ? "Ended at" : "Stopped at"}: <strong>${esc(phaseText(g.phase) || "before the first step")}</strong>${last ? ` · <code>${esc(last.tool)}</code>${last.done ? "" : " (unfinished)"}` : ""}</div>`;
+    const outcome = pr.stop_outcome ? `<div class="rec-sub"><strong>${esc(pr.stop_outcome)}</strong></div>` : "";
+    const reason = pr.stop_reason ? `<div class="rec-sub mf-stop-reason">Reason: ${esc(pr.stop_reason.slice(0, 220))}</div>` : "";
+    return `<span class="badge ${cls}" title="${esc(BUILD[buildBucket(id)][1])}">${esc(label)}</span>${when ? ` <span class="rec-sub">${esc(when)}</span>` : ""}${outcome}${where}${reason}`;
   }
 
   // The two columns each answer one question, with five answers. The detailed reason is shown
   // under the answer in the cell, not as more filter options.
   const BUILD = {
-    not_built: ["Not built", "No build has run for this paper yet."],
-    building: ["Building", "A build of this paper is running now."],
-    queued: ["Queued", "Waiting in the queue; it starts when a build slot is free."],
-    finished: ["Finished", "The last build ran to the end (submit or give up)."],
-    stopped: ["Stopped early", "The last build did not finish: stopped by a person, failed, interrupted by a restart, or waiting for AI quota. Rebuild resumes it."],
-    skipped: ["Skipped", "Not built on purpose: a person marked it not QTL data, or it is already in the reference manifest."],
+    not_built: ["Not processed", "This paper has not been processed yet."],
+    building: ["Processing", "This paper is being processed now."],
+    queued: ["Queued", "Waiting in the queue; it starts when a processing slot is free."],
+    finished: ["Finished", "The last processing run ran to the end (submit or give up)."],
+    stopped: ["Stopped early", "The last processing run did not finish: stopped by a person, failed, interrupted by a restart, or waiting for AI quota. Reprocess resumes it."],
+    skipped: ["Skipped", "Not processed on purpose: a person marked it not QTL data, or it is already in the reference manifest."],
   };
   const RESULT = {
     ready: ["Ready", "Every manifest row has its data downloaded or processed, with full summary statistics. Rows may still need review."],
     partial: ["Partial", "Some usable rows, but not all rows have data, or only partial statistics (e.g. significant pairs) exist."],
     needs_you: ["Needs you", "A person must act: an access application, a browser-only download, or approving a larger download."],
-    none: ["No usable data", "The build finished without usable data; the cause is shown under it (network, tool, unsupported type, …)."],
-    pending: ["No result yet", "Not built, still building, or stopped before a result."],
+    none: ["No usable data", "Processing finished without usable data; the cause is shown under it (network, tool, unsupported type, …)."],
+    pending: ["No result yet", "Not processed, still processing, or stopped before a result."],
   };
   // When the latest build started: its log, or the saved outcome for builds older than the logs.
   function lastBuildAt(id) {
@@ -536,11 +530,11 @@
 
   function buildStatusOf(id) {
     const st = stateOf(id), run = (data.runs || {})[id];
-    return st === "excluded" ? "Excluded by human" : st === "building" ? `Building${job.no_llm ? " (AI skipped)" : " with AI"}…`
-      : st === "queued" ? "Queued" : run?.outcome === "failed" ? "Build failed"
-      : (data.progress || {})[id]?.state === "interrupted" ? "Build interrupted"
-      : run?.outcome === "stopped" ? "Build stopped" : run?.outcome === "usage_limit" ? "Waiting for AI quota"
-      : isBuilt(id) || run ? "Build completed" : "Not built";
+    return st === "excluded" ? "Excluded by human" : st === "building" ? `Processing${job.no_llm ? " (AI skipped)" : " with AI"}…`
+      : st === "queued" ? "Queued" : run?.outcome === "failed" ? "Processing failed"
+      : (data.progress || {})[id]?.state === "interrupted" ? "Processing interrupted"
+      : run?.outcome === "stopped" ? "Processing stopped" : run?.outcome === "usage_limit" ? "Waiting for AI quota"
+      : isBuilt(id) || run ? "Processed" : "Not processed";
   }
   function matchesColumns(id) {
     const p = data.records[id], rows = rowsOf(id), run = (data.runs || {})[id];
@@ -589,7 +583,7 @@
     const attempted = isBuilt(id) || !!run;
     const toCheck = rows.filter((r) => r.review === "pending").length;
     const status = buildStatusOf(id);
-    const build = st === "excluded" ? '<span class="rec-sub">Excluded from future builds</span>' : st === "exists" ? "" : `<button type="button" class="rec-btn mf-build" data-record="${id}" ${busy ? "disabled" : ""}>${attempted ? "Rebuild" : "Build manifest"}</button>`;
+    const build = st === "excluded" ? '<span class="rec-sub">Excluded from future processing</span>' : st === "exists" ? "" : `<button type="button" class="rec-btn mf-build" data-record="${id}" ${busy ? "disabled" : ""}>${attempted ? "Reprocess" : "Process data"}</button>`;
     const check = attempted || p.curator_note || p.qtl_review ? `<button type="button" class="rec-btn mf-open" data-record="${id}" aria-expanded="${openPapers.has(id)}">${openPapers.has(id) ? "Close" : "Details"}${toCheck ? ` (${toCheck})` : ""}</button>` : "";
     const urls = dataUrls(id);
     const link = (u) => `<a href="${esc(safeUrl(u))}" target="_blank" rel="noopener">${esc(u)}</a>`;
@@ -625,28 +619,122 @@
       <td><div class="mf-paper-btns">${build}${check}</div></td>`.replace(/<td(?=\s|>)/g, () => `<td data-label="${esc(COLUMNS[cellIndex++][1])}"`);
   }
 
+  // ---- Details: the six steps (status, and why a step failed and what to do), then every file ----
+  const STEP_STATUS = { running: ["Running", "mf-d-warn"], pending: ["Pending", "mf-d-none"],
+    complete: ["Complete", "mf-d-ok"], failed: ["Failed", "mf-d-bad"] };
+  const STAGE_MARK = { complete: "✓", failed: "✗", pending: "…", skipped: "–", running: "▶" };
+  const ACTIONS = {
+    request: "Open the access page, submit the application, then paste the access instructions into the conversation below and click Continue processing.",
+    browser: "Open the source page in your browser, download the files, put them on the server and give their paths in the conversation below, then click Continue processing.",
+    limit: "Review the file sizes: raise “up to … GB per paper” at the top of the page, or give the server paths of files you downloaded yourself, then Reprocess.",
+  };
+  // Which step a person-needed problem belongs to: access and browser downloads are step 1's
+  // question "can it be downloaded"; a download over the limit is step 2's.
+  const HUMAN_STEP = { request: "1", browser: "1", limit: "2" };
+
+  function stepsHtml(id, det, state) {
+    const p = data.records[id] || {};
+    const steps = det.steps.map((s) => ({ ...s }));
+    const human = state.reasons.filter((r) => ManifestStatus.human.has(r.kind));
+    // A paper that needs a person and has no usable data failed at that step, whatever the run said.
+    if (!det.running && human.length && !state.good.length) {
+      const num = HUMAN_STEP[human[0].kind] || "1";
+      const s = steps.find((x) => x.num === num);
+      if (s && s.status !== "failed") {
+        steps.forEach((x) => { if (x.num > num && x.status !== "failed") x.status = "pending"; if (x.num < num && x.status !== "failed") x.status = "complete"; });
+        Object.assign(s, { status: "failed", outcome: "Needs you", reason: human.map((r) => r.why).join(" · "),
+          solution: ACTIONS[human[0].kind] });
+      }
+    }
+    const failed = steps.find((s) => s.status === "failed");
+    const requests = state.reasons.filter((r) => r.kind === "request");
+    const requestUrls = ManifestStatus.requestLinks(state.reasons, p.publication_url || (p.doi ? `https://doi.org/${p.doi}` : ""));
+    const requestBlock = requests.length ? `<section class="mf-request-links"><h4>Access request — pages and instructions</h4>
+      ${requestUrls.length ? `<ul>${requestUrls.map((r) => `<li><a class="rec-url" href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${esc(r.url)}</a>${r.fallback ? '<div class="rec-sub">No separate application URL recorded: check the paper’s Data availability statement for author contact instructions.</div>' : ""}</li>`).join("")}</ul>` : "<p>No application URL was recorded; verify the authors’ contact details in the paper.</p>"}
+      <ul>${requests.map((r) => `<li>${esc(r.why)}</li>`).join("")}</ul></section>` : "";
+    const needsBlock = humanBottlenecks({ ...state, reasons: state.reasons.filter((r) => r.kind !== "request" || !requests.length) });
+    const other = state.reasons.filter((r) => !ManifestStatus.human.has(r.kind));
+    const otherBlock = other.length ? `<div class="mf-norows"><strong>Related problems</strong><ul>${other.map((r) => `<li><strong>${esc(ManifestStatus.labels[r.kind])}</strong>: <code>${esc(r.what)}</code> — ${esc(r.why)}</li>`).join("")}</ul></div>` : "";
+    const humanAt = human.length ? HUMAN_STEP[human[0].kind] || "1" : "";
+    const items = steps.map((s) => {
+      const [label, cls] = STEP_STATUS[s.status] || STEP_STATUS.pending;
+      const extra = [];
+      if (s.status === "running" && s.now) extra.push(`<div class="rec-sub">Now: ${esc(String(s.now).slice(0, 180))}</div>`);
+      if (s.note) extra.push(`<div class="rec-sub">${esc(s.note)}</div>`);
+      if (s.status === "failed") {
+        extra.push(`<dl class="mf-prog-facts">
+          ${s.outcome ? `<dt>Stopped</dt><dd>${esc(s.outcome)}</dd>` : ""}
+          <dt>Reason</dt><dd class="mf-bad">${esc(s.reason || "not recorded")}</dd>
+          <dt>Solution</dt><dd>${esc(s.solution || "")}</dd>
+          ${s.last ? `<dt>Last step</dt><dd><code>${esc(s.last.tool)}</code>${s.last.done ? "" : " (unfinished)"}${s.last.why ? ` — ${esc(s.last.why)}` : ""}${s.last.output ? `<div class="rec-sub">Last output: ${esc(s.last.output)}</div>` : ""}</dd>` : ""}
+          ${s.problem ? `<dt>Problem</dt><dd class="mf-bad">${esc(s.problem.tool)} ${esc(s.problem.outcome)}: ${esc(s.problem.why)}</dd>` : ""}
+        </dl>`);
+      }
+      // Person-needed problems sit at their own step; on the failed step also the other problems and the conversation.
+      if (s.num === humanAt) extra.push(requestBlock + needsBlock);
+      if (s === failed) extra.push(otherBlock + buildChatHtml(id));
+      return `<li class="mf-step mf-step-${s.status}"><div class="mf-step-head"><span class="badge ${cls}">${label}</span>
+        <strong>Step ${esc(s.num)} · ${esc(s.name)}</strong></div><div class="rec-sub">${esc(s.text || "")}</div>${extra.join("")}</li>`;
+    }).join("");
+    return { html: `<ol class="mf-steps">${items}</ol>`, chatShown: !!failed, otherShown: !!failed && !!other.length };
+  }
+
+  function stageChips(stages) {
+    return `<span class="mf-stages">${stages.map((g) => `<span class="mf-stage mf-stage-${esc(g.status)}" title="${esc([g.name, g.status, g.reason, g.attempt && `attempt ${g.attempt}`].filter(Boolean).join(" — "))}">${STAGE_MARK[g.status] || "·"} ${esc(g.name)}</span>`).join("")}</span>`;
+  }
+  function failedText(f) { return f.failed ? `<span class="mf-bad">${esc(f.failed.stage)}</span><div class="rec-sub">${esc((f.failed.reason || "").slice(0, 220))}</div>` : "—"; }
+
+  function filesHtml(id, det) {
+    const c = det.counts || {};
+    const key = `files-${id}`;
+    const yes = (v) => v ? "✓" : "✗";
+    const rows = det.files.map((f, i) => {
+      const assessed = f.stages.find((g) => g.name === "assessed");
+      const processed = f.stages.find((g) => g.name === "processed");
+      const sub = f.processed.length ? `<tr class="mf-file-sub"><td colspan="6"><details data-file-list="${key}-${i}" ${filesOpen.has(`${key}-${i}`) ? "open" : ""}>
+          <summary>${f.processed.length} processed table${f.processed.length === 1 ? "" : "s"} made from it</summary>
+          <table class="mf-ev"><thead><tr><th>Processed table</th><th>Stages</th><th>Reached</th><th>Failed at</th></tr></thead><tbody>
+          ${f.processed.map((q) => `<tr><td class="rec-url">${esc(q.name)}<div class="rec-sub">${size(q.size)}</div></td><td>${stageChips(q.stages)}</td><td>${esc(q.stage)}</td><td>${failedText(q)}</td></tr>`).join("")}
+          </tbody></table></details></td></tr>` : "";
+      return `<tr><td class="rec-url">${esc(f.name)}<div class="rec-sub">${f.size != null ? size(f.size) : ""}${f.url ? ` · <a href="${esc(safeUrl(f.url))}" target="_blank" rel="noopener">source</a>` : ""}</div></td>
+        <td>${f.downloaded ? "✓ downloaded" : `✗ ${esc(f.stages[0]?.status === "skipped" ? "not downloaded" : "download failed")}`}</td>
+        <td>${assessed ? `${STAGE_MARK[assessed.status] || "·"} <span class="rec-sub">${esc(assessed.reason || assessed.status)}</span>` : "—"}</td>
+        <td>${processed ? `${STAGE_MARK[processed.status] || "·"} <span class="rec-sub">${esc(processed.reason || processed.status)}</span>` : "—"}</td>
+        <td>${esc(f.stage)}</td><td>${failedText(f)}</td></tr>${sub}`;
+    }).join("");
+    const orphans = det.processed_unmatched || [];
+    const orphanRows = orphans.length ? `<h4>Processed tables whose source was not matched (${orphans.length})</h4><table class="mf-ev"><thead><tr><th>Processed table</th><th>Stages</th><th>Reached</th><th>Failed at</th></tr></thead><tbody>
+      ${orphans.map((q) => `<tr><td class="rec-url">${esc(q.name)}<div class="rec-sub">${size(q.size)}</div></td><td>${stageChips(q.stages)}</td><td>${esc(q.stage)}</td><td>${failedText(q)}</td></tr>`).join("")}</tbody></table>` : "";
+    return `<details class="mf-files" data-file-list="${key}" ${filesOpen.has(key) ? "open" : ""}>
+      <summary><strong>Files (${c.files || 0})</strong> <span class="rec-sub">${c.downloaded || 0} downloaded · ${c.processed_tables || 0} processed tables · ${c.in_manifest || 0} in the manifest · ${c.failed || 0} failed · folder <code>${esc(det.folder || "")}</code></span></summary>
+      ${det.files.length ? `<div class="table-wrap"><table class="mf-ev mf-file-table"><thead><tr><th>File</th><th>Download</th><th>Assessed (step 4)</th><th>Processed (step 5)</th><th>Reached</th><th>Failed at</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p class="muted">No file has been downloaded or planned yet.</p>'}
+      ${orphanRows}
+      <p class="rec-sub">Stages of a processed table: written → liftover (GRCh37 only) → rs ids → validate → in the manifest. ✓ complete · ✗ failed · … pending · – not needed. Hover a stage for its reason.</p></details>`;
+  }
+
   function bodyHtml(id) {
     const rows = rowsOf(id), locs = data.locations.filter((l) => l.record_id === id);
     const state = followUp(id);
     const p = data.records[id] || {};
-    const requests = state.reasons.filter((r) => r.kind === "request");
-    const requestUrls = ManifestStatus.requestLinks(state.reasons, p.publication_url || (p.doi ? `https://doi.org/${p.doi}` : ""));
+    const det = details.get(id);
+    const g = progressOf(id), pr = g?.pr || {};
+    const [label, cls] = g ? (STATE[g.state] || STATE.unknown) : ["Not processed", "mf-d-none"];
+    const head = `<div class="mf-det-head"><h3>Processing progress <span class="badge ${cls}">${esc(det?.running ? "Processing" : label)}</span>${det?.queued ? ` <span class="rec-sub">queued, position ${det.queue_position}</span>` : ""}</h3>
+      <a class="rec-btn" href="/api/manifest/${id}/logs" target="_blank" rel="noopener">Full processing logs (.md)</a>
+      ${pr.run_id ? `<span class="rec-sub">${esc(pr.run_id)} · ${pr.steps || 0} AI steps · ${(pr.tokens || 0).toLocaleString()} tokens</span>` : ""}</div>`;
+    const steps = det ? stepsHtml(id, det, state) : { html: '<p class="muted">Loading the steps and files…</p>', chatShown: false, otherShown: false };
+    const files = det ? filesHtml(id, det) : "";
+    const recent = (pr.recent || []).slice().reverse().map((r) => `<li><code>${esc(r.tool)}</code> <span class="mf-oc-${esc(r.outcome)}">${esc(r.outcome)}</span>${r.why ? ` — ${esc(r.why)}` : ""}</li>`).join("");
     const curatorSection = p.curator_note ? `<section class="mf-curator-note"><h3>Curator notes / recheck evidence</h3><p>${esc(p.curator_note)}</p></section>` : "";
-    const requestSection = requests.length ? `<section class="mf-request-links"><h3>Access request — pages and instructions</h3>
-      <p>Open the recorded application page or author-request instructions:</p>
-      ${requestUrls.length ? `<ul>${requestUrls.map((r) => `<li><a class="rec-url" href="${esc(safeUrl(r.url))}" target="_blank" rel="noopener">${esc(r.url)}</a>${r.fallback ? '<div class="rec-sub">No separate application URL recorded. Check this paper’s Data availability statement for author contact instructions.</div>' : ""}</li>`).join("")}</ul>` : '<p>No application URL was recorded. The report calls for contacting the authors; verify their contact details in the paper.</p>'}
-      <ul>${requests.map((r) => `<li>${esc(r.why)}</li>`).join("")}</ul></section>` : "";
-    // Access requests already have their own section above; list the other causes once.
-    const causes = requests.length ? state.reasons.filter((r) => r.kind !== "request") : state.reasons;
-    const why = causes.length
-      ? `<div class="mf-norows"><strong>Follow-up by cause</strong><ul>${causes.map((r) => `<li><strong>${esc(ManifestStatus.labels[r.kind])}</strong>: <code>${esc(r.what)}</code> — ${esc(r.why)}</li>`).join("")}</ul>
-        <span class="rec-sub">Network and tool failures do not establish an access application requirement. Review the cause before retrying.</span></div>`
-      : state.good.length ? '<p class="rec-sub">Data downloaded and processed. Review candidate rows below; failed alternate URLs remain in source history.</p>'
-      : `<div class="mf-norows mf-nothing"><strong>No usable data found.</strong> Inspect source reports below.</div>`;
-    const sources = locs.length ? `<details class="mf-sources"><summary>Source reports (${locs.length} location${locs.length === 1 ? "" : "s"})</summary>${locs.map((l) => locationHtml(l, !rows.length)).join("")}</details>` : "";
-    return `<div class="mf-paper-body">${progressSection(id)}<p><a class="rec-btn" href="/api/manifest/${id}/logs" target="_blank" rel="noopener">Full build logs (.md)</a></p>${requestSection}${humanBottlenecks({ ...state, reasons: state.reasons.filter((r) => r.kind !== "request" || !requests.length) })}${why}${curatorSection}${buildChatHtml(id)}${sources}
-      ${rows.length ? `<div class="table-wrap"><table class="rec-table"><thead><tr><th>Status</th><th>Dataset</th><th>Context</th><th>Pop.</th><th>N</th><th>Build</th><th>File</th><th>Data</th><th>Issues</th><th></th></tr></thead>
-        <tbody>${rows.map(rowHtml).join("")}</tbody></table></div>` : ""}</div>`;
+    const other = state.reasons.filter((r) => !ManifestStatus.human.has(r.kind));
+    const otherBlock = !steps.otherShown && other.length ? `<div class="mf-norows"><strong>Related problems</strong><ul>${other.map((r) => `<li><strong>${esc(ManifestStatus.labels[r.kind])}</strong>: <code>${esc(r.what)}</code> — ${esc(r.why)}</li>`).join("")}</ul></div>` : "";
+    const sources = locs.length ? `<details class="mf-sources"><summary>Source reports (${locs.length} location${locs.length === 1 ? "" : "s"})</summary>${locs.map((l) => locationHtml(l, false)).join("")}</details>` : "";
+    return `<div class="mf-paper-body">${head}${steps.html}
+      ${recent ? `<details><summary>Recent steps (${(pr.recent || []).length})</summary><ul class="mf-log">${recent}</ul></details>` : ""}
+      ${files}
+      ${rows.length ? `<h3>Manifest rows</h3><div class="table-wrap"><table class="rec-table"><thead><tr><th>Status</th><th>Dataset</th><th>Context</th><th>Pop.</th><th>N</th><th>Genome build</th><th>File</th><th>Data</th><th>Issues</th><th></th></tr></thead>
+        <tbody>${rows.map(rowHtml).join("")}</tbody></table></div>` : ""}
+      ${otherBlock}${curatorSection}${steps.chatShown ? "" : buildChatHtml(id)}${sources}</div>`;
   }
 
   const paperHtml = (id) => `<tbody class="mf-paper" data-record="${id}"><tr class="mf-paper-head">${headHtml(id)}</tr>
@@ -675,11 +763,11 @@
 
   function updateCount(ids) {
     const n = toBuild(ids).length;
-    buildAll.textContent = n ? `Build all shown (${n})` : "Build all shown";
+    buildAll.textContent = n ? `Process all shown (${n})` : "Process all shown";
     buildAll.disabled = !n;
     const builtN = ids.filter(isBuilt).length, toCheck = ids.reduce((n, id) => n + rowsOf(id).filter((r) => r.review === "pending").length, 0);
     const handN = ids.filter((id) => needsYou(id).length).length;
-    count.textContent = `${plural(ids.length, "paper")} · ${builtN} built · ${handN} need an access / browser / budget action · ${plural(toCheck, "row")} to check`;
+    count.textContent = `${plural(ids.length, "paper")} · ${builtN} processed · ${handN} need an access / browser / budget action · ${plural(toCheck, "row")} to check`;
     const mf = (data.files || {})["qtl_manifest.tsv"];
     $("mf-file-rows").textContent = mf ? `· ${plural(mf.rows, "row")}` : "";
   }
@@ -756,7 +844,7 @@
     const scroll = body.querySelector?.(".mf-overview-wrap")?.scrollLeft || 0;
     const ids = shownIds();
     updateCount(ids);
-    body.innerHTML = `<p class="muted mf-overview-note">One row per paper. Column filters combine with each other and the filters above.</p><details class="mf-legend"><summary>What the Build status and Data result values mean</summary><dl>${[...Object.values(BUILD).map(([t, d]) => ["Build status", t, d]), ...Object.values(RESULT).map(([t, d]) => ["Data result", t, d])].map(([c, t, d]) => `<dt>${esc(c)}: ${esc(t)}</dt><dd>${esc(d)}</dd>`).join("")}</dl></details><div class="table-wrap mf-overview-wrap"><table class="rec-table mf-overview" role="table" aria-label="Manifest papers"><colgroup>${COLUMNS.map(([key]) => `<col class="mf-col-${key}">`).join("")}</colgroup><thead><tr>
+    body.innerHTML = `<p class="muted mf-overview-note">One row per paper. Column filters combine with each other and the filters above.</p><details class="mf-legend"><summary>What the Processing status and Data result values mean</summary><dl>${[...Object.values(BUILD).map(([t, d]) => ["Processing status", t, d]), ...Object.values(RESULT).map(([t, d]) => ["Data result", t, d])].map(([c, t, d]) => `<dt>${esc(c)}: ${esc(t)}</dt><dd>${esc(d)}</dd>`).join("")}</dl></details><div class="table-wrap mf-overview-wrap"><table class="rec-table mf-overview" role="table" aria-label="Manifest papers"><colgroup>${COLUMNS.map(([key]) => `<col class="mf-col-${key}">`).join("")}</colgroup><thead><tr>
       ${COLUMNS.map(([key, label]) => `<th scope="col" data-col="${key}">${label}<span class="mf-col-resize" data-resize="${key}" title="Drag to resize · double-click to reset all columns" aria-hidden="true"></span></th>`).join("")}
       </tr><tr class="mf-column-filters">${COLUMNS.map(([key, label]) => `<th data-label="${esc(label)}">${columnFilterHtml(key, label)}</th>`).join("")}</tr></thead>
       ${ids.length ? ids.slice(0, limit).map(paperHtml).join("") : `<tbody><tr><td colspan="${COLUMNS.length}" class="rec-empty">No paper matches. Adjust or clear the filters above.</td></tr></tbody>`}</table></div>`
@@ -829,6 +917,10 @@
       runStatus.textContent = END[job.state];
     }
     stopBtn.hidden = !running;
+    const live = new Set((job?.active || []).map((c) => c?.record_id).filter(Boolean));
+    openPapers.forEach((id) => {
+      if ((live.has(id) || details.get(id)?.running) && Date.now() - (detailsAt.get(id) || 0) > 15000) loadDetails(id);
+    });
     clearTimeout(timer);
     if (running) timer = setTimeout(poll, 3000);
   }
@@ -935,6 +1027,7 @@
       refreshPaper(id);
       if (first) body.querySelector(`.mf-paper[data-record="${id}"] .mf-detail[data-id="${first.row_id}"]`)?.scrollIntoView({behavior: "smooth", block: "start"});
       loadChat(id);
+      loadDetails(id);
       return;
     }
     const o = e.target.closest(".mf-open");
@@ -942,10 +1035,15 @@
       const id = +o.dataset.record;
       if (openPapers.has(id)) openPapers.delete(id); else openPapers.add(id);
       refreshPaper(id);
-      if (openPapers.has(id)) loadChat(id);
+      if (openPapers.has(id)) { loadChat(id); loadDetails(id); }
       return;
     }
     if (e.target.closest(".mf-more")) { limit += PAGE; render(); return; }
+    const fileList = e.target.closest("summary")?.parentElement;
+    if (fileList?.dataset?.fileList) {  // native <details> toggles itself; remember it for redraws
+      const key = fileList.dataset.fileList;
+      setTimeout(() => { if (fileList.open) filesOpen.add(key); else filesOpen.delete(key); }, 0);
+    }
     const toggle = e.target.closest(".mf-toggle");
     if (toggle) {
       const id = +toggle.closest("tr").dataset.id;
@@ -966,7 +1064,7 @@
     patch(id, payload);
   });
   stopBtn.addEventListener("click", async () => {
-    if (!confirm("Stop building? The paper in progress is dropped; queued papers are not built.")) return;
+    if (!confirm("Stop processing? The paper in progress is dropped; queued papers are not processed.")) return;
     stopBtn.disabled = true;
     try { await showRun(await (await fetch("/api/manifest/run/stop", { method: "POST" })).json()); } finally { stopBtn.disabled = false; }
   });

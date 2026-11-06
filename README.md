@@ -124,7 +124,7 @@ from the database on every change. LocusCompare's manifest is used as a referenc
 the context vocabulary, from the copy in `reference/qtl_manifest.tsv` (copy it again when LocusCompare's
 changes); nothing outside this repository is read or written.
 
-On the page every saved record is listed with a **Build manifest** button; builds run one after another
+On the page every saved record is listed with a **Process data** button; builds run one after another
 in the background of the server (clicks queue up), and a built paper shows its rows behind **Check**.
 
 API: `GET /api/manifest`, `PATCH /api/manifest/{row_id}`, `GET|POST /api/manifest/run`,

@@ -90,6 +90,8 @@ def build_index(map_file: Path, columns: dict[str, str], header: bool, sep: str 
 class Lookup:
     """Other alleles from an indexed study SNP info file."""
 
+    REASONS = ("filled", "multiallelic", "allele_not_in_map", "not_in_map")
+
     def __init__(self, map_file: Path) -> None:
         self.db = sqlite3.connect(index_path(map_file), check_same_thread=False)
 
@@ -102,9 +104,7 @@ class Lookup:
                            "known": known.astype(str).str.strip().str.upper(),
                            "rsid": rsid.astype(str).str.strip() if rsid is not None else ""})
         out = pd.Series("", index=df.index, dtype=object)
-        why = {"filled": 0, "multiallelic": 0, "allele_not_in_map": 0, "not_in_map": 0}
         ok = df.dropna(subset=["pos"])
-        why["not_in_map"] += len(df) - len(ok)
         keys = sorted({(c, int(p)) for c, p in zip(ok["chrom"], ok["pos"], strict=True)})
         found: dict[tuple[str, int], list[tuple[set[str], set[str]]]] = {}
         self.db.execute("create temp table if not exists k (chrom text, pos integer)")
@@ -114,25 +114,29 @@ class Lookup:
                 "select m.chrom, m.pos, m.id, m.a1, m.a2 from k join m on m.chrom = k.chrom and m.pos = k.pos"):
             alleles = {a for a in (a1, a2) if SNV.fullmatch(a or "")}
             found.setdefault((c, p), []).append((set((ids or "").split(";")), alleles))
-        vals = []
+        vals, why_row = [], []
         for c, p, a, rs in zip(ok["chrom"], ok["pos"].astype(int), ok["known"], ok["rsid"], strict=True):
             recs = found.get((c, p), [])
             if rs.startswith("rs") and any(rs in r[0] for r in recs):
                 recs = [r for r in recs if rs in r[0]]
             alleles = set().union(*(r[1] for r in recs)) if recs else set()
             if not alleles:
-                why["not_in_map"] += 1
+                why_row.append("not_in_map")
                 vals.append("")
             elif a not in alleles:
-                why["allele_not_in_map"] += 1
+                why_row.append("allele_not_in_map")
                 vals.append("")
             elif len(alleles) != 2:
-                why["multiallelic"] += 1
+                why_row.append("multiallelic")
                 vals.append("")
             else:
-                why["filled"] += 1
+                why_row.append("filled")
                 vals.append(next(iter(alleles - {a})))
         out[ok.index] = vals
+        reason = pd.Series("not_in_map", index=df.index, dtype=object)
+        reason[ok.index] = why_row
+        self.last_reasons = reason  # per row, for callers that look up distinct variants only
+        why = {k: int((reason == k).sum()) for k in self.REASONS}
         return out, why
 
 
@@ -210,7 +214,7 @@ def fill_positions(path: Path, lookup: PositionLookup, columns: dict[str, str],
     ref_c, alt_c, vid_c = (columns.get(k) or "" for k in ("ref_col", "alt_col", "variant_id_col"))
     total = {"rows": 0, "had_position": 0, "filled": 0, "ambiguous": 0, "not_in_map": 0, "removed": 0}
     first = True
-    with gzip.open(tmp, "wt") as out:
+    with gzip.open(tmp, "wt", compresslevel=1) as out:
         for df in pd.read_csv(path, sep="\t", dtype=str, chunksize=CHUNK_ROWS, keep_default_na=False):
             for c in (chrom_c, pos_c):
                 if c not in df.columns:

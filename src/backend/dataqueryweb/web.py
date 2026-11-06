@@ -36,6 +36,7 @@ from fastapi.templating import Jinja2Templates
 from dataqueryweb import (
     __version__,
     checks,
+    details,
     fetch,
     finder,
     llm,
@@ -109,11 +110,22 @@ def data_kind(record: dict[str, Any]) -> str:
 
 
 def create_app(store: records.RecordStore | None = None) -> FastAPI:
-    app = FastAPI(title="dataqueryweb", version=__version__)
     saved = store or records.RecordStore()
     checked = checks.CheckStore(saved)
     manifests = manifest.ManifestStore(saved.path)
     data_root = fetch.data_dir(saved.path)  # downloaded and processed files
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        # When the server starts nothing of it runs yet: a latest log with no end, whose process is
+        # gone, was cut by a restart — record at which step it stopped. Only at server start, never on import.
+        # MANIFEST_MARK_INTERRUPTED=0 for a second, read-only server next to the real one.
+        if os.environ.get("MANIFEST_MARK_INTERRUPTED", "1") != "0":
+            with contextlib.suppress(OSError):
+                progress.mark_interrupted(data_root)
+        yield
+
+    app = FastAPI(title="dataqueryweb", version=__version__, lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=_FRONTEND / "static"), name="static")
     templates = Jinja2Templates(directory=_FRONTEND / "displays")
     # `?v=` on every script and stylesheet. The package version never changes between
@@ -313,6 +325,26 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
                             filename=filename if download else None,
                             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
+    @app.get("/api/manifest/{record_id}/details")
+    async def manifest_details(record_id: int) -> dict[str, Any]:
+        """The Details panel: the six steps with their status, and every file of the paper."""
+        record = saved.get(record_id)
+        if record is None:
+            raise HTTPException(404, "No such saved record")
+        job: manifest.Batch | None = getattr(app.state, "manifest_job", None)
+        snap = job.snapshot() if job is not None and job.running else {}
+        live = next((a for a in snap.get("active") or [] if a and a.get("record_id") == record_id), None)
+        running = (live.get("step") or "starting") if live else None
+        phase = progress.current_step(data_root, record_id, running, live.get("since") or "") if live else None
+        queue = list(snap.get("queue") or [])
+        facts = progress.summary(data_root, record_id, manifests.runs().get(record_id))
+        found = await asyncio.to_thread(details.files, data_root, record, manifests.rows(record_id))
+        return {"steps": details.steps(facts, running, phase), "running": running is not None, "phase": phase,
+                "queued": record_id in queue, "queue_position": queue.index(record_id) + 1 if record_id in queue else None,
+                "run": {k: (facts or {}).get(k) for k in ("run_id", "steps", "tokens", "started", "last_at", "state",
+                                                            "stop_outcome", "stop_reason", "stop_at", "next", "recent")},
+                **found}
+
     @app.get("/api/manifest/{record_id}/chat")
     async def get_manifest_chat(record_id: int) -> dict[str, Any]:
         if saved.get(record_id) is None:
@@ -406,7 +438,12 @@ def create_app(store: records.RecordStore | None = None) -> FastAPI:
         job: manifest.Batch | None = getattr(app.state, "manifest_job", None)
         everything, done = saved.all(), manifests.processed()
         human = [r for r in everything if not manifest.eligible(r)]
-        return {"job": job.snapshot() if job else None, "records": len(everything), "human": len(human),
+        snap = job.snapshot() if job else None
+        for a in (snap or {}).get("active") or []:  # the step each running paper is in (same as its Details)
+            if a and a.get("record_id"):
+                with contextlib.suppress(OSError):
+                    a["phase"] = progress.current_step(data_root, a["record_id"], a.get("step") or "", a.get("since") or "")
+        return {"job": snap, "records": len(everything), "human": len(human),
                 "processed": len(done), "waiting": sum(r["record_id"] not in done for r in human),
                 "waiting_all_species": sum(r["record_id"] not in done for r in everything)}
 

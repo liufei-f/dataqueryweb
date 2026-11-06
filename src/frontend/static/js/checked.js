@@ -1,7 +1,9 @@
 // AI-checked papers: every paper the LLM has read, its latest verdict and locations, with
 // Save / Remove per location so a curator can file the correct ones into Saved records.
 (() => {
-  const list = document.getElementById("chk-list");
+  const table = document.getElementById("chk-table");
+  const list = table;  // one tbody per paper: clicks are handled for the whole table
+  const opened = new Set();  // papers whose data locations are shown
   const filter = document.getElementById("chk-filter");
   const verdictSel = document.getElementById("chk-verdict");
   const savedSel = document.getElementById("chk-saved");
@@ -70,40 +72,48 @@
         <td class="dq-save-cell">
           <button type="button" class="dq-save${saved ? " saved" : ""}" data-c="${ci}" data-s="${si}"
                   title="${saved ? "In Saved records — click to remove this location" : "This location is correct: save it to Saved records"}">${saved
-                    ? (rec.saved_by === "auto" ? "🤖 Auto-saved ✓" : "Saved ✓") : "Save"}</button>
+                    ? (rec.saved_by === "auto" ? "Auto-saved ✓" : "Saved ✓") : "Save"}</button>
         </td>
       </tr>`;
   }
 
+  // One paper = one <tbody class="mf-paper">, laid out like the Manifest papers table; its data
+  // locations open below it (Locations), as Details does there.
   function card(c, ci) {
     const p = c.paper, v = c.verdict || {}, rec = recordFor(p);
     const sources = (p.sources || []).slice().sort((a, b) => !a.ai_pick - !b.ai_pick);
-    const verdict = c.ok ? `
-      <div class="dq-verdict dq-verdict-${esc(v.new_qtl_data)}">
-        <span class="dq-verdict-label">${esc(LABEL[v.new_qtl_data] || v.new_qtl_data || "Unclear")}</span>
-        ${v.new_qtl_data === "yes" && v.download_status ? `<span class="badge badge-${v.download_status === "open" ? "open" : v.download_status === "controlled" ? "controlled" : v.download_status === "on_request" ? "request" : "unknown"}">${esc(STATUS[v.download_status] || v.download_status)}</span>` : ""}
-        <span class="dq-verdict-reason">${esc(v.reason || "")}</span>
-        ${[(v.qtl_types || []).join(", "), v.species, v.tissues_or_cells].filter(Boolean).length
-          ? `<span class="dq-verdict-model">${esc([(v.qtl_types || []).join(", "), v.species, v.tissues_or_cells].filter(Boolean).join(" · "))}</span>` : ""}
-        <span class="dq-verdict-model">${esc(c.model)} · confidence ${Math.round((v.confidence || 0) * 100)}% · ${esc(fmtTok(c.total_tokens))} tokens · checked ${esc(String(c.checked_at).slice(0, 10))}${c.search_terms ? ` · search “${esc(c.search_terms)}”` : ""}</span>
-      </div>` : `<div class="dq-verdict dq-verdict-error">AI check failed: ${esc(v.error || "unknown error")} · ${esc(fmtTok(c.total_tokens))} tokens</div>`;
+    const picked = sources.filter((s) => s.ai_pick).length;
+    const savedN = sources.filter((s) => isSaved(rec, s)).length;
     const ids = [p.doi && `doi:${p.doi}`, p.pmid && `PMID ${p.pmid}`, p.pmcid, p.preprint_server && `${p.preprint_server} preprint`]
       .filter(Boolean).map(esc).join(" · ");
     const pubUrl = p.doi ? `https://doi.org/${p.doi}` : p.url;
-    return `
-      <article class="dq-paper${rec ? " has-saved" : ""}">
-        <div class="dq-paper-head">
-          <h3 class="dq-paper-title"><a href="${esc(safeUrl(pubUrl))}" target="_blank" rel="noopener">${esc(p.title || p.doi)}</a></h3>
-          <div class="dq-paper-meta">${esc([p.authors && p.authors.split(",").slice(0, 3).join(","), p.journal, p.year].filter(Boolean).join(" · "))}</div>
-          <div class="dq-paper-ids">${ids}${rec ? ` · <a href="/records?q=${encodeURIComponent(p.doi || p.pmid || p.title)}">in Saved records (#${rec.record_id})</a>` : ""}</div>
-        </div>${verdict}
-        ${sources.length ? `
+    const label = c.ok ? (LABEL[v.new_qtl_data] || v.new_qtl_data || "Unclear") : "Check failed";
+    const cls = !c.ok ? "mf-d-bad" : v.new_qtl_data === "yes" ? "mf-d-ok" : v.new_qtl_data === "no" ? "mf-d-none" : "mf-d-warn";
+    const dl = v.new_qtl_data === "yes" && v.download_status ? `<div><span class="badge badge-${v.download_status === "open" ? "open" : v.download_status === "controlled" ? "controlled" : v.download_status === "on_request" ? "request" : "unknown"}">${esc(STATUS[v.download_status] || v.download_status)}</span></div>` : "";
+    const facts = [(v.qtl_types || []).join(", "), v.species, v.tissues_or_cells].filter(Boolean);
+    const open = opened.has(ci);
+    const body = open ? `<tr><td colspan="8"><div class="mf-paper-body">${sources.length ? `
         <div class="table-wrap"><table class="dq-sources">
           <colgroup><col style="width:34%"><col style="width:14%"><col style="width:9%"><col style="width:33%"><col style="width:10%"></colgroup>
           <thead><tr><th>Download / data location</th><th>Repository</th><th>Access</th><th>Where the paper says it</th><th></th></tr></thead>
           <tbody>${sources.map((s) => sourceRow(c, ci, s, (p.sources || []).indexOf(s), rec)).join("")}</tbody>
-        </table></div>` : `<div class="dq-note">No data location was found for this paper.</div>`}
-      </article>`;
+        </table></div>` : `<div class="dq-note">No data location was found for this paper.</div>`}</div></td></tr>` : "";
+    return `
+      <tbody class="mf-paper${rec ? " has-saved" : ""}">
+      <tr class="mf-paper-head">
+        <td data-label="Saved record">${rec ? `<a href="/records?q=${encodeURIComponent(p.doi || p.pmid || p.title)}"><strong>#${rec.record_id}</strong></a><div class="rec-sub">${rec.saved_by === "auto" ? "auto-saved" : "saved by you"}</div>` : '<span class="muted">not saved</span>'}</td>
+        <td data-label="Paper / URL" class="mf-paper-cell">
+          <strong><a class="mf-paper-title" href="${esc(safeUrl(pubUrl))}" target="_blank" rel="noopener">${esc(p.title || p.doi)}</a></strong>
+          <div class="rec-sub">${esc([p.authors && p.authors.split(",").slice(0, 3).join(","), p.journal, p.year].filter(Boolean).join(" · "))}</div>
+          <div class="rec-sub">${ids}</div>
+        </td>
+        <td data-label="AI verdict"><span class="badge ${cls}">${esc(label)}</span>${c.ok ? `<div class="rec-sub">confidence ${Math.round((v.confidence || 0) * 100)}%</div>` : ""}${dl}</td>
+        <td data-label="QTL type · species · context" class="mf-context-cell">${facts.length ? facts.map((f) => `<div>${esc(f)}</div>`).join("") : "—"}</td>
+        <td data-label="Reason">${c.ok ? esc(v.reason || "—") : `<span class="mf-bad">${esc(v.error || "unknown error")}</span>`}</td>
+        <td data-label="Data locations">${sources.length}<div class="rec-sub">${picked} picked by the AI · ${savedN} saved</div></td>
+        <td data-label="Checked">${esc(String(c.checked_at).slice(0, 10))}<div class="rec-sub">${esc(c.model || "")} · ${esc(fmtTok(c.total_tokens))} tokens${c.search_terms ? ` · search “${esc(c.search_terms)}”` : ""}</div></td>
+        <td data-label="Actions"><div class="mf-paper-btns"><button type="button" class="rec-btn chk-open" data-c="${ci}" aria-expanded="${open}">${open ? "Close" : `Locations (${sources.length})`}</button></div></td>
+      </tr>${body}</tbody>`;
   }
 
   function render() {
@@ -121,8 +131,9 @@
     const unsaved = checks.filter((c) => c.ok && c.verdict.new_qtl_data === "yes" && !recordFor(c.paper)).length;
     count.textContent = `${shown.length === checks.length ? checks.length : `${shown.length} of ${checks.length}`} paper${checks.length === 1 ? "" : "s"}`
       + (unsaved ? ` · ${unsaved} with new QTL data not saved yet` : "");
-    list.innerHTML = shown.length ? shown.map(([c, i]) => card(c, i)).join("")
-      : `<p class="muted">${checks.length ? "No paper matches the filter." : 'No paper has been checked by the AI yet. Run a search with <strong>AI check</strong> on <a href="/">Find QTL data</a>.'}</p>`;
+    table.querySelectorAll(":scope > tbody").forEach((t) => t.remove());
+    table.insertAdjacentHTML("beforeend", shown.length ? shown.map(([c, i]) => card(c, i)).join("")
+      : `<tbody><tr><td colspan="8" class="rec-empty">${checks.length ? "No paper matches the filter." : 'No paper has been checked by the AI yet. Run a search with <strong>AI check</strong> on <a href="/">Find QTL data</a>.'}</td></tr></tbody>`);
   }
 
   async function load() {
@@ -132,13 +143,21 @@
         fetch("/api/records").then((r) => r.json()),
       ]);
     } catch {
-      list.innerHTML = '<p class="muted">Could not load the checked papers.</p>';
+      table.querySelectorAll(":scope > tbody").forEach((t) => t.remove());
+      table.insertAdjacentHTML("beforeend", '<tbody><tr><td colspan="8" class="rec-empty">Could not load the checked papers.</td></tr></tbody>');
       return;
     }
     render();
   }
 
   list.addEventListener("click", async (e) => {
+    const toggle = e.target.closest(".chk-open");
+    if (toggle) {
+      const ci = +toggle.dataset.c;
+      if (opened.has(ci)) opened.delete(ci); else opened.add(ci);
+      render();
+      return;
+    }
     const btn = e.target.closest(".dq-save");
     if (!btn) return;
     const c = checks[+btn.dataset.c], s = c && (c.paper.sources || [])[+btn.dataset.s];

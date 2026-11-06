@@ -60,7 +60,9 @@ def with_reasons(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def proof(s: Session) -> dict[str, str]:
     """Everything the model was shown, by name: what a quote may come from."""
     files = "\n".join([*s.validated, *(d["path"] for d in s.downloads), *s.source_files()])
-    shown = {f"tool result #{i + 1}": e.get("result_full", "") for i, e in enumerate(s.log)}
+    # Output of the model's own run_python code is not evidence: the code could print anything.
+    shown = {f"tool result #{i + 1}": e.get("result_full", "") for i, e in enumerate(s.log)
+             if e.get("tool") != "run_python"}
     return s.texts | shown | {"file paths": files, "rebuild check": s.rebuild_report}
 
 

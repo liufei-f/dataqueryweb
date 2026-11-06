@@ -23,9 +23,13 @@
     </a>
     <nav class="site-nav">
       <a href="/" class="{{ 'active' if active == 'search' else '' }}">Find QTL data</a>
-      <a href="/records" class="{{ 'active' if active == 'records' else '' }}">Saved records</a>
-      <a href="/manifest" class="{{ 'active' if active == 'manifest' else '' }}">Manifest rows</a>
+      <span class="nav-arrow" aria-hidden="true">→</span>
       <a href="/checked" class="{{ 'active' if active == 'checked' else '' }}">AI-checked papers</a>
+      <span class="nav-arrow" aria-hidden="true">→</span>
+      <a href="/records" class="{{ 'active' if active == 'records' else '' }}">Saved records</a>
+      <span class="nav-arrow" aria-hidden="true">→</span>
+      <a href="/manifest" class="{{ 'active' if active == 'manifest' else '' }}">Manifest rows</a>
+      <span class="nav-sep" aria-hidden="true"></span>
       <a href="/about" class="{{ 'active' if active == 'about' else '' }}">How it works</a>
     </nav>
     <span class="version">v1</span>

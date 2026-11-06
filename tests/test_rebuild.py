@@ -43,14 +43,13 @@ def test_rebuild_deletes_broken_processed_files_and_keeps_the_rest(tmp_path: Pat
     (folder / "cut_processed.tsv.gz").write_bytes(whole[: len(whole) // 2])  # an interrupted write
     (folder / "b_processed.tsv.gz.rsid.tmp").write_text("half")
 
-    report = rebuild.prepare(s, "PROCEDURE v2")
+    report = rebuild.prepare(s)
     left = sorted(p.name for p in folder.iterdir())
     assert left == [".processed_checks.json", "a.tsv.gz", "good_processed.tsv.gz", "norsid_processed.tsv.gz"]
     assert "DELETED 5" in report and "truncated" in report and "'chr' prefix" in report
     assert "rs ids missing (1)" in report and "norsid_processed" in report
     assert "in the target format (1)" in report and "good_processed" in report
     assert f"{s.folder_name()}/a.tsv.gz" in s.checked  # the download was format-checked by the program
-    assert "No copy of the skill used by earlier builds" in report
 
 
 def test_rebuild_keeps_broken_files_without_a_source(tmp_path: Path) -> None:
@@ -58,16 +57,15 @@ def test_rebuild_keeps_broken_files_without_a_source(tmp_path: Path) -> None:
     folder = tmp_path / s.folder_name()
     folder.mkdir()
     table(chrom=["chr1", "chr1"]).to_csv(folder / "chrom_processed.tsv.gz", sep="\t", index=False)
-    report = rebuild.prepare(s, "PROCEDURE")
+    report = rebuild.prepare(s)
     assert (folder / "chrom_processed.tsv.gz").exists() and "BROKEN but kept" in report
 
 
-def test_skill_changes_are_shown_as_a_diff(tmp_path: Path) -> None:
-    log = tmp_path / "logs"
-    rebuild.skill_changes(log, "20260101T000000Z-a", "rule one\nrule two\n")
-    assert "unchanged" in rebuild.skill_changes(log, "20260102T000000Z-b", "rule one\nrule two\n")
-    diff = rebuild.skill_changes(log, "20260103T000000Z-c", "rule one\nrule two\nchrom has no chr\n")
-    assert "+chrom has no chr" in diff and "20260102T000000Z-b" in diff
+def test_the_rebuild_check_no_longer_compares_skill_versions(tmp_path: Path) -> None:
+    s = session(tmp_path)
+    (tmp_path / s.folder_name()).mkdir()
+    report = rebuild.prepare(s)
+    assert "SKILL CHANGES" not in report and not list((tmp_path / ".build_logs").rglob("*.skill.txt"))
 
 
 def test_assessments_are_kept_across_builds_and_a_glob_assesses_a_group(tmp_path: Path) -> None:
@@ -79,14 +77,31 @@ def test_assessments_are_kept_across_builds_and_a_glob_assesses_a_group(tmp_path
         (folder / name).write_text("chrom\tpos\tref\talt\tpval\tgene\n1\t5\tA\tC\t0.1\tENSG00000000001\n")
         index[name] = {"path": f"{s.folder_name()}/{name}", "record_id": 7}
     (tmp_path / agent.INDEX_FILE).write_text(json.dumps(index))
-    rebuild.prepare(s, "P")
+    rebuild.prepare(s)
     out = s.assess_file(f"{s.folder_name()}/t.*.tsv", "qtl_nominal_all", "chrom pos ref alt pval gene", "ready",
                         pval_column="pval")
     assert out["recorded"] == 2 and not s.unassessed()
     again = session(tmp_path)
-    report = rebuild.prepare(again, "P")
+    report = rebuild.prepare(again)
     assert not again.unassessed() and "reused from earlier builds of unchanged files: 2" in report
     (folder / "t.NK.tsv").write_text("chrom\tpos\tref\talt\tpval\tgene\n1\t6\tA\tC\t0.1\tENSG00000000001\n")
     third = session(tmp_path)
-    rebuild.prepare(third, "P")
+    rebuild.prepare(third)
     assert third.unassessed() == [f"{s.folder_name()}/t.NK.tsv"]  # a changed file is assessed again
+
+
+def test_a_file_rewritten_by_add_rsid_is_neither_deleted_nor_read_again(tmp_path: Path) -> None:
+    fake_dbsnp(tmp_path)
+    s = session(tmp_path)
+    folder = tmp_path / s.folder_name()
+    folder.mkdir()
+    (folder / "a.tsv.gz").write_bytes(gzip.compress(b"x\n"))
+    (tmp_path / agent.INDEX_FILE).write_text(json.dumps({"u": {"path": f"{s.folder_name()}/a.tsv.gz", "record_id": 7}}))
+    f = folder / "good_processed.tsv.gz"
+    table().to_csv(f, sep="\t", index=False)
+    rebuild.prepare(s)                     # read to the end and checked: complete
+    table().to_csv(f, sep="\t", index=False)  # rewritten (as add_rsid does) ...
+    rebuild.mark_rsid_complete(f)          # ... and marked by it
+    report = rebuild.prepare(session(tmp_path))
+    assert f.exists() and "DELETED" not in report and "reading" not in report
+    assert rebuild.rsid_complete(f)

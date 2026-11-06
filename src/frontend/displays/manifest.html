@@ -3,10 +3,10 @@
 {% block content %}
 <div class="dq mf-page">
   <h1>Manifest papers</h1>
-  <p class="muted lede">One row per saved paper. <strong>Build status</strong> shows the latest build: running, finished, stopped or interrupted, the phase it is in or stopped in, its last step with the reason, and what a rebuild does next (Details has the full progress).
+  <p class="muted lede">One row per saved paper. <strong>Processing status</strong> shows the latest processing run: running, finished, stopped or interrupted, the phase it is in or stopped in, its last step with the reason, and what Reprocess does next (Details has the full progress).
     <strong>Data result / success</strong> shows whether data was downloaded and processed, only partial statistics were obtained,
     or access, network, tool or download-limit issues remain. Downloaded data still needs review before approval.
-    <strong>Human decision</strong> is saved separately from the AI result. “Not QTL data” excludes future builds; existing files are retained. A build already in progress is not cancelled.
+    <strong>Human decision</strong> is saved separately from the AI result. “Not QTL data” excludes it from future processing; existing files are retained. Processing already in progress is not cancelled.
     Use <strong>Details</strong> to inspect files, evidence and access instructions, or review candidate rows.</p>
 
   <div class="rec-toolbar">
@@ -15,18 +15,18 @@
       <option value="">All papers</option>
       <option value="needs">Needs you (access request / browser download / larger download)</option>
       <option value="tocheck">Has rows to review</option>
-      <option value="stopped">Build stopped early (rebuild to resume)</option>
-      <option value="unbuilt">Not built yet</option>
+      <option value="stopped">Processing stopped early (reprocess to resume)</option>
+      <option value="unbuilt">Not processed yet</option>
       <option value="sumstats">Has full summary statistics (open)</option>
     </select>
     <label class="muted mf-check" title="Species is human (Homo sapiens). Records saved by the AI and by you are both listed."><input type="checkbox" id="mf-human"> Species: human only</label>
     <span class="muted rec-count" id="mf-count"></span>
-    <button type="button" class="rec-btn primary" id="mf-build-all" title="Queue every paper the filter shows that is not built yet">Build all shown</button>
+    <button type="button" class="rec-btn primary" id="mf-build-all" title="Queue every paper the filter shows that is not processed yet">Process all shown</button>
     <a class="rec-btn primary" href="/api/manifest/export?scope=approved&fmt=manifest" title="The 27 manifest columns, approved rows only">Download approved (manifest TSV)</a>
     <a class="rec-btn" href="/api/manifest/export?scope=all&fmt=review" title="Every row with status, issues, source files and evidence">Download all with evidence</a>
   </div>
-  <div class="mf-opts" aria-label="Build settings">
-    <span class="muted">Build manifest also:</span>
+  <div class="mf-opts" aria-label="Processing settings">
+    <span class="muted">Process data also:</span>
     <label><input type="checkbox" id="mf-download" checked> downloads and processes the data, up to
       <input type="number" id="mf-maxgb" class="dq-input mf-gb" min="0" step="1" value="1000" aria-label="Gigabytes per paper"> GB per paper</label>
     <label><input type="checkbox" id="mf-supp"> opens supplementary tables <span class="muted">(usually significant hits only)</span></label>

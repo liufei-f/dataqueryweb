@@ -14,6 +14,7 @@ from __future__ import annotations
 import gzip
 import os
 import re
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -117,31 +118,124 @@ def unfilled(lookup: Lookup, chrom: pd.Series, pos: pd.Series, ref: pd.Series, a
             "examples": examples}
 
 
+CACHE_FILE = "rsid_cache.sqlite"
+OUT_LEVEL = 1  # gzip level of rewritten tables: level 9 took ~45% of add_rsid / fill_alleles time
+
+
+class Cache:
+    """Every variant already looked up in dbSNP, with its rs id ("" when dbSNP has none).
+
+    Shared by all files and papers (``data/reference/dbsnp/rsid_cache.sqlite``, next to the VCF):
+    the tables of one study repeat the same variants in every context and every phenotype, so
+    each variant is read from dbSNP once and every later table takes it from here.
+    """
+
+    def __init__(self, path: Path) -> None:
+        # Autocommit: a lookup never leaves a read transaction open. Two builds share this file;
+        # an open read snapshot made the other build's later write fail with "database is locked".
+        self.db = sqlite3.connect(path, timeout=600, check_same_thread=False, isolation_level=None)
+        self.db.execute("pragma journal_mode=wal")
+        self.db.execute("pragma synchronous=normal")
+        self.db.execute("create table if not exists v (chrom text, pos integer, ref text, alt text, rsid text, "
+                        "primary key (chrom, pos, ref, alt)) without rowid")
+
+    def close(self) -> None:
+        self.db.close()
+
+    def get(self, keys: list[tuple[str, int, str, str]]) -> dict[tuple[str, int, str, str], str]:
+        self.db.execute("create temp table if not exists q (chrom text, pos integer, ref text, alt text)")
+        self.db.execute("delete from q")
+        self.db.executemany("insert into q values (?,?,?,?)", keys)
+        return {(c, p, r, a): rs for c, p, r, a, rs in self.db.execute(
+            "select v.chrom, v.pos, v.ref, v.alt, v.rsid from q join v using (chrom, pos, ref, alt)")}
+
+    def put(self, found: dict[tuple[str, int, str, str], str]) -> None:
+        # BEGIN IMMEDIATE takes the write lock first, so a second writer waits (busy timeout)
+        # instead of failing on a stale snapshot.
+        self.db.execute("begin immediate")
+        try:
+            self.db.executemany("insert or replace into v values (?,?,?,?,?)",
+                                [(*k, v) for k, v in found.items()])
+            self.db.execute("commit")
+        except BaseException:
+            self.db.execute("rollback")
+            raise
+
+
+def cache_path(data_root: Path) -> Path:
+    return vcf_path(data_root).with_name(CACHE_FILE)
+
+
+def _keys(chrom: pd.Series, pos: pd.Series, ref: pd.Series, alt: pd.Series) -> pd.DataFrame:
+    return pd.DataFrame({"chrom": chrom.astype(str).str.strip().str.replace(r"(?i)^chr", "", regex=True),
+                         "pos": pd.to_numeric(pos, errors="coerce"),
+                         "ref": ref.astype(str).str.strip().str.upper(),
+                         "alt": alt.astype(str).str.strip().str.upper()})
+
+
+def cached_rsids(lookup: Lookup, cache: Cache | None, chrom: pd.Series, pos: pd.Series, ref: pd.Series,
+                 alt: pd.Series) -> tuple[pd.Series, dict[str, int]]:
+    """An rs id per row like ``Lookup.rsids``, reading each distinct variant from the cache when it
+    is there and from dbSNP (then stored in the cache) when it is not."""
+    df = _keys(chrom, pos, ref, alt)
+    ok = df.dropna(subset=["pos"]).astype({"pos": int})
+    uniq = list(dict.fromkeys(zip(ok["chrom"], ok["pos"], ok["ref"], ok["alt"], strict=True)))
+    cache_error = ""
+    try:
+        known = cache.get(uniq) if cache is not None and uniq else {}
+    except sqlite3.Error as exc:  # the cache only saves time: never fail add_rsid because of it
+        known, cache_error = {}, f"{type(exc).__name__}: {exc}"
+    miss = [k for k in uniq if k not in known]
+    if miss:
+        m = pd.DataFrame(miss, columns=["chrom", "pos", "ref", "alt"])
+        fresh = dict(zip(miss, lookup.rsids(m["chrom"], m["pos"], m["ref"], m["alt"]), strict=True))
+        if cache is not None and not cache_error:
+            try:
+                cache.put(fresh)
+            except sqlite3.Error as exc:
+                cache_error = f"{type(exc).__name__}: {exc}"
+        known |= fresh
+    out = pd.Series("", index=df.index, dtype=object)
+    out[ok.index] = [known.get(k, "") for k in zip(ok["chrom"], ok["pos"], ok["ref"], ok["alt"], strict=True)]
+    return out, {"variants": len(uniq), "from_cache": len(uniq) - len(miss), "from_dbsnp": len(miss),
+                 "cache_errors": int(bool(cache_error))}
+
+
 def annotate(path: Path, lookup: Lookup, columns: dict[str, str], rsid_col: str = "rsid",
-             step: Callable[[str], None] = lambda _: None) -> dict[str, Any]:
+             step: Callable[[str], None] = lambda _: None, cache: Cache | None = None) -> dict[str, Any]:
     """Write ``rsid_col`` into a tab-separated .tsv.gz table in place; returns the counts.
 
-    An rs id the table already holds is kept; only empty ones are filled from dbSNP.
+    An rs id the table already holds is kept; only empty ones are filled from dbSNP, each distinct
+    variant once (through ``cache`` when given, so other tables of the study reuse it).
     """
     tmp = path.with_name(path.name + ".rsid.tmp")
     rows = matched = 0
+    stats = {"variants": 0, "from_cache": 0, "from_dbsnp": 0, "cache_errors": 0}
     first = True
-    with gzip.open(tmp, "wt") as out:
+    with gzip.open(tmp, "wt", compresslevel=OUT_LEVEL) as out:
         for df in pd.read_csv(path, sep="\t", dtype=str, chunksize=CHUNK_ROWS, keep_default_na=False):
-            found = lookup.rsids(df[columns["chrom_col"]], df[columns["position_col"]],
-                                 df[columns["ref_col"]], df[columns["alt_col"]])
-            if rsid_col in df.columns:
-                have = df[rsid_col].where(df[rsid_col].str.fullmatch(r"rs\d+").fillna(False), "")
-                found = have.where(have != "", found)
-            df[rsid_col] = found
+            have = (df[rsid_col].where(df[rsid_col].str.fullmatch(r"rs\d+").fillna(False), "")
+                    if rsid_col in df.columns else pd.Series("", index=df.index, dtype=object))
+            need = df.index[have == ""]
+            if len(need):
+                found, st = cached_rsids(lookup, cache, df.loc[need, columns["chrom_col"]],
+                                         df.loc[need, columns["position_col"]], df.loc[need, columns["ref_col"]],
+                                         df.loc[need, columns["alt_col"]])
+                have.loc[need] = found
+                for k, v in st.items():
+                    stats[k] += v
+            df[rsid_col] = have
             rows += len(df)
             matched += int((df[rsid_col] != "").sum())
             df.to_csv(out, sep="\t", index=False, header=first)
             first = False
-            step(f"rs ids: {rows:,} rows, {matched:,} found")
+            step(f"rs ids: {rows:,} rows, {matched:,} found ({stats['from_cache']:,} variants from the cache, "
+                 f"{stats['from_dbsnp']:,} from dbSNP"
+                 + (f"; cache unavailable in {stats['cache_errors']} chunk(s), read dbSNP directly" if stats["cache_errors"] else "")
+                 + ")")
     tmp.replace(path)
     return {"rows": rows, "with_rsid": matched, "share": round(matched / rows, 4) if rows else 0.0,
-            "rsid_col": rsid_col}
+            "rsid_col": rsid_col, **stats}
 
 
 SNV = re.compile(r"[ACGT]")
@@ -149,6 +243,8 @@ SNV = re.compile(r"[ACGT]")
 
 class AlleleLookup(Lookup):
     """The other allele of a biallelic SNV, from the dbSNP records at a GRCh38 position."""
+
+    REASONS = ("filled", "multiallelic", "allele_not_in_dbsnp", "not_in_dbsnp")
 
     def _alleles(self, contig: str, positions: list[int]) -> dict[int, list[tuple[str, set[str]]]]:
         """pos → [(rs id, {single-base alleles of that record})] for these sorted positions."""
@@ -183,35 +279,56 @@ class AlleleLookup(Lookup):
                            "known": known.astype(str).str.strip().str.upper(),
                            "rsid": rsid.astype(str).str.strip() if rsid is not None else ""})
         out = pd.Series("", index=df.index, dtype=object)
-        why = {"filled": 0, "multiallelic": 0, "allele_not_in_dbsnp": 0, "not_in_dbsnp": 0}
+        reason = pd.Series("not_in_dbsnp", index=df.index, dtype=object)
         for c, part in df.dropna(subset=["pos"]).groupby("chrom"):
             contig = self.contigs.get(str(c))
             if not contig:
-                why["not_in_dbsnp"] += len(part)
                 continue
             p = part["pos"].astype(int)
             found = self._alleles(contig, sorted(set(p)))
-            vals = []
+            vals, why_row = [], []
             for q, a, rs in zip(p, part["known"], part["rsid"], strict=True):
                 recs = found.get(q, [])
                 if rs.startswith("rs") and any(r[0] == rs for r in recs):
                     recs = [r for r in recs if r[0] == rs]
                 alleles = set().union(*(r[1] for r in recs)) if recs else set()
                 if not alleles:
-                    why["not_in_dbsnp"] += 1
+                    why_row.append("not_in_dbsnp")
                     vals.append("")
                 elif a not in alleles:
-                    why["allele_not_in_dbsnp"] += 1
+                    why_row.append("allele_not_in_dbsnp")
                     vals.append("")
                 elif len(alleles) != 2:
-                    why["multiallelic"] += 1
+                    why_row.append("multiallelic")
                     vals.append("")
                 else:
-                    why["filled"] += 1
+                    why_row.append("filled")
                     vals.append(next(iter(alleles - {a})))
             out[part.index] = vals
-        why["not_in_dbsnp"] += int(df["pos"].isna().sum())
+            reason[part.index] = why_row
+        self.last_reasons = reason  # per row, for callers that look up distinct variants only
+        why = {k: int((reason == k).sum()) for k in ("filled", "multiallelic", "allele_not_in_dbsnp", "not_in_dbsnp")}
         return out, why
+
+
+def distinct_other_alleles(lookup: Any, chrom: pd.Series, pos: pd.Series, known: pd.Series,
+                           rsid: pd.Series | None) -> tuple[pd.Series, dict[str, int]]:
+    """``lookup.other_alleles`` for each distinct (chrom, pos, allele, rs id) once, spread back over
+    the rows. A QTL table repeats every variant for each phenotype; the per-row result and counts
+    are the same as asking row by row."""
+    keys = pd.DataFrame({"c": chrom.astype(str), "p": pos.astype(str), "k": known.astype(str),
+                         "r": rsid.astype(str) if rsid is not None else ""}, index=chrom.index)
+    uniq = keys.drop_duplicates()
+    other_u, _ = lookup.other_alleles(uniq["c"], uniq["p"], uniq["k"], uniq["r"] if rsid is not None else None)
+    table = uniq.assign(other=other_u.to_numpy(), why=lookup.last_reasons.to_numpy())
+    rows = keys.reset_index().merge(table, on=["c", "p", "k", "r"], how="left").set_index("index").reindex(keys.index)
+    counts = rows["why"].value_counts()
+    return rows["other"].fillna(""), {k: int(counts.get(k, 0)) for k in _in_order(lookup)}
+
+
+def _in_order(lookup: Any) -> tuple[str, ...]:
+    """The reason names a lookup reports, in its own order."""
+    return tuple(lookup.REASONS)
 
 
 def fill_alleles(path: Path, lookup: Any, columns: dict[str, str],
@@ -229,15 +346,16 @@ def fill_alleles(path: Path, lookup: Any, columns: dict[str, str],
     vid_c, rs_c = columns.get("variant_id_col") or "", columns.get("rsid_col") or ""
     total = {"rows": 0, "had_ref": 0, "filled": 0, "multiallelic": 0}
     first = True
-    with gzip.open(tmp, "wt") as out:
+    with gzip.open(tmp, "wt", compresslevel=OUT_LEVEL) as out:
         for df in pd.read_csv(path, sep="\t", dtype=str, chunksize=CHUNK_ROWS, keep_default_na=False):
             if ref_c not in df.columns:
                 df[ref_c] = ""
             have = df[ref_c].str.strip().str.upper().str.fullmatch(r"[ACGT]").fillna(False)
             need = df.index[~have]
             if len(need):
-                other, why = lookup.other_alleles(df.loc[need, chrom_c], df.loc[need, pos_c], df.loc[need, alt_c],
-                                                  df.loc[need, rs_c] if rs_c and rs_c in df.columns else None)
+                other, why = distinct_other_alleles(
+                    lookup, df.loc[need, chrom_c], df.loc[need, pos_c], df.loc[need, alt_c],
+                    df.loc[need, rs_c] if rs_c and rs_c in df.columns else None)
                 df.loc[need, ref_c] = other
                 for k, v in why.items():
                     total[k] = total.get(k, 0) + v

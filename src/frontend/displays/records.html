@@ -1,7 +1,7 @@
 {% extends "layout.html" %}
 {% block title %}Saved records — DataQuery{% endblock %}
 {% block content %}
-<div class="dq">
+<div class="dq mf-page">
   <h1>Saved records</h1>
   <p class="muted lede">Data locations you saved on the Find QTL data page, plus those the AI saved automatically
     because it was very sure (marked <strong>🤖 auto-saved</strong> — spot-check them and <strong>Confirm</strong>, or delete).
@@ -21,20 +21,19 @@
     <a class="rec-btn" href="/api/records/export?fmt=csv">Download CSV</a>
   </div>
 
-  <div class="dq-paper">
-    <div class="table-wrap">
-      <table class="rec-table">
-        <colgroup>
-          <col style="width:4%"><col style="width:25%"><col style="width:10%"><col style="width:12%">
-          <col style="width:22%"><col style="width:9%"><col style="width:15%"><col style="width:3%">
-        </colgroup>
-        <thead>
-          <tr><th>#</th><th>Publication</th><th>QTL type</th><th>Context / species</th>
-              <th>Download location</th><th>Access</th><th>Curator note</th><th></th></tr>
-        </thead>
-        <tbody id="rec-body"><tr><td colspan="8" class="rec-empty">Loading…</td></tr></tbody>
-      </table>
-    </div>
+  <p class="muted mf-overview-note">One row per saved paper; every download location saved for it is listed in the row.</p>
+  <div class="table-wrap mf-overview-wrap">
+    <table class="rec-table mf-overview" aria-label="Saved records">
+      <colgroup>
+        <col style="width:6%"><col style="width:23%"><col style="width:8%"><col style="width:13%">
+        <col style="width:20%"><col style="width:10%"><col style="width:13%"><col style="width:7%">
+      </colgroup>
+      <thead>
+        <tr><th>Paper index</th><th>Paper / URL</th><th>QTL type(s)</th><th>Context / species</th>
+            <th>Download locations</th><th>Access / saved</th><th>Curator note</th><th>Actions</th></tr>
+      </thead>
+      <tbody id="rec-body"><tr><td colspan="8" class="rec-empty">Loading…</td></tr></tbody>
+    </table>
   </div>
   <p class="muted rec-path">Stored in <code>{{ db_path }}</code></p>
 </div>

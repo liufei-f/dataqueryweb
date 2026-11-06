@@ -177,6 +177,8 @@ def test_the_model_downloads_processes_validates_and_submits(tmp_path: Path, ser
     bad_quote = row | {"evidence": row["evidence"] | {"biocontext": {"quote": "a sentence nobody wrote anywhere"}}}
     judge = Script([
         [("read_paper", {"query": "donors"})],
+        [("read_skill", {"name": n}) for n in ("table-identity", "processing-cookbook", "manifest-columns", "facts",
+                                               "add-rsid")],
         [("download", {"dataset": "BrainSeq", "urls": ["https://zenodo.org/f/eqtl.tsv.gz"]})],
         [("run_python", {"dataset": "BrainSeq", "code": SPLIT, "purpose": "too early: nothing assessed yet"})],
         [("assess_file", {"path": "brainseq/eqtl.tsv.gz", "contents": "qtl_nominal_all", "description": "x",
@@ -204,7 +206,7 @@ def test_the_model_downloads_processes_validates_and_submits(tmp_path: Path, ser
     assert any("waits until every downloaded file is checked" in t for t in told)  # processing before assess_file
     assert any("inspect_local 'brainseq/eqtl.tsv.gz' first" in t for t in told)  # assess before inspect
     assert out["assessments"]["brainseq/eqtl.tsv.gz"]["format_check"]["kind"] == "table"
-    assert "PROCEDURE (SKILL.md)" in judge.system and "Phase 7: Submit" in judge.system
+    assert "PROCEDURE (SKILL.md)" in judge.system and "Step 6: Check and write the manifest" in judge.system
     [r] = out["rows"]
     assert r["row"]["file_path"] == "brainseq/eqtl_processed.tsv.gz" and r["row"]["chrom_col"] == "chrom"
     assert r["evidence"]["data"]["status"] == "processed" and r["evidence"]["file_path"]["verified"]
@@ -225,8 +227,8 @@ def test_the_skill_drops_its_front_matter_and_names_every_tool(tmp_path: Path) -
     f = tmp_path / "SKILL.md"
     f.write_text("---\nname: x\ndescription: y\n---\n\n# Steps\n1. read_paper\n")
     assert agent.skill(f) == "PROCEDURE (SKILL.md)\n\n# Steps\n1. read_paper"
-    text = agent.skill()
-    assert "description:" not in text
+    assert "description:" not in agent.skill()
+    text = agent.procedure_all()  # the core and its modules together
     assert all(t["name"] in text for t in agent.TOOLS)
     with pytest.raises(FileNotFoundError, match="MANIFEST_SKILL"):
         agent.skill(tmp_path / "missing.md")
@@ -464,3 +466,294 @@ def test_fill_positions_needs_an_assessed_study_map(tmp_path: Path) -> None:
     out = s.fill_positions("x/eqtl_processed.tsv.gz", {"rsid_col": "rsid", "chrom_col": "chrom", "position_col": "pos"},
                            "x/dbsnp.vcf.gz", {"chrom": "c", "pos": "p", "id": "i", "allele1": "a", "allele2": "b"})
     assert "must be a downloaded file you assessed with contents variant_map" in out["error"]
+
+
+def test_add_rsid_reads_each_variant_from_dbsnp_once_and_reuses_it(tmp_path: Path) -> None:
+    fake_dbsnp(tmp_path)  # rs1 1:10177 A/C,G; rs2 1:10352 G/T
+    lookup = dbsnp.Lookup(dbsnp.vcf_path(tmp_path))
+    cache = dbsnp.Cache(dbsnp.cache_path(tmp_path))
+    cols = {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt"}
+    table = pd.DataFrame({"chrom": ["1", "1", "1", "1"], "pos": ["10177", "10177", "10352", "999"],
+                          "ref": ["A", "A", "T", "C"], "alt": ["C", "C", "G", "G"], "gene": ["g1", "g2", "g1", "g1"]})
+    for name in ("a_processed.tsv.gz", "b_processed.tsv.gz"):
+        table.to_csv(tmp_path / name, sep="\t", index=False)
+    first = dbsnp.annotate(tmp_path / "a_processed.tsv.gz", lookup, cols, cache=cache)
+    assert (first["variants"], first["from_dbsnp"], first["with_rsid"]) == (3, 3, 3)
+
+    def no_dbsnp(*a, **k):
+        raise AssertionError("must come from the cache")
+    lookup.rsids = no_dbsnp
+    second = dbsnp.annotate(tmp_path / "b_processed.tsv.gz", lookup, cols, cache=cache)
+    assert (second["from_cache"], second["from_dbsnp"]) == (3, 0)
+    out = pd.read_csv(tmp_path / "b_processed.tsv.gz", sep="\t", dtype=str, keep_default_na=False)
+    assert out["rsid"].tolist() == ["rs1", "rs1", "rs2", ""]  # "not in dbSNP" is cached too
+    cache.close()
+
+
+def test_two_builds_can_share_the_rsid_cache(tmp_path: Path) -> None:
+    path = tmp_path / "cache.sqlite"
+    a, b = dbsnp.Cache(path), dbsnp.Cache(path)
+    k1, k2 = ("1", 10177, "A", "C"), ("1", 10352, "T", "G")
+    assert a.get([k1, k2]) == {}  # a looks up first (this used to leave a read snapshot open)
+    b.put({k2: "rs2"})            # then the other build writes
+    a.put({k1: "rs1"})            # and a's own write must still go through
+    assert dbsnp.Cache(path).get([k1, k2]) == {k1: "rs1", k2: "rs2"}
+
+
+def test_add_rsid_goes_on_without_the_cache_when_it_fails(tmp_path: Path) -> None:
+    import sqlite3
+
+    fake_dbsnp(tmp_path)
+    lookup = dbsnp.Lookup(dbsnp.vcf_path(tmp_path))
+    cache = dbsnp.Cache(tmp_path / "c.sqlite")
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    cache.get = locked
+    f = tmp_path / "a_processed.tsv.gz"
+    pd.DataFrame({"chrom": ["1"], "pos": ["10177"], "ref": ["A"], "alt": ["C"]}).to_csv(f, sep="\t", index=False)
+    res = dbsnp.annotate(f, lookup, {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt"},
+                         cache=cache)
+    assert res["with_rsid"] == 1 and res["cache_errors"] == 1
+
+
+# ── procedure modules: read before acting, never improvised ─────────────────
+
+EVENTS = {t["name"] for t in agent.TOOLS} | {"assess_variant_map", "process", "note_manual", "submit_non_full",
+                                              "submit_empty", "start_with_history"}
+
+
+def test_every_module_names_known_actions_and_the_core_lists_every_module() -> None:
+    mods = agent.modules()
+    assert {"resume-rebuild", "table-identity", "processing-cookbook", "variant-maps", "liftover", "add-rsid",
+            "manifest-columns", "facts", "full-vs-nonfull", "access"} <= set(mods)
+    core = agent.skill()
+    for name, m in mods.items():
+        assert m["when"] and m["text"] and set(m["required_before"]) <= EVENTS, name  # a typo would disable a gate
+        assert f"`{name}`" in core, name  # the core's module table tells the model when to read it
+
+
+def test_an_action_is_refused_until_its_module_is_read_and_the_refusal_carries_it(tmp_path: Path) -> None:
+    s = session(tmp_path)
+    cases = [("fill_alleles", {}, {"variant-maps"}),
+             ("liftover", {}, {"liftover"}),
+             ("add_rsid", {}, {"add-rsid"}),
+             ("assess_file", {"contents": "variant_map"}, {"table-identity"}),  # variant-maps already read above
+             ("run_python", {"code": "open('a_processed.tsv.gz', 'w')"}, {"processing-cookbook"}),
+             ("note_location", {"status": "manual"}, {"access"}),
+             ("submit", {"rows": [{"scope": "non_full"}]}, {"manifest-columns", "facts", "full-vs-nonfull"})]
+    for tool, args, want in cases:
+        out = s.module_gate(tool, args)
+        assert out is not None and set(out["procedure_module"]) == want, (tool, out and out["procedure_module"])
+        assert "refused" in out and all(f"=== MODULE {n} ===" in out["text"] for n in want)
+        assert s.module_gate(tool, args) is None  # read now: the same call goes through
+    fresh = session(tmp_path)
+    assert fresh.module_gate("run_python", {"code": "print(open('a.tsv').readline())"}) is None  # read-only code
+    assert fresh.module_gate("note_location", {"status": "listed"}) is None
+    assert set(fresh.module_gate("submit", {"rows": []})["procedure_module"]) == {"manifest-columns", "facts",
+                                                                                 "full-vs-nonfull"}
+
+
+def test_read_skill_gives_the_module_and_names_the_others_on_a_wrong_name(tmp_path: Path) -> None:
+    s = session(tmp_path)
+    out = s.read_skill("liftover")
+    assert out["procedure_module"] == ["liftover"] and "hg19ToHg38" in out["text"] and "liftover" in s.modules_read
+    assert s.module_gate("liftover", {}) is None
+    bad = s.read_skill("lift")
+    assert "no module 'lift'" in bad["error"] and "variant-maps —" in bad["error"]
+
+
+def test_a_module_in_the_conversation_is_never_cut() -> None:
+    module = json.dumps(agent.module_payload(["liftover"], agent.modules(), ""))
+    other = json.dumps({"x": "y" * 5000})
+    messages = [{"role": "tool", "content": module}, {"role": "tool", "content": other}] + \
+               [{"role": "tool", "content": "z"} for _ in range(agent.KEEP_FULL)]
+    agent.prune(messages)
+    assert messages[0]["content"] == module and "[cut;" in messages[1]["content"]
+
+
+def test_a_paper_processed_before_starts_with_the_resume_module_and_its_notes(tmp_path: Path, monkeypatch) -> None:
+    s = session(tmp_path)
+    s.rebuild_report = "SKILL CHANGES: ..."
+    monkeypatch.setattr(agent, "paper_note", lambda rid: "- the study's map is SNPinfo" if rid == 7 else "")
+    text = agent.first_message(s, [])
+    assert "PROCEDURE MODULE resume-rebuild" in text and "resume-rebuild" in s.modules_read
+    assert "NOTES FOR THIS PAPER" in text and "the study's map is SNPinfo" in text
+    assert "PROCEDURE MODULE resume-rebuild" not in agent.first_message(session(tmp_path), [])  # first build
+
+
+def test_a_file_gets_two_processing_attempts_then_it_is_reported(tmp_path: Path) -> None:
+    s = session(tmp_path)
+    (tmp_path / "x").mkdir()
+    (tmp_path / "x" / "t_processed.tsv").write_text("chrom\tpos\tref\talt\tvariant_id\tp\tgene\nchr1\t5\tA\tC\tchr1_5_A_C\t0.1\tENSG00000000001\n")
+    cols = {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt", "pval_col": "p",
+            "phenotype_id_col": "gene", "variant_id_col": "variant_id"}
+    first = s.validate("x/t_processed.tsv", "\\t", "eQTL", cols, "self")
+    assert not first["ok"] and first["attempt"] == "1 of 2" and "validate again" in first["next"]
+    second = s.validate("x/t_processed.tsv", "\\t", "eQTL", cols, "self")
+    assert second["attempt"] == "2 of 2" and "skipped_tables" in second["next"]
+    third = s.validate("x/t_processed.tsv", "\\t", "eQTL", cols, "self")
+    assert "failed validate 2 times" in third["refused"] and "'chr' prefix" in third["problems"]
+
+
+def test_when_no_table_can_be_converted_the_model_is_told_to_stop_and_report(tmp_path: Path) -> None:
+    s = session(tmp_path)
+    s.assessments = {"a": {"contents": "qtl_nominal_all", "processable": "no"},
+                     "b": {"contents": "readme", "processable": "no"}}
+    assert "stop and report" in s.after_assessments([])
+    s.assessments["c"] = {"contents": "qtl_nominal_all", "processable": "yes"}
+    assert "write the processing code" in s.after_assessments([])
+    assert s.after_assessments(["d"]) == "assess the remaining files"
+
+
+def test_each_step_lists_the_modules_it_may_need() -> None:
+    import re
+
+    core, mods = agent.skill(), agent.modules()
+    steps = re.split(r"(?m)^## Step \d", core)[1:]
+    assert len(steps) == 6
+    named = set()
+    for i, text in enumerate(steps, 1):
+        block = text.split("**Modules for this step", 1)
+        assert len(block) == 2, f"step {i} has no module list"
+        listed = set(re.findall(r"^- `([a-z-]+)`", block[1].split("\n\n", 1)[0], re.M))  # the list ends at a blank line
+        assert listed and listed <= set(mods), (i, listed - set(mods))
+        named |= listed
+    assert named == set(mods)  # every module is named by the step that may need it
+
+
+def _xlsx(path: Path, rows: list[list[str]], name: str = "ST12") -> None:
+    import zipfile as zf
+
+    strings = sorted({c for r in rows for c in r})
+    idx = {v: i for i, v in enumerate(strings)}
+    cells = "".join(f'<row r="{n}">' + "".join(f'<c r="{chr(65 + j)}{n}" t="s"><v>{idx[c]}</v></c>' for j, c in enumerate(r))
+                    + "</row>" for n, r in enumerate(rows, 1))
+    with zf.ZipFile(path, "w") as z:
+        z.writestr("xl/workbook.xml", f'<workbook><sheets><sheet name="{name}" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        z.writestr("xl/_rels/workbook.xml.rels", '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/>'
+                   "</Relationships>")
+        z.writestr("xl/sharedStrings.xml", "<sst>" + "".join(f"<si><t>{v}</t></si>" for v in strings) + "</sst>")
+        z.writestr("xl/worksheets/sheet1.xml", f"<worksheet><sheetData>{cells}</sheetData></worksheet>")
+
+
+def test_read_table_rows_count_as_evidence_and_run_python_output_does_not(tmp_path: Path) -> None:
+    s = session(tmp_path)
+    (tmp_path / "x").mkdir()
+    _xlsx(tmp_path / "x" / "supp.xlsx", [["QTL", "cell_type", "n_samples"], ["eQTL", "l1.B", "1103"],
+                                         ["caQTL", "l1.B", "1087"], ["eQTL", "l1.NK", "1101"]])
+    assert s.read_table("x/supp.xlsx")["sheets"] == ["ST12"]
+    out = s.read_table("x/supp.xlsx", sheet="ST12", find=r"caQTL\tl1\.B")
+    assert out["rows"] == [["caQTL", "l1.B", "1087"]] and out["matched"] == 1
+    assert rules.verify_quote("caQTL l1.B 1087", s.texts).startswith("table x/supp.xlsx sheet ST12")
+    s.run_python("x", "print('caQTL l1.B 9999 donors')", "made-up output")
+    assert rules.verify_quote("caQTL l1.B 9999 donors", s.texts) == ""  # printed by own code: not evidence
+    (tmp_path / "x" / "t.tsv.gz").write_bytes(gzip.compress(b"a\tb\n1\tx\n2\ty\n"))
+    assert s.read_table("x/t.tsv.gz", find="y")["rows"] == [["2", "y"]]
+
+
+def test_an_rsid_only_failure_is_not_an_attempt_and_paths_cannot_dodge_the_limit(tmp_path: Path) -> None:
+    fake_dbsnp(tmp_path)
+    s = session(tmp_path)
+    (tmp_path / "x").mkdir()
+    f = tmp_path / "x" / "t_processed.tsv"
+    f.write_text("chrom\tpos\tref\talt\tvariant_id\tp\tgene\trsid\n1\t10177\tA\tC\tchr1_10177_A_C\t0.1\tENSG00000000001\t\n")
+    cols = {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt", "pval_col": "p",
+            "phenotype_id_col": "gene", "variant_id_col": "variant_id", "rsid_col": "rsid"}
+    out = s.validate("x/t_processed.tsv", "\\t", "eQTL", cols, "self")
+    assert not out["ok"] and "not counted" in out["next"] and "attempt" not in out
+    f.write_text("chrom\tpos\tref\talt\tvariant_id\tp\tgene\trsid\nchr1\t10177\tA\tC\tchr1_10177_A_C\t0.1\tENSG00000000001\trs1\n")
+    s.validate("x/t_processed.tsv", "\\t", "eQTL", cols, "self")
+    second = s.validate("x/t_*.tsv", "\\t", "eQTL", cols, "self")  # another way of naming the same file
+    assert second["attempt"] == "2 of 2"
+    assert "refused" in s.validate("x/t_processed.tsv", "\\t", "eQTL", cols, "self")
+
+
+def test_add_rsid_skips_files_whose_rs_ids_are_already_complete(tmp_path: Path) -> None:
+    from dataqueryweb import rebuild
+
+    fake_dbsnp(tmp_path)
+    s = session(tmp_path)
+    (tmp_path / "x").mkdir()
+    for name in ("a_processed.tsv.gz", "b_processed.tsv.gz"):
+        pd.DataFrame({"chrom": ["1"], "pos": ["10177"], "ref": ["A"], "alt": ["C"]}).to_csv(tmp_path / "x" / name,
+                                                                                           sep="\t", index=False)
+    rebuild.mark_rsid_complete(tmp_path / "x" / "a_processed.tsv.gz")
+    cols = {"chrom_col": "chrom", "position_col": "pos", "ref_col": "ref", "alt_col": "alt"}
+    out = s.add_rsid("x/*_processed.tsv.gz", cols)
+    assert out["skipped_complete"] == ["a_processed.tsv.gz"] and out["rows"] == 1  # only b was rewritten
+    again = s.add_rsid("x/*_processed.tsv.gz", cols)
+    assert sorted(again["skipped_complete"]) == ["a_processed.tsv.gz", "b_processed.tsv.gz"] and again["rows"] == 0
+    pd.DataFrame({"chrom": ["1"], "pos": ["10177"], "ref": ["A"], "alt": ["C"]}).to_csv(tmp_path / "x" / "b_processed.tsv.gz",
+                                                                                       sep="\t", index=False)
+    assert not rebuild.rsid_complete(tmp_path / "x" / "b_processed.tsv.gz")  # rewritten since: checked again
+
+
+def test_a_run_that_cannot_reach_the_llm_records_where_and_why_it_stopped(tmp_path: Path) -> None:
+    from dataqueryweb import llm, progress
+
+    class Down:
+        async def chat_tools(self, *a, **k):
+            raise llm.LLMFailed("gpt: ConnectError")
+
+    usage = {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+    out = asyncio.run(agent.run(RECORD, Down(), root=tmp_path, max_bytes=1e9, target=rules.Target(level_1=["Brain"]),
+                                paper=PAPER, step=lambda _: None, cancel=threading.Event(), usage=usage))
+    stop = progress.parse(Path(out["audit_path"]))["stop"]
+    assert stop["outcome"] == "llm_failed" and "ConnectError" in stop["reason"] and stop["step_name"] == "not started"
+
+
+def test_a_stopped_run_records_that_a_person_stopped_it(tmp_path: Path) -> None:
+    from dataqueryweb import progress
+
+    cancel = threading.Event()
+    cancel.set()
+    usage = {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+    with pytest.raises(fetch.Cancelled):
+        asyncio.run(agent.run(RECORD, Script([]), root=tmp_path, max_bytes=1e9, target=rules.Target(level_1=["Brain"]),
+                              paper=PAPER, step=lambda _: None, cancel=cancel, usage=usage))
+    logfile = next((tmp_path / ".build_logs" / str(RECORD["record_id"])).glob("*.md"))
+    stop = progress.parse(logfile)["stop"]
+    assert stop["outcome"] == "stopped" and "stopped by a person" in stop["reason"]
+    assert progress.summary(tmp_path, RECORD["record_id"])["state"] == "stopped"
+
+
+def test_a_run_stopped_while_a_tool_runs_records_that_tool_and_its_step(tmp_path: Path, monkeypatch) -> None:
+    from dataqueryweb import progress
+
+    real = agent.dispatch
+
+    async def stop_during_add_rsid(s, name, args):
+        if name == "add_rsid":
+            raise fetch.Cancelled()  # the Stop button, while add_rsid is still running
+        return await real(s, name, args)
+    monkeypatch.setattr(agent, "dispatch", stop_during_add_rsid)
+    judge = Script([[("read_paper", {"query": "donors"})], [("read_skill", {"name": "add-rsid"})],
+                    [("add_rsid", {"file_path": "x/a_processed.tsv.gz", "columns": {}})]])
+    usage = {"total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0, "calls": 0}
+    with pytest.raises(fetch.Cancelled):
+        asyncio.run(agent.run(RECORD, judge, root=tmp_path, max_bytes=1e9, target=rules.Target(level_1=["Brain"]),
+                              paper=PAPER, step=lambda _: None, cancel=threading.Event(), usage=usage))
+    stop = progress.parse(next((tmp_path / ".build_logs" / str(RECORD["record_id"])).glob("*.md")))["stop"]
+    assert (stop["outcome"], stop["step"], stop["last_tool"]) == ("stopped", "5", "add_rsid")
+    assert "while add_rsid was running" in stop["reason"]
+
+
+def test_a_readme_judged_not_processable_is_not_a_failed_file(tmp_path: Path) -> None:
+    from dataqueryweb import details
+
+    rec = RECORD | {"record_code": "Paper_2026_x"}
+    folder = tmp_path / "Paper_2026_x"
+    folder.mkdir()
+    (folder / "README.md").write_text("about the data")
+    (folder / "sig.tsv").write_text("a\tb\n")
+    (tmp_path / ".build_logs" / "7").mkdir(parents=True)
+    stamp = lambda f: {"size": f.stat().st_size, "mtime": f.stat().st_mtime_ns}  # noqa: E731
+    (tmp_path / ".build_logs" / "7" / "assessments.json").write_text(json.dumps({
+        "Paper_2026_x/README.md": {**stamp(folder / "README.md"), "assessment": {"contents": "readme", "processable": "no",
+                                                                               "reason": "documentation"}},
+        "Paper_2026_x/sig.tsv": {**stamp(folder / "sig.tsv"), "assessment": {"contents": "qtl_significant_only",
+                                                                            "processable": "no", "reason": "no p-value"}}}))
+    out = {f["name"]: f for f in details.files(tmp_path, rec, [])["files"]}
+    assert out["README.md"]["failed"] is None and out["README.md"]["stages"][1]["status"] == "skipped"
+    assert out["sig.tsv"]["failed"] == {"stage": "assessed", "reason": "qtl_significant_only, processable no: no p-value"}

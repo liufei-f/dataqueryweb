@@ -24,9 +24,8 @@
 
 **重新 build 时的程序检查（`rebuild.py`，LLM 第一步之前）**，结果放在给 LLM 的第一条消息开头：
 
-1. **skill 变动**：每次 build 用的 skill 全文存在 `data/.build_logs/<record_id>/<run_id>.skill.txt`；和上一次 build 的副本做 diff 给 LLM 看。没有旧副本时说明"所有规则都可能是新的"。
-2. **已下载文件**：每个下载的文件由程序先跑一遍 `inspect_local` 的格式检查；以前 build 对**未改动**文件（大小、修改时间不变）的 `assess_file` 判断从 `data/.build_logs/<record_id>/assessments.json` 复用；`assess_file` 可以用 glob 一次判断表头相同的一组文件。
-3. **已处理文件**（`*_processed.tsv(.gz)`）：每个文件**完整解压读到结尾**（中断写入会留下截断的 gzip），结果按大小和修改时间缓存在 `<论文文件夹>/.processed_checks.json`；再用前 2 万行检查目标格式（标准列 chrom/pos/ref/alt/variant_id，chrom 为 1–22、不带 `chr`，variant id `chr<chrom>_<pos>_<ref>_<alt>`，caQTL peak `chr<chrom>_<start>_<end>`）和 rsID（dbSNP 有的必须填）。
+1. **已下载文件**：每个下载的文件由程序先跑一遍 `inspect_local` 的格式检查；以前 build 对**未改动**文件（大小、修改时间不变）的 `assess_file` 判断从 `data/.build_logs/<record_id>/assessments.json` 复用；`assess_file` 可以用 glob 一次判断表头相同的一组文件。
+2. **已处理文件**（`*_processed.tsv(.gz)`）：每个文件**完整解压读到结尾**（中断写入会留下截断的 gzip），结果按大小和修改时间缓存在 `<论文文件夹>/.processed_checks.json`；再用前 2 万行检查目标格式（标准列 chrom/pos/ref/alt/variant_id，chrom 为 1–22、不带 `chr`，variant id `chr<chrom>_<pos>_<ref>_<alt>`，caQTL peak `chr<chrom>_<start>_<end>`）和 rsID（dbSNP 有的必须填）。
    - 截断、读不了、格式不对 → **程序直接删除**，LLM 必须从源文件重新处理成目标格式（论文文件夹里没有下载的源文件时不删，只报告）；
    - 只缺 rsID → 保留，要求跑 `add_rsid`，不重新处理；
    - 格式正确 → 保留复用，提交前仍要 `validate`。

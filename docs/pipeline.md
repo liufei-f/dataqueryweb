@@ -21,7 +21,7 @@ flowchart LR
   A[搜索 / 输入 DOI] --> B[读论文<br/>finder + extract]
   B --> C[AI 判定<br/>llm + rubric]
   C --> D[保存记录<br/>records.sqlite3]
-  D --> E[Build manifest<br/>agent.py + SKILL.md]
+  D --> E[Process data<br/>agent.py + SKILL.md]
   E --> F[候选行<br/>qtl_manifest_candidates.tsv]
   F --> G[人工审核<br/>Approve / Reject]
   G --> H[qtl_manifest.tsv]
@@ -32,7 +32,7 @@ flowchart LR
 | 1. 批量搜索论文、找数据位置 | Find QTL data | `finder.py`、`extract.py` | 程序（规则） |
 | 2. 判定是否有新 QTL 数据 | Find QTL data | `llm.py`、`rubric.py`、`checks.py` | LLM 回答问题，程序按规则打分 |
 | 3. 保存记录（auto saved / human saved） | Find QTL data、Saved records | `records.py` | 程序按规则自动保存，或人手动保存 |
-| 4. Build manifest | Manifest rows | `manifest.py`、`agent.py`、`rebuild.py`、`reasons.py` 等 | LLM 通过工具调查，程序检查每一步 |
+| 4. Process data（build） | Manifest rows | `manifest.py`、`agent.py`、`rebuild.py`、`reasons.py` 等 | LLM 通过工具调查，程序检查每一步 |
 | 5. 审核和导出 | Manifest rows | `manifest.py`、`web.py` | 人 |
 
 第 1–3 步（批量搜索、AI 判定、自动保存和人工保存）见第 1b 节，第 4 步（build）从第 2 节开始。
@@ -41,7 +41,7 @@ flowchart LR
 
 ## 1b. 批量搜索 → AI 判定 → 自动保存 / 人工保存
 
-这一段决定哪些论文进入 Saved records，只有进了 Saved records 的论文才能 build manifest。
+这一段决定哪些论文进入 Saved records，只有进了 Saved records 的论文才能 Process data（build）。
 
 ### 1b.1 批量搜索（Find QTL data 页面，`GET /api/search`）
 
@@ -159,9 +159,9 @@ flowchart LR
 | 这篇论文以前判定过 | 复用以前的判定，不花 token；要重新判定就点 Re-check with AI |
 | 这篇论文已经在 Saved records 里 | 跳过 AI 判定 |
 | 人工保存了一条 auto 记录 | 变成 human；以后自动保存不会再改它 |
-| 人工判定 Not QTL data | 这篇论文以后不 build（Build status 显示 Skipped），已下载的文件保留 |
+| 人工判定 Not QTL data | 这篇论文以后不 build（Processing status 显示 Skipped），已下载的文件保留 |
 | 非人类物种 | 默认不 build（Manifest rows 页面可以取消 "Species: human only"） |
-| 论文已经在 LocusCompare 参考 manifest 里（按 DOI） | 不 build，Build status 显示 Skipped |
+| 论文已经在 LocusCompare 参考 manifest 里（按 DOI） | 不 build，Processing status 显示 Skipped |
 
 保存下来的记录（不论 auto 还是 human）都会出现在 Manifest rows 页面，可以 build。
 
@@ -176,7 +176,7 @@ flowchart LR
 | A | AI 判定（文本） | 搜索 / 输入 DOI 时，每篇没判定过的论文一次 | `llm.Judge._judge_text`，提示词 `llm.SYSTEM` + `rubric.QUESTIONS` |
 | B | AI 判定（联网补充） | A 之后，满足条件时再一次 | `llm.Judge.research`，提示词 `llm.SYSTEM_WEB` |
 | C | Build（默认） | 每篇论文 build 时，最多 80 轮 | `agent.run`，提示词 `agent.SYSTEM` + `SKILL.md` + 工具定义 |
-| D | Build conversation | Details 里给 AI 发消息时 | `web.post_manifest_chat` |
+| D | Processing conversation | Details 里给 AI 发消息时 | `web.post_manifest_chat` |
 | E | 旧的规则优先流程（`MANIFEST_AGENT=0` 时） | 每篇论文一次（每批若干张表） | `manifest.SYSTEM` 和 `fetch.PLAN_SYSTEM` |
 | F | 检查 key | 页面上 check key、额度恢复检查 | `Judge.ping`："Reply with the word OK." |
 
@@ -250,7 +250,7 @@ flowchart LR
 
 **操作类工具**（`read_paper`、`open_url`、`list_files`、`peek_file`、`download`、`inspect_local`、`run_python`、`validate`、`fill_positions`、`fill_alleles`、`liftover`、`add_rsid`、`read_build_history`）只需要填参数（查询词、网址、文件路径、列名、代码和 `purpose`），加上 `why`。
 
-### D. Build conversation（Details 里的对话）
+### D. Processing conversation（Details 里的对话）
 
 **LLM 收到的：** 论文信息、本地数据文件夹和文件列表、上次 build 的结果、各数据位置的报告、到目前为止的对话。
 
@@ -286,14 +286,16 @@ flowchart LR
 
 ## 2. 一篇论文的 build：整体流程
 
-点击 **Build manifest / Rebuild** 后，后端把论文放进队列（`manifest.Batch`，同时最多 2 篇）。轮到这篇时：
+点击 **Process data / Reprocess** 后，后端把论文放进队列（`manifest.Batch`，同时最多 2 篇）。轮到这篇时：
 
 1. **读论文**：`manifest.read_paper` 重新取全文（Europe PMC / PMC / 出版社页面）。
 2. **准备会话**：`agent.run` 建立 `Session`，打开这次 build 的日志 `data/.build_logs/<record_id>/<run_id>.md`。
 3. **Rebuild 检查**（程序，LLM 开始前）：`rebuild.prepare`，见第 5 节。
-4. **LLM 调查循环**：LLM 按 `SKILL.md` 的 Phase 0–7 调用工具，直到 `submit` 或 `give_up`。每次调用都先过 `reasons.check`（第 6 节），再执行，再记日志。
+4. **LLM 调查循环**：LLM 按 `SKILL.md` 的 6 个步骤调用工具，直到 `submit` 或 `give_up`。每次调用都先过 `reasons.check`（第 6 节），再执行，再记日志。
 5. **检查提交**：`agent.check_submission` 逐行核对，不合格就退回让 LLM 改（最多 3 轮）。
 6. **保存**：`ManifestStore.save_run` 写入数据库，并重写 `manifest/qtl_manifest_candidates.tsv`。人已经 Approve / Reject / 编辑过的行不会被覆盖。
+
+   **只有 AI 正常结束（submit 或 give_up）才保存。** LLM 连不上、AI 停着不提交、轮数用完都没提交时，这次 build 什么都不保存，上一次 build 的行和数据位置报告原样保留，结果记为 `failed` 并写明原因（页面显示 Stopped early · Failed）。AI 额度用完时同样不保存，队列每小时检查一次，恢复后接着做这篇。
 
 预算（环境变量可改）：
 
@@ -308,23 +310,43 @@ flowchart LR
 
 ---
 
-## 3. LLM 的步骤（SKILL.md 的 Phase）
+## 3. LLM 的步骤（SKILL.md 的 6 步）
 
-`skills/build-manifest/SKILL.md` 是 LLM 的操作手册，改它就能改 LLM 的工作方式，不需要改代码。每次 build 开始时都会读最新版本。
+`skills/build-manifest/` 是 LLM 的操作手册，改它就能改 LLM 的工作方式，不需要改代码。每次处理开始时都会读最新版本。分三部分：
 
-| Phase | 做什么 | 主要工具 |
+| 文件 | 内容 | 什么时候给 LLM |
 |---|---|---|
-| 0 | 续跑检查：读 rebuild 检查结果、以前的日志和脚本，定续跑计划 | `read_build_history`、`note_location` |
-| 1 | 读论文：样本、人群、组织/细胞、基因组版本、数据声明 | `read_paper` |
-| 2 | 列出所有数据位置 | `open_url`、`note_location` |
-| 3 | 选择全量 nominal summary statistics 表（3b：找不到全量时才考虑非全量表） | `list_files`、`peek_file` |
-| 4 | 下载 | `download` |
-| 4b | 检查每个下载的文件，判断内容和能否处理 | `inspect_local`、`assess_file` |
-| 5 | 处理成目标格式，写 `<原名>_processed.tsv.gz` | `run_python` |
-| 5a | 只有 rsID 时补位置；只有效应等位基因时补另一个等位基因；GRCh37 → GRCh38 | `fill_positions`、`fill_alleles`、`liftover` |
-| 5b | 补 rsID | `add_rsid` |
-| 6 | 按导入脚本的方式验证 | `validate` |
-| 7 | 提交 manifest 行（或放弃） | `submit`、`give_up` |
+| `SKILL.md`（核心，约 6,300 token） | 理由和证据规则、模块表、决策表、6 个步骤的主流程、目标格式、提交清单 | 每次处理，放在 system prompt 里 |
+| `modules/<name>.md`（10 个） | 特殊情况的具体做法 | 需要时：程序在对应动作之前强制要求先读，AI 也可以随时用 `read_skill` 读 |
+| `papers/<record_id>.md` | 只针对某一篇论文的经验（以前处理时踩过的坑） | 只在处理那一篇时，放进第一条消息 |
+
+**模块和"先读后做"（程序强制）：** 每个模块文件开头写明 `name`、`when`（什么时候该读）和 `required_before`（哪些动作之前必须读过）。AI 调用这些动作时，如果对应模块还没读过，程序拒绝执行，并把模块全文放在拒绝信息里；AI 读完再调用一次就能通过。读过的模块留在对话里，不会被裁剪。这样 AI 不可能没看就自己编一套做法。
+
+| 模块 | 什么时候读 | 哪些动作之前必须读过 |
+|---|---|---|
+| `resume-rebuild` | 以前处理过（有 REBUILD CHECK 或历史日志） | 自动放进第一条消息 |
+| `table-identity` | 判断文件里是什么、是哪种 QTL | `assess_file` |
+| `processing-cookbook` | 写生成 `_processed` 表的脚本 | 写 `_processed` 的 `run_python` |
+| `variant-maps` | 缺另一个等位基因或缺位置，或研究提供了 SNP info / variant map | `fill_alleles`、`fill_positions`、把文件判为 `variant_map` 的 `assess_file` |
+| `liftover` | 坐标是 GRCh37 / hg19，或版本不清楚 | `liftover` |
+| `add-rsid` | processed 表没有 rsID 列，或 dbSNP 里有的 rsID 没填 | `add_rsid` |
+| `manifest-columns` | 填一行的列名 | `validate`、`submit` |
+| `facts` | 样本量、人群、基因组版本、context 标签 | `submit` |
+| `full-vs-nonfull` | 某种 QTL 没有保留全量表 | 含 `non_full` 行或 0 行的 `submit`、`give_up` |
+| `access` | 某个位置需要人处理，或下载 / 网页失败 | 状态为 `manual` / `error` 的 `note_location`、`give_up` |
+
+有测试保证每个模块写的动作名都是程序认识的（拼错会让检查失效），并且核心的模块表列出了每个模块。
+
+处理一篇论文分 6 步（`SKILL.md` 的 Step 1–6；页面的 Processing progress 也按这 6 步显示）：
+
+| 步骤 | 做什么 | 分支 | 主要工具 | 相关模块 |
+|---|---|---|---|---|
+| 1 来源和磁盘上的文件 | 查数据位置（下载链接）：需不需要下、能不能下；文件夹里是否已经有下载好的、处理好的；按文件名、表头、README 选候选表（全量的数字核对在第 4 步） | 已处理且格式合格 → 不再处理：做完第 3 步（事实）和第 4 步（判定源文件，复用的判定也算）后**直接到第 6 步**；只缺 rsID → 第 3、4 步后，第 5 步只跑 add_rsid，再到第 6 步；处理文件被删 / 只有源文件 → 第 4 步；需要申请或只能浏览器下载 → `manual`，报告给人 | `read_paper`、`open_url`、`list_files`、`peek_file`、`note_location`、`read_build_history` | `resume-rebuild`、`access`、`full-vs-nonfull` |
+| 2 下载 | 只下需要、而且还不在磁盘上的；中断的下载续传 | — | `download` | — |
+| 3 manifest 需要的事实 | 看 manifest 需要什么，从文章里找：QTL 类型、context、样本量、人群、基因组版本、dataset 名，每项带原文；补充表格里的事实用 `read_table` 读（它返回的行算证据） | 找不到 → 标 unknown 并写明查过哪里 | `read_paper`、`read_table` | `manifest-columns`、`facts` |
+| 4 格式和计划 | 用数字核对是不是全量（和第 3 步论文里的检验数对比）；看每个文件现在是什么格式、有哪些列、能不能转成标准格式；写计划：用哪些固定程序和模块、写什么代码 | **都不能转换 → 停下汇报**（0 行提交，每张表写明原因） | `inspect_local`、`assess_file` | `table-identity`、`variant-maps`（判为 variant_map 时） |
+| 5 处理 | 按计划写脚本转换，再按顺序跑固定程序：fill_positions → fill_alleles（研究 map）→ liftover → fill_alleles（dbSNP）→ add_rsid | — | `run_python`、`fill_positions`、`fill_alleles`、`liftover`、`add_rsid` | `processing-cookbook`、`variant-maps`、`liftover`、`add-rsid` |
+| 6 检查并写 manifest | validate 每个处理好的文件；通过就提交 | **失败 → 回第 5 步重新处理再验证；同一个文件失败两次 → 程序不再验证，写进 skipped_tables 并报告错误**（只因 rsID 为空的失败不计次数，跑 add_rsid 即可；次数按实际文件计，换一种路径写法也算同一个） | `validate`、`submit`、`give_up` | `manifest-columns`、`facts`、`full-vs-nonfull` |
 
 ### 工具一览
 
@@ -341,12 +363,14 @@ flowchart LR
 | `liftover` | 固定程序：UCSC chain 把 GRCh37 转成 GRCh38 | 每个文件只能转一次，必须在 `add_rsid` 之前 |
 | `fill_positions` | 固定程序：只有 rsID 的表，用研究自带的 SNP map 按 rsID 补染色体和位置 | 只接受 assess 为 variant_map 的文件；rsID 在 map 里唯一对应一个位置才补；在 `fill_alleles`、`liftover` 之前 |
 | `fill_alleles` | 固定程序：用研究自带的 SNP map 或 dbSNP 补非效应等位基因 | 只补双等位位点，不猜 |
-| `add_rsid` | 固定程序：用本地 dbSNP 按 chrom/pos/ref/alt 补 rsID | 只写 `_processed` 表；只适用于 GRCh38 |
+| `add_rsid` | 固定程序：用本地 dbSNP 按 chrom/pos/ref/alt 补 rsID，经共用缓存 | 只写 `_processed` 表；只适用于 GRCh38；**已经补齐、之后没改过的文件自动跳过**（列在 `skipped_complete`） |
+| `read_table` | 由程序读本地表格或 xlsx 的某个 sheet，可按关键词找行 | 返回的行算 AI 看过的内容，引文可以通过核对；AI 自己 `run_python` 打印的内容**不算** |
 | `validate` | 按导入脚本读前 2 万行并逐列检查（第 4 节） | 不通过不能提交 |
 | `note_location` | 记录一个数据位置的状态（listed / downloaded / manual / error / not_data / duplicate） | 必须带 `evidence` |
 | `submit` | 提交 manifest 行和 skipped_tables | 见第 2 节第 5 步 |
 | `give_up` | 完全找不到表时放弃 | 必须带 `evidence` |
 | `read_build_history` | 读这篇论文以前的日志和脚本 | 只能读本论文的 |
+| `read_skill` | 读一个流程模块 | 模块名写错时列出所有模块 |
 
 **所有工具都必须带 `why`**，见第 6 节。
 
@@ -382,6 +406,7 @@ flowchart LR
 | 数据 | 位置 | 用途 |
 |---|---|---|
 | NCBI dbSNP GRCh38 build 157 + tabix 索引 | `data/reference/dbsnp/GCF_000001405.40.gz`（或 `$DBSNP_VCF`） | `add_rsid`、`fill_alleles`、validate 的 rsID 检查 |
+| rsID 缓存 | `data/reference/dbsnp/rsid_cache.sqlite`（程序自动建） | `add_rsid` 查过的每个变异（chrom、pos、ref、alt → rsID，dbSNP 没有的记为空）。同一研究的各个文件、以及以后的论文遇到同一变异直接读缓存，不再查 dbSNP（实测快约 26 倍）。删掉它只会让下次变慢，不影响结果 |
 | UCSC `hg19ToHg38.over.chain.gz` | `data/reference/liftover/`（或 `$LIFTOVER_CHAIN`） | `liftover` |
 | LocusCompare 参考 manifest | `$LC2_QTL_MANIFEST` | 已有的论文、dataset 名称和 level_1 context |
 
@@ -396,12 +421,12 @@ flowchart LR
 | 情况 | 怎么做 | 程序强制 |
 |---|---|---|
 | 全部检验过的 variant–phenotype 对（nominal / allpairs） | 保留，需要时处理 | — |
-| 只有显著 / lead / eGene / permutation 结果 | 放进 skipped_tables；Phase 3b 找遍了也没有全量表时，才保留最完整的一个，标 `scope: non_full` | submit 要求 `non_full_reason` 和带数字的 `scope_note` |
+| 只有显著 / lead / eGene / permutation 结果 | 放进 skipped_tables；按模块 `full-vs-nonfull` 找遍了也没有全量表时，才保留最完整的一个，标 `scope: non_full` | submit 要求 `non_full_reason` 和带数字的 `scope_note` |
 | fine-mapping、共定位、条件分析、富集、后验结果 | skipped_tables（不是关联统计量） | — |
 | QTL 类型不是 eQTL / sQTL / caQTL / pQTL（mQTL、isoQTL、apaQTL…） | skipped_tables："qtl_type not in the manifest"；不能改标成别的类型 | submit 拒绝其他类型 |
 | 论文复用的资源（GTEx、eQTLGen…）、非人类样本 | skipped_tables | — |
 | 基因型、表达矩阵、counts、peak 列表、协变量 | 不算表；note_location 标 `not_data` | — |
-| 论文已在参考 manifest 里（按 DOI 匹配） | **不 build**：LocusCompare 已有这篇的数据，Build status 显示 Skipped | 程序直接跳过（`manifest.already_exists`） |
+| 论文已在参考 manifest 里（按 DOI 匹配） | **不 build**：LocusCompare 已有这篇的数据，Processing status 显示 Skipped | 程序直接跳过（`manifest.already_exists`） |
 | 人工标记为 `not_qtl` | 不 build | 队列跳过 |
 
 ### 缺列时怎么办
@@ -450,14 +475,14 @@ flowchart LR
 | 出版社页面 HTTP 403 | 重试一次；再用正式发表版本、PMC / Europe PMC、仓库 API | — |
 | Rebuild：processed 文件截断或格式不对 | 程序已删除，从源文件重新处理 | REBUILD CHECK |
 | Rebuild：processed 文件格式对、只缺 rsID | 跑 add_rsid，不重新处理 | REBUILD CHECK、validate |
-| Rebuild：下载文件和上次判定时一样 | 复用判定；只有 skill 变动影响到它时才重新判定 | REBUILD CHECK |
+| Rebuild：下载文件和上次判定时一样 | 复用判定，不重新下载 | REBUILD CHECK |
 | 任何一步 | 带 `why`；assess_file、note_location、give_up 还要带 `evidence`（逐字引文） | 不带就拒绝 |
 
 z → p 和按 rsID 补位置（`fill_positions`）在 2026-11-04 加入，代码、skill 和本文一致。
 
 ---
 
-## 4c. 全量还是非全量（Phase 3 / 3b）
+## 4c. 全量还是非全量（第 1 步，模块 `full-vs-nonfull`）
 
 manifest 要的是**全量 nominal summary statistics**：每一对检验过的 variant–phenotype。文件名叫 "summary statistics"、"allpairs"、"nominal" 都不能证明是全量，必须用数字核对（在下载的文件上用 run_python 计数）：
 
@@ -470,11 +495,11 @@ manifest 要的是**全量 nominal summary statistics**：每一对检验过的 
 | 文件名、README、读这个文件的脚本 | — | demo、example、test、illustrative、"not completely included" → 示例摘录 |
 | 大小 | 每个 context 压缩后通常 > 100 MB | 很小 |
 
-**找不到全量表时（Phase 3b）**，先像策展人一样重读论文，再下结论（最多约 15 次调用）：
+**找不到全量表时（模块 `full-vs-nonfull`）**，先像策展人一样重读论文，再下结论（最多约 15 次调用）：
 
 1. 按顺序读 Data / Code availability、QTL 分析的 Methods、提到资源 / 门户 / 仓库的 Results 句子、补充数据说明；
 2. 依次查：出版社页面（常比全文副本多链接）→ 论文的另一个版本（预印本 ↔ 正式发表）→ 已知仓库的新版本、README、release → 论文提到的每个编号的页面；
-3. 新找到的位置照样走 Phase 2、3（note_location、先 peek_file 再下载）。
+3. 新找到的位置照样走第 1 步（note_location、先 peek_file 再下载）。
 
 **仍然没有全量表时：**
 
@@ -504,7 +529,7 @@ LLM 给的每条引文，程序都要在它**看过的内容**里找到（`manif
 - 比较时忽略大小写、空格、标点和印刷变体（各种破折号、引号、连字）；
 - 词和数字必须按原顺序出现在**同一段**文本里；LLM 用 "…" 省略时，每一段都要按顺序找到；
 - 字母和数字加起来少于 12 个的引文不算证据；
-- "看过的内容"包括：论文全文和摘要、打开过的网页、文件列表、文件开头、工具结果、rebuild 检查报告、下载和处理过的文件路径。
+- "看过的内容"包括：论文全文和摘要、打开过的网页、文件列表、文件开头、`read_table` 返回的行、rebuild 检查报告、下载和处理过的文件路径。AI 自己写的 `run_python` 打印出来的内容不算（代码可以打印任何东西）。
 
 `submit` 时对四个事实还有额外要求：
 
@@ -544,21 +569,19 @@ LLM 给的每条引文，程序都要在它**看过的内容**里找到（`manif
 
 ---
 
-## 5. Rebuild：先检查已有文件（`rebuild.py`）
+## 5. Reprocess：先检查已有文件（`rebuild.py`）
+
+页面上的 **Reprocess** 按钮在代码里叫 rebuild（`rebuild.py`、日志里的 REBUILD CHECK），是同一件事。
 
 论文文件夹里已经有文件时，程序在 LLM 第一步之前做下面的检查，结果放在 LLM 第一条消息开头的 **REBUILD CHECK** 里。
 
-### 5.1 skill 有什么变动
-
-每次 build 用的 skill 全文存成 `data/.build_logs/<record_id>/<run_id>.skill.txt`。rebuild 时和上一次 build 的副本做 diff，给 LLM 看哪些规则是新的。没有旧副本时（这个机制之前的 build），程序告诉 LLM 所有规则都可能是新的，要按当前全部规则检查以前的产出。
-
-### 5.2 已下载的文件
+### 5.1 已下载的文件
 
 - 每个下载的文件由程序先跑一遍 `inspect_local` 的格式检查，LLM 不必再逐个 inspect；
 - 以前 build 对**未改动**的文件（大小和修改时间都不变）做的 `assess_file` 判定，从 `data/.build_logs/<record_id>/assessments.json` 复用；改动过的文件要重新判定；
 - `assess_file` 可以用 glob，一次判定表头和内容相同的一组文件（例如 `Kanai_2026_pbmc/finngen_multiome_v1.eQTL.*.cis_nominal.tsv.gz`）。
 
-### 5.3 已处理的文件
+### 5.2 已处理的文件
 
 每个 `*_processed.tsv(.gz)`：
 
@@ -611,7 +634,6 @@ data/
 ├── .build_logs/<record_id>/
 │   ├── <run_id>.md                     # 这次 build 的完整日志，边做边写，重启也不丢
 │   ├── <run_id>.decisions.jsonl        # 每一步的理由、证据、结果
-│   ├── <run_id>.skill.txt              # 这次 build 用的 skill 全文
 │   └── assessments.json                # assess_file 判定，供下次 build 复用
 ├── .agent_scripts/<record_id>/<run_id>/stepNN.py   # LLM 写的每个 Python 脚本
 └── <论文文件夹>/                        # 例如 Kanai_2026_pbmc/
@@ -636,9 +658,10 @@ manifest/
 | `Python command` / `Python stdout / stderr` | `run_python` 的脚本和输出 |
 | `Checkpoint` | 进度消息（下载进度除外） |
 | `Tool interrupted: <工具>` | 工具执行中被取消 |
-| `Build investigation finished` | build 正常结束 |
+| `Build investigation finished` | AI 的调查结束（提交、放弃、或没提交就结束） |
+| `Build stopped` | **每次处理的最后一条记录：停在哪一步、为什么停**。内容：`outcome`（submitted / gave_up / no_submission / llm_failed / usage_limit / stopped / error / interrupted）、`step` 和 `step_name`（最后一次工具调用所在的步骤，Step 1–6）、`last_tool`、`reason`（原因原文） |
 
-日志在网页 Details 里的 **Full build logs (.md)** 可以打开和下载，也可以用 `GET /api/manifest/<record_id>/logs` 列出。
+日志在网页 Details 里的 **Full processing logs (.md)** 可以打开和下载，也可以用 `GET /api/manifest/<record_id>/logs` 列出。
 
 ---
 
@@ -646,18 +669,26 @@ manifest/
 
 `progress.py` 读每篇论文最新的日志，`/api/manifest` 返回 `progress`。日志是逐条写的，即使服务器或机器重启，也能看出停在哪一步。
 
-### Build status（6 个值）
+**停在哪一步、为什么停**：每次处理结束时，程序都会在日志最后写一条 `Build stopped`：
+- 正常提交 → `submitted`，原因写提交了几行和 summary；放弃 → `gave_up`，原因写 give_up 的理由；
+- LLM 连不上 → `llm_failed`；AI 额度用完 → `usage_limit`；AI 没提交就停了或轮数用完 → `no_submission`；
+- 有人点了 Stop → `stopped`；程序出错 → `error`，写出错误信息；
+- **服务器或机器重启**时来不及写，服务下次启动时程序会给所有"没有结束记录"的最新日志补写一条 `interrupted`，步骤取最后一次工具调用，原因写"服务器或机器停止，当时 xxx 正在运行"。
+
+页面上的 Processing status 单元格和 Details → Processing progress 都直接显示这条记录：**Stopped at / Ended at：Step N · 名称 · 最后的工具**，以及 **Reason：原因原文**。2026-11-05 之前的旧日志没有这条记录，页面退回用保存的结果说明。
+
+### Processing status（6 个值）
 
 | 值 | 含义 |
 |---|---|
-| Not built | 还没 build 过 |
-| Building | 正在 build，单元格显示当前 Phase 和步骤 |
+| Not processed | 还没处理过 |
+| Processing | 正在处理，单元格显示当前在第几步（Step 1–6）和正在调用的工具 |
 | Queued | 在队列里等，显示排第几 |
-| Finished | 上次 build 跑完了（submit 或 give up） |
-| Stopped early | 上次没跑完。小字写原因：Interrupted（日志突然结束，服务器或机器停了）、Stopped by a person、Failed、Waiting for AI quota。Rebuild 会接着做 |
-| Skipped | 有意不 build：人工标记为非 QTL 数据，或已经在参考 manifest 里 |
+| Finished | 上次处理跑完了（submit 或 give up） |
+| Stopped early | 上次没跑完。小字写原因：Interrupted（日志突然结束，服务器或机器停了）、Stopped by a person、Failed、Waiting for AI quota。点 Reprocess 会接着做 |
+| Skipped | 有意不处理：人工标记为非 QTL 数据，或已经在参考 manifest 里 |
 
-单元格还显示：停在哪个 Phase、最后一步的工具和理由、是否做完。
+单元格还显示：停在第几步、最后一次调用的工具和理由、是否做完。
 
 ### Data result（5 个值）
 
@@ -669,20 +700,28 @@ manifest/
 | No usable data | build 跑完了但没有可用数据，小字写原因 |
 | No result yet | 没 build、正在 build，或在出结果前就停了 |
 
-筛选栏上方的 "What the Build status and Data result values mean" 有同样的说明，每个选项悬停也有说明。
+筛选栏上方的 "What the Processing status and Data result values mean" 有同样的说明，每个选项悬停也有说明。
 
 ### Details 面板
 
-顺序：
+点开 Details 时，页面调用 `GET /api/manifest/{record_id}/details`（`details.py`），从磁盘上的日志、判定、处理结果算出下面的内容；论文正在处理时每 15 秒刷新一次。
 
-1. **Build progress**：11 个 Phase 的进度（✓ 做过、■ 停在这里、▶ 正在做）、停在哪一步及理由和最后输出、最后的问题（之后没有成功步骤时才显示）、rebuild 下一步做什么、AI 步数和 token、最近 8 步；
-2. Full build logs；
-3. 需要人做的事（访问申请页面、其他瓶颈和处理方法）、其他原因；
-4. 策展人备注、Build conversation（可以贴邮件、README、本地路径给 AI）；
-5. Source reports（每个数据位置的报告，默认折叠）；
-6. 候选 manifest 行表格（Review rows 逐行 Approve / Reject）。
-
----
+1. **标题栏**：Processing progress 的状态、Full processing logs (.md) 按钮、run_id、AI 步数和 token。
+2. **六步，纵向排列**，每一步一个状态：
+   - **Running**：正在做这一步，显示当前在做什么；
+   - **Pending**：还没到；
+   - **Complete**：做完了（没用到的步骤注明 "not needed in this run"）；
+   - **Failed**：停在这一步。下面写 **Stopped**（结束方式）、**Reason**（原因原文，来自日志的 `Build stopped` 记录）、**Solution**（根据原因给出的解决办法）、最后一次调用和最后的问题。
+   - **适用时放在对应的步骤下**：访问申请页面和说明、Needs you（只能浏览器下载、超过下载上限等）放在它们所属的步骤（申请 / 浏览器下载 → Step 1，超过上限 → Step 2）；没有可用数据又需要人处理时，那一步直接标 Failed。其他相关问题（网络、工具……）和 **Processing conversation** 放在 Failed 的那一步下；没有 Failed 的步骤时，对话框放在页面下方。
+3. **Recent steps**（折叠）：最近 8 次调用。
+4. **Files（可折叠，展开状态会记住）**：论文的每个文件一行：
+   - **Download**：✓ 已下载 / ✗ 下载失败 / ✗ 没下载（比如超过下载上限）；
+   - **Assessed (step 4)**：判定结果和原因。README、补充表格这类非 QTL 表判为不可处理时显示 –（不需要），不算失败；只有 QTL 表转换不了才算失败；
+   - **Processed (step 5)**：生成了几张 processed 表，或者"已经是标准格式"、"是 variant map"；
+   - **Reached / Failed at**：走到了哪一阶段、在哪一阶段失败及原因。
+   - 每个源文件下面可以再展开它生成的 processed 表，每张表的阶段：**written → liftover（只有 GRCh37 时）→ rs ids → validate → in manifest**，✓ 完成、✗ 失败、… 待做、– 不需要；鼠标悬停看原因（比如 validate 的问题和第几次）。找不到对应源文件的 processed 表单独列在后面。
+5. **Manifest rows**：候选行表格，点 Check 逐行审核（同第 8b 节）。
+6. 策展人备注、对话框（没有 Failed 步骤时）、Source reports（折叠）。
 
 ## 8b. 候选行的状态、issue、审核和导出
 
@@ -761,14 +800,14 @@ curl -s 127.0.0.1:8010/api/manifest/run   # 当前队列："job": null 表示没
 
 - 改 `SKILL.md` 不需要重启，下次 build 自动读最新版本；
 - 改前端（`src/frontend/`）通常刷新浏览器即可，重启会更新静态文件的版本号；
-- **重启会中断正在跑的 build**（包括 LLM 写的长时间 `run_python`）。重启前先看 `/api/manifest/run`。被中断的 build 在页面上显示 Stopped early / Interrupted，点 Rebuild 接着做。
+- **重启会中断正在跑的 build**（包括 LLM 写的长时间 `run_python`）。重启前先看 `/api/manifest/run`。被中断的 build 在页面上显示 Stopped early / Interrupted，点 Reprocess 接着做。
 
 ### Rebuild 一篇论文
 
-1. 页面上点 **Rebuild**；
-2. 如果需要给 AI 补充信息（访问邮件、本地文件路径），先在 Details 的 Build conversation 里写，然后点 "Continue build with this context"；
+1. 页面上点 **Reprocess**；
+2. 如果需要给 AI 补充信息（访问邮件、本地文件路径），先在 Details 的 Processing conversation 里写，然后点 "Continue processing with this context"；
 3. 等程序的 rebuild 检查（处理过的大文件第一次要完整读一遍）；
-4. 在 Build status 看 Phase 进度，在 Details 看每一步的理由；
+4. 在 Processing status 看进度（Step 1–6），在 Details 看每一步的理由；
 5. 结束后在 Review rows 里逐行审核。
 
 ### 命令行
@@ -804,7 +843,8 @@ uv run ruff check src tests           # 代码风格
 
 | 现象 | 看哪里 | 处理 |
 |---|---|---|
-| 页面显示 Stopped early / Interrupted | Details → Build progress：停在哪个 Phase、最后一步 | 点 Rebuild；程序会先检查已有文件，删掉写了一半的 |
+| 页面显示 Stopped early / Interrupted | Details → Processing progress：停在第几步、最后一次调用 | 点 Reprocess；程序会先检查已有文件，删掉写了一半的 |
+| 页面显示 Stopped early · Failed，原因 "LLM step failed: …ConnectError" | Processing status 小字、`server.log`；`ss -tn \| grep <LLM 端口>` 看连接是否停在 SYN-SENT | LLM 接口连不上（`.env` 里的 `LLM_BASE_URL`）。上次的行没有被覆盖；接口恢复或换了 LLM 后点 Reprocess |
 | LLM 一直被拒绝 | `decisions.jsonl` 里 `outcome: refused` 的行和 `result` | 常见原因：`why` 太短、`evidence` 引文对不上、还有文件没 `assess_file`、validate 没通过 |
 | validate 报 `rsid_col … is empty for N of M sampled variants that dbSNP holds` | validate 结果 | 对该文件跑 `add_rsid`，再 validate |
 | validate 报 chrom 带 `chr`、variant_id 缺 `chr`、peak 格式不对 | validate 结果里的例子 | 修处理脚本，重新处理该文件 |
@@ -814,7 +854,7 @@ uv run ruff check src tests           # 代码风格
 
 ### 例：Kanai_2026_pbmc（#639）
 
-- 2026-11-03 09:14 开始的 build，停在 Phase 5 的 `run_python`（逐个处理 eQTL nominal 文件）：输出文件最后写入是 11-04 04:14，机器在 04:33 重新启动，日志没有结束事件；
+- 2026-11-03 09:14 开始的 build，停在处理步骤的 `run_python`（逐个处理 eQTL nominal 文件）：输出文件最后写入是 11-04 04:14，机器在 04:33 重新启动，日志没有结束事件；
 - 当时 caQTL 33/33、eQTL 15/33 已处理，`eQTL.l2.CD4_Naive` 只写了一半，另外 17 个 eQTL 没开始；
 - 所有已处理文件格式正确，但 rsID 列为空（处理脚本只建了空列，没有跑 `add_rsid`）；
 - Rebuild 时：程序完整读取 49 个 processed 文件，删除截断的 `CD4_Naive`，其余保留并标为"缺 rsID"；LLM 处理剩下的 eQTL，对全部 processed 文件跑 `add_rsid`，再 validate 和 submit。
@@ -853,7 +893,7 @@ uv run ruff check src tests           # 代码风格
 - 格式检查只读每个文件的前 2 万行。处理脚本对每行用同样的逻辑，所以前面对后面一般也对；完整逐行检查几亿行要好几个小时，没有做。
 - rebuild 第一次完整读取大的 processed 文件很慢（每 GB 约 20 秒每线程），之后靠缓存。
 - `evidence` 核对的是"引文确实出现在 LLM 看过的内容里"，不能保证 LLM 对引文的解读正确；判定结果仍需人工审核行。
-- 2026-11-04 之前的 build 没有保存 skill 副本、`assess_file` 判定和 decisions 记录，rebuild 时这些只能从头开始。
+- 2026-11-04 之前的 build 没有保存 `assess_file` 判定和 decisions 记录，rebuild 时这些只能从头开始。
 - 只有 t 统计量或只有 beta + se 的表不能处理（2026-11-04 决定：只放开 z → p）。
 - 只有 rsID、没有坐标的表，只能用研究自带的 variant map 补位置（2026-11-04 决定：不用 dbSNP 查位置）。
 - rebuild 检查不预先检查 tar 压缩包（列出成员要解压整个文件），由 AI 自己 inspect。
